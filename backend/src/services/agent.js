@@ -21,6 +21,7 @@ import { DB_PROXY_CLIENT as DB_PROXY_CLIENT_REFERENCE, DB_JS_SUPABASE_ADAPTER } 
 import { config, isPreviewConfigured } from '../config.js'
 
 import { supabase } from '../db/supabaseClient.js'
+import { autoInjectDependencies, resolvePackageVersion, normalizePackageName } from './dependencyAutoInjector.js'
 
 
 
@@ -238,6 +239,8 @@ function describeStep(name, input) {
 
     case 'propose_db_change':
 
+    case 'propose_migration':
+
       return { type: 'db' }
 
     case 'propose_edge_function':
@@ -298,7 +301,7 @@ function buildSystemPrompt(
 
   treePaths,
 
-  schemaTables,
+  schemaDetails,
 
   attachments,
 
@@ -343,22 +346,26 @@ function buildSystemPrompt(
   const kickoffSection = isInitialKickoff ? `
 
 [PROJECT INITIALIZATION DIRECTIVE]
-
 Estás construyendo un proyecto completamente nuevo a partir de este prompt inicial: "${userMessage}".
 
 REGLAS CRÍTICAS DE KICKOFF:
 
-1. NUNCA respondas haciendo preguntas al usuario sobre qué prefiere. Tienes control arquitectónico y creativo total.
-
 2. Infiere el modelo de datos completo, las pantallas principales y el flujo de trabajo estándar del tipo de aplicación solicitada.
-
    - Si es cotizaciones: crea cotizador con ítems dinámicos, cálculo, listado y vista de detalle.
-
-3. Provee datos falsos realistas (mock data) de alta fidelidad para que la vista previa nazca visualmente completa y activa, nunca vacía.
 
 4. Escribe el layout base, navegación y páginas principales usando componentes shadcn/ui y tokens semánticos de Tailwind.
 
-5. Emite todos los archivos necesarios en una sola pasada a través de propose_change.` : '';
+5. Emite todos los archivos necesarios en una sola pasada a través de propose_change.
+
+PROHIBIDO CREAR MOCKS O COMPONENTES COSMÉTICOS FALSOS: Si el usuario pide una conexión real, integración externa (WhatsApp, APIs, Stripe) o persistencia, NUNCA inventes interfaces estáticas que simulan funcionar. Debes crear la estructura real de datos (propose_migration), endpoints (propose_edge_function) o clarificar los requerimientos.
+
+CUÁNDO USAR 'ask_question':
+Si el usuario solicita un proyecto nuevo desde cero, un sistema complejo o una integración con múltiples opciones (ej. 'creame un sistema MCP para WhatsApp', 'crea un SaaS de reservas', 'agrega pasarela de pagos'), NO asumas los requerimientos ni crees código de inmediato.
+DEBES invocar obligatoriamente la herramienta 'ask_question' ofreciendo entre 2 y 4 opciones claras y bien fundamentadas (marcando una como 'Recomendada') para definir:
+1. El objetivo/arquitectura principal (ej. Servidor MCP vs Bot vs App web).
+2. El proveedor de conexión o método de autenticación.
+3. Los roles o usuarios del sistema.
+Una vez invocada 'ask_question', finaliza tu turno inmediatamente sin emitir código adicional hasta que el usuario responda.` : '';
 
 
 
@@ -438,74 +445,37 @@ useEffect(() => {
 
 
 
-  const dbSection = schemaTables
+  const dbSection = schemaDetails
+      ? `
 
-    ? `
-
-
-
-Este repositorio también tiene una base de datos PostgreSQL conectada. TÚ te encargas de la base de datos, no el usuario: si lo que te piden necesita guardar o leer datos (formularios, listas, citas, usuarios, productos, lo que sea) y la tabla correspondiente no existe todavía, créala tú mismo con "propose_migration" en el mismo turno en que escribes el código que la usa. Nunca le digas al usuario que "cree la tabla" o que "configure la base de datos" — esa herramienta es tuya, úsala. Se ejecuta sola apenas la llamás (salvo que esta etapa requiera aprobación, ver "PEDIDOS GRANDES"), no hace falta pedirle permiso antes.
-
-
+Este repositorio también tiene una base de datos PostgreSQL conectada. Tú te encargas de la base de datos, no el usuario: si lo que te piden necesita guardar o leer datos (formularios, listas, citas, usuarios, productos, lo que sea) y la tabla correspondiente no existe todavía, créala tú mismo con "propose_migration" en el mismo turno en que escribes el código que la usa. Nunca le digas al usuario que "cree la tabla" o que "configure la base de datos" — esa herramienta es tuya, úsala. Se ejecuta sola apenas la llamás (salvo que esta etapa requiera aprobación, ver "PEDIDOS GRANDES"), no hace falta pedirle permiso antes.
 
 DATABASE RULES (MANDATORY):
-
 1. AUTONOMY: Never stop to ask permission or say "Should I create this table?". If a user asks for a feature requiring persistent data, immediately emit the SQL migration via 'propose_migration' alongside the frontend code changes.
-
 2. IDEMPOTENCY: Use 'CREATE TABLE IF NOT EXISTS', 'ALTER TABLE ... ADD COLUMN IF NOT EXISTS', and 'DO $$ ...' blocks for enum types to prevent duplicate execution errors.
-
 3. RLS & GRANTS ORDER (CRITICAL): Every 'CREATE TABLE' in 'public' must follow this exact sequence:
-
    a. CREATE TABLE public.<table> (...)
-
    b. GRANT SELECT, INSERT, UPDATE, DELETE ON public.<table> TO authenticated; (and anon if public read is required)
-
    c. GRANT ALL ON public.<table> TO service_role;
-
    d. ALTER TABLE public.<table> ENABLE ROW LEVEL SECURITY;
-
    e. CREATE POLICY ...
-
 4. DESTRUCTIVE ACTIONS GUARD: Never execute 'DROP TABLE' or 'DROP COLUMN' on existing user tables unless explicitly instructed by the user prompt. For modifications, prefer adding columns or creating views.
-
+5. REGLA MANDATORIA DE PERSISTENCIA (CRÍTICO): Toda petición con intención de persistencia ("se guarden", "guardar", "historial", "registrar", "almacenar", "base de datos") te OBLIGA a llamar a "propose_migration" ANTES o EN PARALELO de escribir el código de UI que la consuma. Está TERMINANTEMENTE PROHIBIDO escribir llamadas a tablas (db.from / supabase.from / api) que no existan en la base de datos sin emitir "propose_migration" en el mismo turno. Si omites la migración o afirmas que guardas datos sin haber creado la tabla real, el sistema emitirá BUILD_FAILED y rechazará tu respuesta.
 7. ATOMICIDAD FRONTEND + BASE DE DATOS (REGLA MANDATORIA):
-   - Si creas o modificas componentes visuales que hacen consultas a tablas (ej. supabase.from('...'), db.from('...')), TIENES ESTRICTAMENTE PROHIBIDO asumir que las tablas existen si no están en tu introspección de esquema.
-   - En el MISMO turno, debes emitir PRIMERO la migración con 'propose_migration' para crear las tablas, roles y políticas RLS necesarias, y LUEGO emitir el código de 'src/App.jsx' o componentes con 'propose_patch' / 'propose_change'.
-   - NUNCA generes código de frontend que consulte una tabla inexistente sin haber emitido su migración DDL correspondiente.
-5. CONSERVACIÓN DE CÓDIGO: Queda estrictamente prohibido remover estilos, clases visuales, iconos o componentes para resolver errores de compilación de Vite o React. Las reparaciones deben ser quirúrgicas y preservar la fidelidad visual existente.
-  6. DISEÑO SEMÁNTICO: No hardcodees colores arbitrarios (ej. bg-white, text-black). Usa siempre tokens semánticos de Tailwind/Shadcn (bg-background, text-foreground, border-border) para garantizar compatibilidad con modo oscuro.
 
+ESQUEMA ACTUAL DE BASE DE DATOS:
+${Object.keys(schemaDetails || {}).length ? Object.entries(schemaDetails).map(([t, cols]) => ` - ${t}: (${(Array.isArray(cols) ? cols.join(', ') : 'no array')})`).join('\n') : '(la base de datos está vacía, no tiene tablas todavía)'}
 
+Si necesitas guardar un campo que no figure en las columnas existentes de la tabla, DEBES ejecutar propose_migration con un ALTER TABLE ... ADD COLUMN ... en el mismo turno.
 
-STORAGE RULES (MANDATORY):
+Si el usuario pregunta si un import/migración de datos realmente funcionó, si "se migró todo", si faltan filas, o cualquier variante de "¿los datos están ahí de verdad?" — usá la herramienta "check_db_data" ANTES de responder. Nunca contestes esa pregunta de memoria ni digas que datos "no se migraron" o "no se pudieron importar" sin haberlo comprobado ahí.
 
-1. EPHEMERAL DISK: The container file system is ephemeral. Never save user-uploaded files, generated images, captures (e.g. html2canvas), or any persistent state to local disk folders.
-
-2. CLIENT-SIDE STATE: For frontend-only features (mockups, simple galleries), use LocalStorage, IndexedDB, or Base64 data URIs.
-
-3. PERSISTENT BACKEND: For full-stack features, always use the Supabase/PostgreSQL database via 'supabase-js'. Do NOT attempt to persist files to the local Node/Express file system.
-
-
-
-
-
-${dbClientHint}
-
-Tablas existentes (esquema "public"):
-
-${schemaTables.length ? schemaTables.join('\n') : '(la base de datos está vacía, no tiene tablas todavía — si el pedido necesita guardar datos, créalas tú con propose_db_change, no asumas que ya existen)'}
-
-Si el usuario pregunta si un import/migración de datos realmente funcionó, si "se migró todo", si faltan filas, o cualquier variante de "¿los datos están ahí de verdad?" — usá la herramienta "check_db_data" ANTES de responder. Nunca contestes esa pregunta de memoria ni digas que datos "no se migraron" o "no se pudieron importar" sin haberlo comprobado ahí: la lista de tablas de arriba es el ESQUEMA (qué columnas hay), no cuántas filas tiene cada una — no alcanza para saber si hay datos reales cargados.
-
-Si además necesitás ver el CONTENIDO real de esas filas (valores concretos, no solo si existen) — para depurar un dato puntual, entender la forma real de algo antes de escribir código que lo use, o porque el usuario te pide revisar un registro específico — usá "read_table_rows" en vez de adivinar la forma de los datos.
+Si además necesitás ver el CONTENIDO real de esas filas (valores concretos, no solo si existen) — usá "read_table_rows" en vez de adivinar la forma de los datos.
 
 CRÍTICO - DEBUGGING DE BASE DE DATOS: Si el usuario te reporta un error al intentar guardar/registrar (ej. "Error al registrar"), o si ves un error de Postgres (ej. "violates check constraint", "violates row-level security"): LEE exactamente qué dice el error y arréglalo de raíz. No intentes adivinar ni regeneres repetidamente el campo "id" si el error no es sobre el ID. 
-
-- Si falla un CHECK constraint (ej. mayúsculas vs minúsculas como 'Entrada' vs 'entrada'), asegúrate de que el frontend envíe el dato exactamente como lo exige la tabla, o relaja el constraint.
-
-- Si falla RLS al insertar, verifica que exista una política de INSERT explícita y que coincida con el estado de login (si la app es pública, exigir "user_id = current_user_id()" bloqueará todos los guardados).`
-
-    : ''
+- Si falla un CHECK constraint, asegúrate de que el frontend envíe el dato exactamente como lo exige la tabla, o relaja el constraint.
+- Si falla RLS al insertar, verifica que exista una política de INSERT explícita y que coincida con el estado de login.`
+      : ''
 
 
 
@@ -862,6 +832,8 @@ When the user asks for a visual, architectural, or structural change (e.g. "hazl
 You must immediately invoke 'propose_change' with the modified files.
 
 If a design request is broad or ambiguous, make executive architectural decisions based on standard UI patterns and implement them directly.
+
+- VALIDACIÓN DE COMPILACIÓN (CRÍTICO): Nunca declares una tarea terminada sin confirmación de compilación limpia del sistema. Si recibes BUILD_FAILED, corrígelo antes de responder. Prohibido decir "listo" o "aplicado" si la compilación arrojó errores.
 
 
 
@@ -1350,53 +1322,31 @@ const edgeFunctionTool = {
 const askQuestionTool = {
 
   name: 'ask_question',
-
   description:
-
     'Muestra al usuario una tarjeta con opciones para elegir dentro del chat (estilo Lovable), en vez de escribir la pregunta como texto plano. Usala cuando de verdad haya un puñado de alternativas concretas entre las que el usuario tiene que decidir antes de que sigas (ej. qué canales conectar, qué alcance darle a algo grande y ambiguo) — NO para confirmaciones simples de sí/no, ni para preguntas abiertas de texto libre, ni cuando el pedido ya es lo bastante claro para simplemente hacerlo. Tras llamarla, tu turno termina ahí: no asumas ni inventes una respuesta, esperala en el próximo mensaje del usuario.',
-
   input_schema: {
-
     type: 'object',
-
     properties: {
-
       question: { type: 'string', description: 'La pregunta, breve y clara (una sola oración)' },
-
+      header: { type: 'string', description: 'Texto corto para el chip/badge superior de la tarjeta (ej. "Arquitectura", "Base de datos")' },
+      body: { type: 'string', description: 'Contexto explicativo de 1-2 oraciones que ayuda al usuario a entender por qué le estás preguntando esto' },
       multiSelect: { type: 'boolean', description: 'true si puede elegir varias opciones a la vez, false (default) si es una sola' },
-
-      allowCustom: { type: 'boolean', description: 'true si además debería poder escribir su propia opción a mano' },
-
       options: {
-
         type: 'array',
-
         description: 'Entre 2 y 6 opciones',
-
         items: {
-
           type: 'object',
-
           properties: {
-
             label: { type: 'string', description: 'Nombre corto de la opción' },
-
             description: { type: 'string', description: 'Una frase explicando qué implica elegir esta opción' },
-
+            recommended: { type: 'boolean', description: 'true si esta es la opción que recomiendas (máximo una por pregunta)' }
           },
-
           required: ['label'],
-
         },
-
       },
-
     },
-
-    required: ['question', 'options'],
-
+    required: ['question', 'header', 'body', 'options'],
   },
-
 }
 
 
@@ -1603,7 +1553,102 @@ const storageUploadTool = {
 
 }
 
+function scanDataAccessInChanges(proposedChanges) {
+  const tableAccess = new Map()
 
+  for (const change of proposedChanges) {
+    const code = change.newContent || ''
+    if (!code) continue
+
+    // Detectar llamadas a .from('table') / supabase.from('table') / db.from('table')
+    const fromRegex = /(?:\b(?:supabase|db|client|api)\.from|\.from)\s*\(\s*['"`]([a-zA-Z0-9_]+)['"`]\s*\)/g
+    let match
+    while ((match = fromRegex.exec(code)) !== null) {
+      const table = match[1]
+      if (!tableAccess.has(table)) tableAccess.set(table, new Set())
+    }
+
+    // Detectar llamadas directas a endpoints REST: /api/db-proxy/<token>/<table> o /rest/v1/<table>
+    const restRegex = /(?:\/api\/db-proxy\/[^/'"`\s\?]+|\/rest\/v1)\/([a-zA-Z0-9_]+)/g
+    while ((match = restRegex.exec(code)) !== null) {
+      const table = match[1]
+      if (!tableAccess.has(table)) tableAccess.set(table, new Set())
+    }
+
+    // Para cada tabla detectada, buscar columnas asociadas
+    for (const table of tableAccess.keys()) {
+      const cols = tableAccess.get(table)
+
+      const chainRegex = new RegExp(`\\.from\\s*\\(\\s*['"\`]${table}['"\`]\\s*\\)([\\s\\S]*?)(?:;|\\n\\s*\\n|\\bconst\\b|\\blet\\b|\\bvar\\b|\\breturn\\b|$)`, 'g')
+      let chainMatch
+      while ((chainMatch = chainRegex.exec(code)) !== null) {
+        const chain = chainMatch[1]
+
+        // Columnas en filtros (.eq, .neq, .order, etc.)
+        const filterColRegex = /\.(?:eq|neq|gt|gte|lt|lte|like|ilike|is|order)\s*\(\s*['"`]([a-zA-Z0-9_]+)['"`]/g
+        let fMatch
+        while ((fMatch = filterColRegex.exec(chain)) !== null) {
+          cols.add(fMatch[1])
+        }
+
+        // Columnas en .select('col1, col2, ...')
+        const selectRegex = /\.select\s*\(\s*['"`]([^'"`*]+)['"`]\s*\)/g
+        let sMatch
+        while ((sMatch = selectRegex.exec(chain)) !== null) {
+          const rawCols = sMatch[1].split(',')
+          for (const rawCol of rawCols) {
+            const cleanCol = rawCol.trim()
+            if (/^[a-zA-Z0-9_]+$/.test(cleanCol) && cleanCol !== 'id' && cleanCol !== 'created_at' && cleanCol !== 'updated_at') {
+              cols.add(cleanCol)
+            }
+          }
+        }
+
+        // Columnas en .insert([ { col: val } ]) o .insert({ col: val }) / .update / .upsert
+        const objectLiteralRegex = /\.(?:insert|upsert|update)\s*\(\s*(?:\[\s*)?\{\s*([^}]+)\s*\}/g
+        let objMatch
+        while ((objMatch = objectLiteralRegex.exec(chain)) !== null) {
+          const innerObj = objMatch[1]
+          const keyRegex = /([a-zA-Z0-9_]+)\s*:/g
+          let kMatch
+          while ((kMatch = keyRegex.exec(innerObj)) !== null) {
+            cols.add(kMatch[1])
+          }
+        }
+      }
+    }
+  }
+
+  return tableAccess
+}
+
+function extractProposedDbEntities(proposedDbChanges) {
+  const createdTables = new Set()
+  const addedColumns = new Map()
+
+  for (const change of proposedDbChanges) {
+    const sql = change.sql || ''
+
+    const createTableRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:["']?([a-zA-Z0-9_]+)["']?\.)?["']?([a-zA-Z0-9_]+)["']?/gi
+    let m
+    while ((m = createTableRegex.exec(sql)) !== null) {
+      const t = m[2]
+      if (t) createdTables.add(t)
+    }
+
+    const addColRegex = /ALTER\s+TABLE\s+(?:["']?([a-zA-Z0-9_]+)["']?\.)?["']?([a-zA-Z0-9_]+)["']?\s+ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?/gi
+    while ((m = addColRegex.exec(sql)) !== null) {
+      const t = m[2]
+      const col = m[3]
+      if (t && col) {
+        if (!addedColumns.has(t)) addedColumns.set(t, new Set())
+        addedColumns.get(t).add(col)
+      }
+    }
+  }
+
+  return { createdTables, addedColumns }
+}
 
 export async function runAgent({ agentId, accessToken, project, history, userMessage, signal, dbConnection, attachments: rawAttachments = [], mode = 'build', onProgress, ownerKey, elementContext }) {
 
@@ -1780,7 +1825,7 @@ onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Analizando intenci�
 
     : await triageRelevantFiles(treePaths, userMessage).catch(() => treePaths)
 
-  const schemaTables = dbConnection ? await getCachedSchemaSummary(dbConnection) : null
+  const schemaDetails = dbConnection ? await getCachedSchemaSummary(dbConnection) : {}
 
   const userId = ownerKey ? ownerKey.split(':')[1] : null;
   const activeSkills = await getActiveProjectSkills(project.id, userId).catch(() => [])
@@ -1789,7 +1834,7 @@ onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Analizando intenci�
 
     displayTreePaths,
 
-    schemaTables,
+    schemaDetails,
 
     attachments,
 
@@ -2181,11 +2226,15 @@ REGLAS DE MODO BUILD (ACTUAL):
 
       }
 
-      if (name === 'propose_db_change') {
+      if (name === 'propose_db_change' || name === 'propose_migration') {
 
-        proposedDbChanges.push({ sql: ensureForceRls(input.sql), summary: input.summary })
+        const sql = input.up_sql || input.sql
 
-        return `Cambio de base de datos registrado: "${input.summary}". Se ejecuta solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
+        const summary = input.name || input.summary || 'Cambio en base de datos'
+
+        proposedDbChanges.push({ sql: ensureForceRls(sql), summary })
+
+        return `Cambio de base de datos registrado: "${summary}". Se ejecuta solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
 
       }
 
@@ -2649,7 +2698,66 @@ REGLAS DE MODO BUILD (ACTUAL):
 
     }
 
+    // Guardrail basado en el DIFF FINAL (Persistencia y Acceso a Base de Datos)
+    if (proposedChanges.length > 0 && dbConnection) {
+      try {
+        const accessedTables = scanDataAccessInChanges(proposedChanges);
 
+        if (accessedTables.size > 0) {
+          const liveSchema = await getSchemaSummary(dbConnection);
+          const { createdTables, addedColumns } = extractProposedDbEntities(proposedDbChanges);
+
+          let dbViolation = null;
+
+          for (const [table, referencedCols] of accessedTables.entries()) {
+            if (table.startsWith('_flowpro_') || table === 'auth') continue;
+
+            const tableExistsLive = !!liveSchema[table];
+            const tableCreatedInTurn = createdTables.has(table);
+
+            if (!tableExistsLive && !tableCreatedInTurn) {
+              dbViolation = `La tabla "${table}" a la que accede el código propuesto no existe en la base de datos PostgreSQL y NO has llamado a "propose_migration" para crearla en este turno.`;
+              break;
+            }
+
+            if (tableExistsLive && !tableCreatedInTurn && referencedCols.size > 0) {
+              const liveCols = liveSchema[table] || [];
+              const addedInTurn = addedColumns.get(table) || new Set();
+
+              for (const col of referencedCols) {
+                if (col === 'id' || col === 'created_at' || col === 'updated_at') continue;
+                if (!liveCols.includes(col) && !addedInTurn.has(col)) {
+                  dbViolation = `La columna "${col}" en la tabla "${table}" no existe en la base de datos PostgreSQL y NO has propuesto un ALTER TABLE con "propose_migration" para agregarla.`;
+                  break;
+                }
+              }
+              if (dbViolation) break;
+            }
+          }
+
+          if (dbViolation) {
+            intentos++;
+            if (intentos < MAX_INTENTOS) {
+              onProgress?.({
+                type: 'telemetry',
+                phase: 'HEALING',
+                label: 'Validando persistencia y esquema de base de datos...',
+                payload: { attempt: intentos, maxAttempts: MAX_INTENTOS, errorSnippet: dbViolation },
+              });
+
+              activeUserMessage = `BUILD_FAILED: Violación de contrato de persistencia en base de datos:\n${dbViolation}\n\nOBLIGATORIO: Debes invocar la herramienta "propose_migration" AHORA MISMO con el script SQL (CREATE TABLE, GRANTs, RLS) para crear la tabla y columnas necesarias antes de cerrar el turno. Está PROHIBIDO omitir la base de datos o dejar tablas inexistentes. El pedido original era:\n\n${userMessage}`;
+              continue;
+            } else {
+              onProgress?.({ type: 'telemetry', phase: 'DEGRADED', label: 'Violación de persistencia no resuelta.' });
+              text = `⚠️ Error de persistencia: El código modificado intenta usar tablas o columnas que no existen en PostgreSQL (${dbViolation}). No se aplicó ninguna migración con propose_migration.`;
+              break;
+            }
+          }
+        }
+      } catch (errDbGuard) {
+        console.error('Error en Guardrail de Diff Final de base de datos:', errDbGuard);
+      }
+    }
 
     // Guardrail de Evasión: el modelo devolvió texto sin herramientas en un turno de edición
 
@@ -2694,108 +2802,114 @@ REGLAS DE MODO BUILD (ACTUAL):
 
 
     // Fases 2 y 3: VFS y Verification Loop
-
     if (proposedChanges.length > 0 && previewAvailable) {
-
       try {
+        // CAPA 1: Auto-inyección de dependencias antes de compilar
+        let existingPkg = null;
+        if (!stagedContent.has('package.json')) {
+          try {
+            existingPkg = await readFileCached('package.json');
+          } catch (_) {}
+        }
+        await autoInjectDependencies(stagedContent, proposedChanges, existingPkg);
 
         const filesMap = {};
-
         for (const [path, content] of stagedContent.entries()) {
-
           filesMap[path] = { content, isBase64: false };
-
         }
-
         onProgress?.({ type: 'telemetry', phase: 'WRITING_VFS', label: `Editando ${Object.keys(filesMap).length} archivo(s)...`, payload: { files: Object.keys(filesMap) } });
 
-        
-
-        // 1. Aplicar cambios al sandbox silenciosamente
-
+        // CAPA 2: Compilación forzada real (await real de testVfsChanges con npm install y warm-up)
         await testVfsChanges(ownerKey, filesMap);
 
-        
+        onProgress?.({ type: 'telemetry', phase: 'VALIDATING_BUILD', label: 'Verificando compilación e interfaz...' });
+        await new Promise(r => setTimeout(r, 800));
 
-        // 2. Ventana de estabilización de Vite (Debounce)
-
-        onProgress?.({ type: 'telemetry', phase: 'VALIDATING_BUILD', label: 'Verificando interfaz...' });
-
-        await new Promise(r => setTimeout(r, 600));
-
-        
-
-        // 3. Revisar logs del sandbox
-
+        // 3. Revisar logs y estado veraz del sandbox
         const status = await getPreviewStatus(ownerKey);
+        const cleanLogs = (status?.logsTail || '').replace(/\x1b\[[0-9;]*m/g, '');
 
-        if (status && status.logsTail) {
+        // 4. Buscar errores de compilación críticos y fallos de importación
+        const viteInfraError = cleanLogs.includes('node_modules/vite') || cleanLogs.includes('.vite/deps');
+        if (viteInfraError) {
+          onProgress?.({ type: 'telemetry', phase: 'VALIDATING_BUILD', label: 'Reconstruyendo dependencias...' });
+          await restartPreviewForAgent({ ownerKey, project, accessToken, dbConnection });
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
 
-          const logsParts = status.logsTail.split('--- VFS REFRESH START ---');
+        const VITE_ERROR_PATTERNS = [
+          'Failed to resolve import',
+          '[plugin:vite:import-analysis]',
+          'Pre-transform error',
+          'Cannot find module',
+          'Internal server error',
+          'SyntaxError',
+          'Transform failed',
+          'Build failed with',
+          'does not provide an export named'
+        ];
 
-          const recentLogs = logsParts[logsParts.length - 1];
-
-          // Limpieza de secuencias ANSI
-
-          const cleanLogs = recentLogs.replace(/\x1b\[[0-9;]*m/g, '');
-
-          
-
-          // 4. Buscar errores de compilación críticos
-
-          
-
-          const viteInfraError = cleanLogs.includes('node_modules/vite') || cleanLogs.includes('.vite/deps');
-
-          if (viteInfraError) {
-
-              onProgress?.({ type: 'telemetry', phase: 'VALIDATING_BUILD', label: 'Reconstruyendo dependencias...' });
-
-              await restartPreviewForAgent({ ownerKey, project, accessToken, dbConnection });
-
-              // Tras reiniciar, intentamos probar de nuevo silenciosamente sin gastar intentos
-
-              await new Promise(r => setTimeout(r, 2000));
-
-              continue;
-
+        let detectedViteError = null;
+        if (status?.status === 'error' && status?.error) {
+          detectedViteError = status.error;
+        } else {
+          for (const pattern of VITE_ERROR_PATTERNS) {
+            if (cleanLogs.includes(pattern)) {
+              detectedViteError = cleanLogs.split('\n').find(l => l.includes(pattern))?.trim() || pattern;
+              break;
+            }
           }
+        }
 
+        // CAPA 3: Bucle de autocorrección interno (máximo 3 iteraciones)
+        if (detectedViteError) {
+          // Si el error es "Failed to resolve import X" de un paquete npm externo, resolver determinísticamente primero
+          const importMatch = detectedViteError.match(/Failed to resolve import ["']([^"']+)["']/i);
+          const pkgToInstall = importMatch ? normalizePackageName(importMatch[1]) : null;
 
+          if (pkgToInstall) {
+            let pkg = {};
+            try {
+              pkg = JSON.parse(stagedContent.get('package.json') || existingPkg || '{}');
+            } catch {
+              pkg = { dependencies: {} };
+            }
+            pkg.dependencies = pkg.dependencies || {};
+            if (!pkg.dependencies[pkgToInstall]) {
+              const ver = await resolvePackageVersion(pkgToInstall);
+              pkg.dependencies[pkgToInstall] = ver;
+              const updatedPkg = JSON.stringify(pkg, null, 2) + '\n';
+              stagedContent.set('package.json', updatedPkg);
+              const pIdx = proposedChanges.findIndex(c => c.path === 'package.json');
+              if (pIdx >= 0) proposedChanges[pIdx].newContent = updatedPkg;
+              else proposedChanges.push({ path: 'package.json', originalContent: existingPkg, newContent: updatedPkg, summary: `Auto-instalada dependencia: ${pkgToInstall}` });
 
-          const viteHasError = cleanLogs.includes('[vite] Internal server error') ||
-
- 
-
-                               cleanLogs.includes('SyntaxError:') || 
-
-                               cleanLogs.includes('Build failed with');
-
-          
-
-          if (viteHasError) {
-
-              intentos++;
-
-              if (intentos < MAX_INTENTOS) {
-
-                  onProgress?.({ type: 'telemetry', phase: 'HEALING', label: 'Refinando componentes...', payload: { attempt: intentos, maxAttempts: MAX_INTENTOS, errorSnippet: cleanLogs.substring(0, 200) } });
-
-                  activeUserMessage = `⚠️ El código que acabas de proponer rompió el build. Aquí está el error limpio del log:\n\n${cleanLogs}\n\nOBLIGATORIO: Debes invocar la herramienta "propose_patch" AHORA MISMO para corregir el error. NO elimines código ni componentes útiles para silenciar el error, corrige la sintaxis específica manteniendo intacta la lógica y estilos. No respondas solo con texto, TIENES que llamar a la herramienta. El pedido original del usuario era:\n\n${userMessage}`;
-
-                  continue; // Reintento silencioso
-
-              } else {
-
-                  onProgress?.({ type: 'telemetry', phase: 'DEGRADED', label: 'Múltiples fallos detectados. Degradando con advertencia...' });
-
-                  text += '\n\n⚠️ **Aviso de Auto-Corrección:** Hubo un error de compilación que no pude resolver automáticamente tras varios intentos. Revisa la vista previa y los logs.';
-
-                  break;
-
+              const retryFilesMap = {};
+              for (const [p, c] of stagedContent.entries()) retryFilesMap[p] = { content: c, isBase64: false };
+              await testVfsChanges(ownerKey, retryFilesMap);
+              await new Promise(r => setTimeout(r, 1200));
+              const retryStatus = await getPreviewStatus(ownerKey);
+              if (retryStatus?.status !== 'error') {
+                continue; // Resuelto determinísticamente sin gastar llamada LLM
               }
-
+            }
           }
+
+          // Error de import local (ej. './NoExiste') o sintaxis/código: inyectar tool_result BUILD_FAILED al LLM
+          intentos++;
+          if (intentos < MAX_INTENTOS) {
+            onProgress?.({ type: 'telemetry', phase: 'HEALING', label: 'Corrigiendo error de compilación...', payload: { attempt: intentos, maxAttempts: MAX_INTENTOS, errorSnippet: detectedViteError.substring(0, 200) } });
+
+            activeUserMessage = `BUILD_FAILED: ${detectedViteError}. Corrige antes de responder al usuario. Si importaste un archivo o componente que no existe (ej. './NoExiste'), corrígelo con "propose_patch" o créalo con "propose_change". NO cierres el turno sin corregir el error. El pedido original era:\n\n${userMessage}`;
+
+            continue; // Reintento silencioso en el MISMO turno
+          } else {
+            onProgress?.({ type: 'telemetry', phase: 'DEGRADED', label: 'Múltiples fallos detectados. Degradando con advertencia...' });
+            text = `⚠️ Error de compilación no resuelto en el preview:\n${detectedViteError}\n\nRevisa el archivo y el log para resolver este problema.`;
+            break;
+          }
+        }
 
 
 
@@ -2867,16 +2981,9 @@ REGLAS DE MODO BUILD (ACTUAL):
 
           }
 
-
-
-        }
-
       } catch (e) {
-
         console.error('Error en VFS Verification Loop:', e);
-
       }
-
     }
 
     
@@ -2915,10 +3022,50 @@ ${userMessage}`;
 
 
 
-      if (totalProposed > 0 && intentos < MAX_INTENTOS) {
+      // VERIFICADOR DE AFIRMACIONES DE PERSISTENCIA
+      if (dbConnection) {
+        const assertionRegex = /\b(base de datos|guardar|guardé|guardan|se guarda|se guardan|tabla|tablas|persist|conecté|conectado|conectada|almacenar|almacenan)\b/i;
+        const textMatches = assertionRegex.exec(text || '');
 
-        onProgress?.({ type: 'telemetry', phase: 'COMPLETED', label: 'Construcción y renderizado validados con éxito.' });
+        if (textMatches) {
+          const matchedWord = textMatches[1];
+          const hasDbChange = proposedDbChanges.length > 0;
+          const accessedTables = scanDataAccessInChanges(proposedChanges);
 
+          if (!hasDbChange) {
+            let assertionValid = false;
+            try {
+              const liveSchema = await getSchemaSummary(dbConnection);
+              const liveTableNames = Object.keys(liveSchema).filter(t => !t.startsWith('_flowpro_'));
+
+              if (accessedTables.size > 0) {
+                const allTablesExist = [...accessedTables.keys()].every(t => liveTableNames.includes(t));
+                if (allTablesExist) assertionValid = true;
+              } else if (liveTableNames.length > 0) {
+                assertionValid = true;
+              }
+            } catch (_) {}
+
+            if (!assertionValid) {
+              intentos++;
+              if (intentos < MAX_INTENTOS) {
+                onProgress?.({
+                  type: 'telemetry',
+                  phase: 'HEALING',
+                  label: 'Auditando afirmación de base de datos...',
+                  payload: { attempt: intentos, maxAttempts: MAX_INTENTOS },
+                });
+
+                activeUserMessage = `BUILD_FAILED: Tu respuesta afirma que se guardan los datos en la base de datos ("${matchedWord}"), pero NO ejecutaste la herramienta "propose_migration" ni existen las tablas necesarias en PostgreSQL. Está PROHIBIDO afirmar que los datos persisten sin crear la estructura real. Invoca "propose_migration" AHORA MISMO con el CREATE TABLE correspondiente. El pedido original era:\n\n${userMessage}`;
+                continue;
+              } else {
+                onProgress?.({ type: 'telemetry', phase: 'DEGRADED', label: 'Afirmación de persistencia no validada.' });
+                text = `⚠️ Nota importante: No se pudo completar la persistencia solicitada en la base de datos. No se ejecutó ninguna migración con propose_migration y las tablas requeridas no existen en la base de datos PostgreSQL. Se requiere crear las tablas antes de poder guardar los datos.`;
+                break;
+              }
+            }
+          }
+        }
       }
 
       break; // Si llega aquí, todo está verde o no hubo cambios, todo está verde o no hubo cambios

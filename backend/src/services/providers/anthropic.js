@@ -22,7 +22,7 @@ export async function converseAnthropic({
   attachments = [],
   accountId,
   scope = 'agent',
-  schemaTables = [],
+  schemaDetails = {},
 }) {
   const anthropic = new Anthropic({ apiKey, ...(baseURL ? { baseURL } : {}) })
   const anthropicTools = tools.map((t) => ({
@@ -129,6 +129,7 @@ Continúa con el pedido original del usuario pero con esta estrategia de bloques
     }
 
     if (toolUses.length === 0) break
+      const hasAskQuestion = toolUses.some(t => t.name === 'ask_question');
 
     messages.push({ role: 'assistant', content: response.content })
 
@@ -138,20 +139,54 @@ Continúa con el pedido original del usuario pero con esta estrategia de bloques
           if (signal?.aborted) throw new DOMException('Cancelado por el usuario', 'AbortError')
 
           // --- DB GUARDRAIL ---
-          if (toolUse.name === 'propose_change') {
-            const code = toolUse.input.new_content || ''
-            const match = code.match(/(?:supabase|db)\.from\(['"]([^'"]+)['"]\)/)
-            if (match) {
-              const tableName = match[1]
-              const tableExists = schemaTables.some(t => typeof t === 'string' && t.includes(tableName))
-              const hasMigration = toolUses.some(t => t.name === 'propose_migration')
+            if (toolUse.name === 'propose_change') {
+              const code = toolUse.input.new_content || ''
               
-              if (!tableExists && !hasMigration) {
-                 throw new Error(`FATAL ERROR: Estás intentando consultar/insertar en la tabla "${tableName}" (db.from('${tableName}')), pero NO EXISTE en la base de datos actual y NO has llamado a propose_migration en este turno para crearla. DEBES emitir el DDL CREATE TABLE usando propose_migration ANTES de programar el frontend.`)
+              // Find all db.from('table') calls
+              const fromRegex = /(?:supabase|db)\.from\(['"]([^'"]+)['"]\)([\s\S]*?)(?:;|$)/g;
+              let match;
+              while ((match = fromRegex.exec(code)) !== null) {
+                const tableName = match[1];
+                const chain = match[2];
+                const hasMigration = toolUses.some(t => t.name === 'propose_migration' || t.name === 'propose_db_change');
+                const tableExists = !!schemaDetails[tableName];
+                
+                if (!tableExists && !hasMigration) {
+                   throw new Error(`FATAL ERROR: Estás intentando consultar/insertar en la tabla "${tableName}" (db.from('${tableName}')), pero NO EXISTE en la base de datos actual y NO has llamado a propose_migration en este turno para crearla. DEBES emitir el DDL CREATE TABLE usando propose_migration ANTES de programar el frontend.`);
+                }
+                
+                if (tableExists) {
+                  const colsInDb = schemaDetails[tableName] || [];
+                  
+                  // Extract keys from .insert([{ key: value }]) or .insert({ key: value })
+                  const insertRegex = /\.insert\(\s*(?:\[\s*)?\{\s*([^}]+)\s*\}\s*(?:\]\s*)?\)/;
+                  const insertMatch = chain.match(insertRegex);
+                  if (insertMatch) {
+                    // Quick and dirty extraction of keys
+                    const keysPart = insertMatch[1];
+                    const keyRegex = /([a-zA-Z0-9_]+)\s*:/g;
+                    let kMatch;
+                    while ((kMatch = keyRegex.exec(keysPart)) !== null) {
+                      const col = kMatch[1];
+                      if (!colsInDb.includes(col) && !hasMigration) {
+                        throw new Error(`ERROR DE CONTRATO: La columna '${col}' no existe en la tabla '${tableName}'. Debes emitir propose_migration con ALTER TABLE ${tableName} ADD COLUMN ${col} [tipo]; antes de usarla en el frontend.`);
+                      }
+                    }
+                  }
+                  
+                  // Extract columns from .eq('col', value)
+                  const eqRegex = /\.eq\(\s*['"]([^'"]+)['"]/g;
+                  let eqMatch;
+                  while ((eqMatch = eqRegex.exec(chain)) !== null) {
+                    const col = eqMatch[1];
+                    if (!colsInDb.includes(col) && !hasMigration) {
+                      throw new Error(`ERROR DE CONTRATO: La columna '${col}' no existe en la tabla '${tableName}'. Debes emitir propose_migration con ALTER TABLE ${tableName} ADD COLUMN ${col} [tipo]; antes de usarla en el frontend.`);
+                    }
+                  }
+                }
               }
             }
-          }
-          // --- END GUARDRAIL ---
+            // --- END GUARDRAIL ---
 
           const result = await executeTool({ name: toolUse.name, input: toolUse.input })
           return { toolUse, result }
@@ -183,10 +218,10 @@ Continúa con el pedido original del usuario pero con esta estrategia de bloques
     }
     messages.push({ role: 'user', content: toolResults })
 
-    if (response.stop_reason !== 'tool_use') {
-      if (response.stop_reason === 'max_tokens') totalUsage.finish_reason = 'length'
-      break
-    }
+    if (response.stop_reason !== 'tool_use' || hasAskQuestion) {
+        if (response.stop_reason === 'max_tokens') totalUsage.finish_reason = 'length'
+        break
+      }
   }
 
   return { text: finalText, usage: totalUsage }
