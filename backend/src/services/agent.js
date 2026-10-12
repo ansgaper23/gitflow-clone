@@ -639,7 +639,16 @@ Decide qué hacer según lo que pida el usuario:
 
 
 
-DEPENDENCIAS: este proyecto corre con Vite + npm. Si al escribir código agregas un "import" de una librería externa que no sea "react"/"react-dom" (o alguna ya declarada en las "dependencies" del package.json que leíste), agrega también esa librería al package.json en el MISMO turno con "propose_change" (con una versión razonable). Si no lo haces, la vista previa no podrá resolver ese import y se romperá.
+DEPENDENCIAS Y LIBRERÍAS DE TERCEROS: este proyecto corre con Vite + npm.
+1. SOPORTE DE DEPENDENCIAS MODERNAS Y REPOSITORIOS:
+   - Tienes autorización explícita para proponer e instalar paquetes de npm modernos, paquetes de scoped registry (@namespace/pkg) o referencias válidas de repositorios de GitHub ("user/repo" o "github:user/repo").
+   - Si al escribir código agregas un "import" de una librería externa que no sea "react"/"react-dom" (o alguna ya declarada en "dependencies" de package.json), agrega también esa librería al package.json en el MISMO turno con "propose_patch" o "propose_change" (con una versión razonable o semver válido). Si no lo haces, la vista previa no podrá resolver ese import y se romperá.
+2. REGLA DE EXPORTACIÓN A PDF / IMAGEN / CANVAS:
+   - PROHIBIDO usar "html2canvas" tradicional en proyectos con Tailwind CSS moderno (Tailwind v4 o setups con oklch), ya que falla catastróficamente al parsear colores "oklch()" y variables CSS avanzadas ("Parsing CSS failed").
+   - Usa SIEMPRE "html2canvas-pro" (ej. import html2canvas from 'html2canvas-pro') o la suite nativa de "jspdf" con "jspdf-autotable".
+3. PRINCIPIO DE NO-SUPOSICIÓN DE APIS:
+   - Antes de modificar código por un fallo de exportación o runtime, verifica la compatibilidad de tipos, sintaxis y librerías en vez de alterar configuraciones aleatorias de CORS, tainted canvas o hacks cosméticos. Si una exportación falla al renderizar estilos o canvas, la causa raíz es la incompatibilidad de la librería clásica con Tailwind moderno (usa "html2canvas-pro" o "jspdf" nativo).
+
 
 
 
@@ -835,7 +844,13 @@ If a design request is broad or ambiguous, make executive architectural decision
 
 - VALIDACIÓN DE COMPILACIÓN (CRÍTICO): Nunca declares una tarea terminada sin confirmación de compilación limpia del sistema. Si recibes BUILD_FAILED, corrígelo antes de responder. Prohibido decir "listo" o "aplicado" si la compilación arrojó errores.
 
-
+### REGLAS DE DEPENDENCIAS MODERNAS Y EXPORTACIONES (MANDATORIO)
+1. **Regla de exportación a PDF / Imagen:**
+   - PROHIBIDO usar "html2canvas" tradicional en proyectos con Tailwind CSS moderno, ya que falla al parsear colores "oklch()" y variables CSS avanzadas ("Parsing CSS failed"). Usa SIEMPRE "html2canvas-pro" (ej. import html2canvas from 'html2canvas-pro') o la suite nativa de "jspdf" con "jspdf-autotable".
+2. **Soporte de dependencias libres y repositorios:**
+   - El agente tiene autorización explícita para proponer e instalar paquetes de npm modernos, paquetes de scoped registry (@namespace/pkg) o referencias válidas de GitHub ("npm install user/repo"), asegurando siempre que se agreguen a "package.json".
+3. **Principio de no-suposición de APIs:**
+   - Antes de modificar código por un fallo de exportación, el agente debe verificar la compatibilidad de tipos y sintaxis en vez de alterar configuraciones aleatorias de CORS o tainted canvas.
 
 ### DESIGN SYSTEM & UI RULES (MANDATORY)
 
@@ -1749,30 +1764,34 @@ export async function runAgent({ agentId, accessToken, project, history, userMes
   // (mensaje inicial del mismo caso real, pegado el error de la pantalla) tampoco matcheaba nada.
 
   const userReportsIssue =
-
     !isPlanMode &&
-
-    /no\s+(?:\w+\s+)?(funciona|anda|arranca|compila|responde|carga|abre|renderiza)|sigue\s+(?:sin\s+\w+|igual|fallando|roto|mal|(?:el\s+mismo\s+|dando\s+el\s+mismo\s+)?(?:problema|error|fallo))|se (rompi[oó]|qued[oó] (mal|roto|colgado))|pantalla (blanca|en blanco)|no (se ve|aparece) nada|error al (cargar|abrir|iniciar)|deploy(a|ó)? mal|no despleg[oó]|(sale|aparece|tira|muestra|me\s+(sale|aparece))\s+(este\s+|esta\s+|esto\s*[,:]?\s*)?error/i.test(
-
+    /no\s+(?:\w+\s+)?(funciona|anda|arranca|compila|responde|carga|abre|renderiza|exporta|descarga|guarda|envia|envía)|sigue\s+(?:sin\s+\w+|igual|fallando|roto|mal|(?:el\s+mismo\s+|dando\s+el\s+mismo\s+)?(?:problema|error|fallo))|se (rompi[oó]|qued[oó] (mal|roto|colgado))|pantalla (blanca|en blanco)|no (se ve|aparece) nada|error al (cargar|abrir|iniciar|exportar|descargar|guardar|generar)|deploy(a|ó)? mal|no despleg[oó]|(sale|aparece|tira|muestra|me\s+(sale|aparece))\s+(este\s+|esta\s+|esto\s*[,:]?\s*)?error/i.test(
       userMessage,
-
     )
 
   // Señal DISTINTA de "userReportsIssue" (esa detecta que algo YA está roto; esta detecta que el
-
   // usuario pidió EXPLÍCITAMENTE que se verifique antes de contestar, típicamente después de que
-
   // un "ya está arreglado" anterior resultó falso) — visto en el mismo caso real: "sigue el mismo
-
   // problema, VERIFICA QUE FUNCIONE ANTES DE ENTREGAR". El chequeo pasivo de arriba (leer el log
-
   // del servidor) no alcanza para esto: el usuario está pidiendo una prueba activa en el
-
   // navegador (test_preview), no solo mirar si el server sigue arriba.
-
   const userDemandsVerification =
-
     !isPlanMode && /(verific|comprob|asegur)\w*\s+.{0,40}(funcion|antes de (entreg|dar|decir|termin)|de verdad|de verd[aá]d)/i.test(userMessage)
+
+  // CAPA 3: Telemetría de Runtime Bridge en tiempo real (consola de navegador / unhandled exceptions)
+  const lastRuntimeError = previewAvailable
+    ? (runtimeBus.getLastError(ownerKey) || (project?.id ? (runtimeBus.getLastError(project.id) || runtimeBus.getLastError(`project:${project.id}`)) : null))
+    : null;
+
+  let runtimeErrorReport = '';
+  if (lastRuntimeError) {
+    const timeAgoSec = Math.max(1, Math.round((Date.now() - (lastRuntimeError.timestamp || Date.now())) / 1000));
+    runtimeErrorReport = `\n\n[ÚLTIMO ERROR DE RUNTIME DETECTADO EN EL PREVIEW (${timeAgoSec}s atrás)]:
+- Tipo / Origen: ${lastRuntimeError.source || 'Runtime Console'}
+- Mensaje: ${lastRuntimeError.message || '(sin mensaje)'}
+${lastRuntimeError.filename ? `- Archivo: ${lastRuntimeError.filename}:${lastRuntimeError.lineno || 0}\n` : ''}${lastRuntimeError.stack ? `- Stack Trace:\n\`\`\`\n${lastRuntimeError.stack}\n\`\`\`\n` : ''}
+El usuario está experimentando este error EXACTO en su navegador ahora mismo (o ocurrió al probar la interfaz). Debes resolverlo directamente en el código sin inventar causas ni pedirle que lo reproduzca.`;
+  }
 
   let previewRealityCheck = null
 
@@ -1870,7 +1889,7 @@ onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Analizando intenci�
 
     ? `\n\nEl usuario está reportando un problema con la vista previa en este mensaje. ${previewRealityCheck}\nUsá esto como punto de partida real — no respondas "todo funciona" o "no encontré ningún error" si este estado dice lo contrario. Si hace falta más detalle, igual podés llamar "check_preview_errors" o "test_preview" de nuevo vos mismo.`
 
-    : '') + (userDemandsVerification && previewAvailable
+    : '') + (runtimeErrorReport || '') + (userDemandsVerification && previewAvailable
 
     ? '\n\nEl usuario te pidió EXPLÍCITAMENTE que verifiques/comprobés que funciona de verdad antes de contestar — probablemente porque una respuesta tuya anterior en este mismo chat dijo "ya está arreglado" y no era cierto. Esto no es opcional ni se cumple leyendo el código de nuevo: en ESTE turno tenés que llamar "test_preview" (o al menos "check_preview_errors" si "test_preview" no aplica al caso) y basar tu respuesta en lo que esa herramienta te devolvió, no en lo que vos "creés" que debería pasar. Si terminás el turno sin haberla llamado, no digas "ya funciona"/"listo" — decí explícitamente que no pudiste verificarlo y por qué.'
 
@@ -2442,19 +2461,19 @@ REGLAS DE MODO BUILD (ACTUAL):
 
           const status = await getPreviewStatus(ownerKey)
 
+          const lastErr = runtimeBus.getLastError(ownerKey) ||
+            (project?.id ? (runtimeBus.getLastError(project.id) || runtimeBus.getLastError(`project:${project.id}`)) : null);
+          const runtimeErrStr = lastErr ? `\n\n[ÚLTIMO ERROR DE RUNTIME EN CONSOLA DEL NAVEGADOR]:\nOrigen: ${lastErr.source || 'Runtime'}\nMensaje: ${lastErr.message || '(sin mensaje)'}${lastErr.filename ? `\nArchivo: ${lastErr.filename}:${lastErr.lineno || 0}` : ''}${lastErr.stack ? `\nStack:\n${lastErr.stack}` : ''}` : '';
+
           if (!status || status.status === 'idle' || status.status === 'unavailable') {
-
-            return 'No hay una vista previa corriendo ahora mismo. Pídele al usuario que la inicie desde el panel de Vista previa para poder diagnosticar el error.'
-
+            return `No hay una vista previa corriendo ahora mismo. Pídele al usuario que la inicie desde el panel de Vista previa para poder diagnosticar el error.${runtimeErrStr}`
           }
 
           if (status.repoFullName !== project.repo_full_name) {
-
-            return 'Hay una vista previa corriendo, pero de otro proyecto distinto a este. No se puede diagnosticar este proyecto hasta que el usuario abra su vista previa.'
-
+            return `Hay una vista previa corriendo, pero de otro proyecto distinto a este. No se puede diagnosticar este proyecto hasta que el usuario abra su vista previa.${runtimeErrStr}`
           }
 
-          return `Estado de la vista previa: ${status.status}${status.error ? ` (error: ${status.error})` : ''}.\nÚltimas líneas del log del servidor de desarrollo:\n${status.logsTail || '(sin salida reciente)'}`
+          return `Estado de la vista previa: ${status.status}${status.error ? ` (error: ${status.error})` : ''}.\nÚltimas líneas del log del servidor de desarrollo:\n${status.logsTail || '(sin salida reciente)'}${runtimeErrStr}`
 
         } catch (err) {
 
