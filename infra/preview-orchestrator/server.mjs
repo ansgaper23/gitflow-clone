@@ -3,6 +3,7 @@ import { spawn, execFile, execSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import net from 'node:net'
+import { getRuntimeTelemetryProbeScript } from './runtimeTelemetryProbe.js'
 
 // ---------------------------------------------------------------------------
 // Pool de previews aisladas por usuario (POOL_SIZE cupos, cada uno con su propia carpeta y
@@ -78,20 +79,40 @@ function resetSlot(slot) {
   slot.error = null
   slot.generation++
   slot.lastPing = 0
+  slot.lastActivity = 0
+  slot.isBusy = false
 }
+
+const MAX_PER_USER = Number(process.env.MAX_PREVIEWS_PER_USER || 2)
 
 function findSlotByOwner(ownerKey) {
   return slots.find((s) => s.ownerKey === ownerKey) || null
+}
+
+function findSlotByOwnerAndRepo(ownerKey, repoFullName) {
+  return slots.find((s) => s.ownerKey === ownerKey && s.repoFullName === repoFullName) || null
+}
+
+function findSlotsByOwner(ownerKey) {
+  return slots.filter((s) => s.ownerKey === ownerKey)
 }
 
 function findFreeSlot() {
   return slots.find((s) => s.ownerKey === null) || null
 }
 
-// El menos usado recientemente (más tiempo sin polling) — el que se desaloja cuando los
-// POOL_SIZE cupos ya están ocupados por owners distintos y llega uno nuevo.
+// POLÍTICA LRU CON ESTADO DE DRENAJE (FASE 4)
+// Selecciona el cupo con lastActivity más antiguo, ignorando cupos en starting,
+// ejecutando git commit o con un turno/build activo (isBusy).
 function findLruSlot() {
-  return slots.slice().sort((a, b) => a.lastPing - b.lastPing)[0]
+  const evictableCandidates = slots.filter((s) => {
+    if (s.status === 'starting' || s.status === 'installing' || s.status === 'cloning' || s.status === 'draining') return false
+    if (s.isBusy) return false
+    return true
+  })
+
+  const pool = evictableCandidates.length > 0 ? evictableCandidates : slots
+  return pool.slice().sort((a, b) => (a.lastActivity || a.lastPing || 0) - (b.lastActivity || b.lastPing || 0))[0]
 }
 
 // Igual que slugify() del backend ([a-z0-9-]) — "slugHint" ya viene sanitizado desde ahí
@@ -148,7 +169,7 @@ function detectStartCommand(dir, port) {
   return { cmd: 'npm', args: ['run', 'dev'], env: { HOST: '0.0.0.0', PORT: String(port) } }
 }
 
-async function waitForPreviewReady(url, maxRetries = 15, delayMs = 1000) {
+async function waitForPreviewReady(url, maxRetries = 90, delayMs = 1000, containerName = null) {
   for (let i = 0; i < maxRetries; i++) {
     try {
       const res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(2000) });
@@ -156,7 +177,17 @@ async function waitForPreviewReady(url, maxRetries = 15, delayMs = 1000) {
         return true;
       }
     } catch (err) {
-      // Vite aún está iniciando o compilando; esperar al siguiente intento
+      // Si el contenedor se cerró prematuramente (ej. error de imports en vite.config), abortar espera
+      if (containerName && i > 5 && i % 3 === 0) {
+        try {
+          const inspectOut = execSync(`docker inspect -f '{{.State.Running}}' ${containerName}`, { stdio: 'pipe' }).toString().trim()
+          if (inspectOut === 'false') {
+            return false
+          }
+        } catch {
+          // Contenedor aún levantando, no abortar
+        }
+      }
     }
     await new Promise(resolve => setTimeout(resolve, delayMs));
   }
@@ -205,96 +236,68 @@ function writeFilesOverlay(workdir, files) {
 }
 
 
-function injectRuntimeReporter(workdir, ownerKey) {
-  const indexPath = path.join(workdir, 'index.html');
-  if (!fs.existsSync(indexPath)) return;
-
-  let html = fs.readFileSync(indexPath, 'utf-8');
-  if (html.includes('FLOWPRO_RUNTIME_ERROR')) return;
-
-  const publicApiUrl = process.env.PUBLIC_API_URL || 'https://flow-pro.online/api/preview/runtime-report';
-  const script = `
-    <script src="https://cdn.jsdelivr.net/npm/html2canvas-pro@2.5.2/dist/html2canvas-pro.min.js"></script>
-    <script>
-    (function() {
-      const SESSION_ID = "${ownerKey}";
-      const REPORT_URL = "${publicApiUrl}";
-      function emitCrash(payload) {
-        window.parent.postMessage({ type: 'FLOWPRO_RUNTIME_ERROR', sessionId: SESSION_ID, payload }, '*');
-        try {
-          fetch(REPORT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId: SESSION_ID, ...payload }),
-            keepalive: true
-          }).catch(() => {});
-        } catch (_) {}
+function ensureWorkspaceGit(workdir) {
+  try {
+    const gitDir = path.join(workdir, '.git')
+    if (!fs.existsSync(gitDir)) {
+      execSync('git init -b main && git config user.name "FlowPro Agent" && git config user.email "agent@flow-pro.online" && git config commit.gpgsign false', { cwd: workdir, stdio: 'ignore' })
+      const gitignorePath = path.join(workdir, '.gitignore')
+      if (!fs.existsSync(gitignorePath)) {
+        fs.writeFileSync(gitignorePath, 'node_modules\n.vite\ndist\n*.log\nenv-*.list\n')
       }
+    }
+    execSync('git add -A && git commit -m "FlowPro local checkpoint" --no-verify --allow-empty', { cwd: workdir, stdio: 'ignore' })
+  } catch (_) {}
+}
 
-      // Fase de captura (true) para interceptar errores de carga de scripts y módulos ES
-      window.addEventListener('error', (event) => {
-        emitCrash({
-          source: 'UNCAUGHT_EXCEPTION',
-          message: event.message || event.error?.message || (event.target && event.target.src ? 'Error cargando recurso: ' + event.target.src : 'Error de script/módulo'),
-          filename: event.filename || event.target?.src || null,
-          lineno: event.lineno,
-          colno: event.colno,
-          stack: event.error ? event.error.stack : null
-        });
-      }, true);
-
-      window.addEventListener('unhandledrejection', (event) => {
-        const reason = event.reason;
-        emitCrash({ source: 'UNHANDLED_REJECTION', message: reason?.message || String(reason), stack: reason?.stack || null });
-      });
-
-      // Detección del Overlay de error de Vite
-      try {
-        const observer = new MutationObserver((mutations) => {
-          for (const m of mutations) {
-            for (const node of m.addedNodes) {
-              if (node.tagName === 'VITE-ERROR-OVERLAY' || (node.id && node.id.includes('vite-error'))) {
-                const text = node.shadowRoot ? node.shadowRoot.textContent : node.textContent;
-                emitCrash({ source: 'VITE_ERROR_OVERLAY', message: text || 'Vite compile overlay detected' });
-              }
-            }
-          }
-        });
-        observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
-      } catch (_) {}
-
-      window.addEventListener('message', async (event) => {
-        if (event.data?.type === 'FLOWPRO_TRIGGER_SNAPSHOT') {
-          try {
-            const h2c = window.html2canvas?.default || window.html2canvas;
-            if (typeof h2c === 'function') {
-              const canvas = await h2c(document.body, {
-                logging: false,
-                useCORS: true,
-                scale: 0.4,
-                allowTaint: false,
-                ignoreElements: (el) => el.tagName === 'IFRAME' || el.classList.contains('no-snapshot')
-              });
-              const webpData = canvas.toDataURL('image/webp', 0.5);
-              window.parent.postMessage({ type: 'FLOWPRO_SNAPSHOT_SUCCESS', payload: webpData }, '*');
-            } else {
-              window.parent.postMessage({ type: 'FLOWPRO_SNAPSHOT_FALLBACK' }, '*');
-            }
-          } catch (err) {
-            console.warn('[Snapshot] Error al generar captura:', err.message);
-            window.parent.postMessage({ type: 'FLOWPRO_SNAPSHOT_FALLBACK' }, '*');
-          }
-        }
-      });
-    })();
-    </script>
-  `;
-  if (html.includes('</head>')) {
-    html = html.replace('</head>', script + '\n</head>');
-  } else {
-    html += script;
+function sanitizePackageJson(workdir) {
+  try {
+    const pkgPath = path.join(workdir, 'package.json')
+    if (!fs.existsSync(pkgPath)) return
+    let pkg = null
+    try {
+      pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'))
+    } catch (parseErr) {
+      console.warn(`[server.mjs] JSON inválido en ${pkgPath}, restaurando estructura básica:`, parseErr.message)
+      pkg = { name: 'app', version: '0.0.1', type: 'module' }
+    }
+    pkg.scripts = pkg.scripts || {}
+    if (!pkg.scripts.dev) {
+      pkg.scripts.dev = 'vite'
+    }
+    if (!pkg.dependencies) {
+      pkg.dependencies = {}
+    }
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2))
+  } catch (err) {
+    console.error('[server.mjs] Error en sanitizePackageJson:', err.message)
   }
-  fs.writeFileSync(indexPath, html);
+}
+
+function injectRuntimeReporter(workdir, ownerKey) {
+  const indexPath = path.join(workdir, 'index.html')
+  if (!fs.existsSync(indexPath)) return
+
+  let html = fs.readFileSync(indexPath, 'utf-8')
+  const publicApiUrl = process.env.PUBLIC_API_URL || 'https://flow-pro.online/api/preview/runtime-report'
+  const script = getRuntimeTelemetryProbeScript(ownerKey, publicApiUrl)
+
+  if (html.includes('<!-- FLOWPRO_TELEMETRY_PROBE_START -->')) {
+    html = html.replace(/<!-- FLOWPRO_TELEMETRY_PROBE_START -->[\s\S]*?<!-- FLOWPRO_TELEMETRY_PROBE_END -->/, () => script)
+  } else if (html.includes('FLOWPRO_RUNTIME_ERROR')) {
+    // Reemplazar sonda anterior no marcada
+    const probeRegex = /<script\s+src="https:\/\/cdn\.jsdelivr\.net\/npm\/html2canvas-pro[\s\S]*?<\/script>\s*(?:<script>[\s\S]*?<\/script>)?/
+    if (probeRegex.test(html)) {
+      html = html.replace(probeRegex, () => script)
+    } else if (html.includes('</head>')) {
+      html = html.replace('</head>', () => `${script}\n</head>`)
+    }
+  } else if (html.includes('</head>')) {
+    html = html.replace('</head>', () => `${script}\n</head>`)
+  } else {
+    html += script
+  }
+  fs.writeFileSync(indexPath, html)
 }
 
 const app = express()
@@ -314,7 +317,23 @@ app.post('/start', (req, res) => {
   if (mode === 'virtual' && !files) return res.status(400).json({ error: 'falta "files" para mode=virtual' })
   if (mode !== 'virtual' && !cloneUrl) return res.status(400).json({ error: 'falta cloneUrl' })
 
-  const slot = findSlotByOwner(ownerKey) || findFreeSlot() || findLruSlot()
+  // Multi-slot: si ya corre para ESTE MISMO repo, reusar ese slot
+  let slot = findSlotByOwnerAndRepo(ownerKey, repoFullName)
+  if (!slot) {
+    const ownerSlots = findSlotsByOwner(ownerKey)
+    if (ownerSlots.length < MAX_PER_USER) {
+      // Tiene espacio para otro preview (hasta 2 por cuenta)
+      slot = findFreeSlot() || findLruSlot()
+    } else {
+      slot = ownerSlots.slice().sort((a, b) => (a.lastActivity || a.lastPing || 0) - (b.lastActivity || b.lastPing || 0))[0]
+    }
+  }
+
+  if (slot.ownerKey && (slot.ownerKey !== ownerKey || slot.repoFullName !== repoFullName)) {
+    log(slot, `[LRU DRAIN] Desalojando cupo #${slot.index} (${slot.slug}) de forma segura antes de reasignar...`)
+    slot.status = 'draining'
+    ensureWorkspaceGit(slot.workdir)
+  }
   killSlot(slot) // corta lo que hubiera antes en este cupo (propio o de otro dueño desalojado)
 
   const slug = sanitizeSlug(slugHint) || sanitizeSlug(repoFullName.split('/').pop()) || `p${slot.index}`
@@ -333,23 +352,67 @@ app.post('/start', (req, res) => {
   runStart(slot, { mode, repoFullName, cloneUrl, branch, files, envVars, slug })
 })
 
-async function runStart(slot, { mode, repoFullName, cloneUrl, branch, files, envVars, slug }) {
+function extractMissingPackage(text) {
+  if (!text) return null
+  const match = text.match(/(?:Failed to resolve import|Cannot find module|failed to load url) ["']([^"'./][^"']*)["']/i)
+  if (!match) return null
+  const rawPkg = match[1].trim()
+  if (!rawPkg) return null
+  return rawPkg.startsWith('@') ? rawPkg.split('/').slice(0, 2).join('/') : rawPkg.split('/')[0]
+}
+
+function isCorruptedVolumeError(text) {
+  if (!text) return false
+  return /ENOTEMPTY|errno -39|directory not empty|syscall rename.*node_modules/i.test(text)
+}
+
+function purgeNamedVolume(slotIndex) {
+  try {
+    execSync(`docker volume rm -f preview-deps-${slotIndex}`, { stdio: 'ignore' })
+  } catch {}
+}
+
+function ensurePackageInManifest(workdir, pkgName) {
+  try {
+    const pkgPath = path.join(workdir, 'package.json')
+    if (!fs.existsSync(pkgPath)) return false
+    const pkgJson = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'))
+    pkgJson.dependencies = pkgJson.dependencies || {}
+    if (!pkgJson.dependencies[pkgName] && !pkgJson.devDependencies?.[pkgName]) {
+      pkgJson.dependencies[pkgName] = 'latest'
+      fs.writeFileSync(pkgPath, JSON.stringify(pkgJson, null, 2))
+      return true
+    }
+  } catch (err) {
+    console.error(`Error updating package.json with ${pkgName}:`, err.message)
+  }
+  return false
+}
+
+async function runStart(slot, { mode, repoFullName, cloneUrl, branch, files, envVars, slug, isRetry = false }) {
   const myGen = ++slot.generation
+  slot.isBusy = true
+  slot.lastActivity = Date.now()
   try {
     if (mode === 'virtual') {
       log(slot, `Escribiendo ${Object.keys(files || {}).length} archivos del proyecto virtual...`)
       writeVirtualFilesFresh(slot.workdir, files)
+      ensureWorkspaceGit(slot.workdir)
     } else {
-      fs.rmSync(slot.workdir, { recursive: true, force: true })
-      fs.mkdirSync(slot.workdir, { recursive: true })
-      log(slot, `Clonando ${repoFullName}${branch ? ` (rama ${branch})` : ''}...`)
-      const cloneArgs = ['clone', '--depth', '1']
-      if (branch) cloneArgs.push('--branch', branch)
-      cloneArgs.push(cloneUrl, slot.workdir)
-      await runCommand(slot, 'git', cloneArgs, {})
+      if (!isRetry) {
+        fs.rmSync(slot.workdir, { recursive: true, force: true })
+        fs.mkdirSync(slot.workdir, { recursive: true })
+        log(slot, `Clonando ${repoFullName}${branch ? ` (rama ${branch})` : ''}...`)
+        const cloneArgs = ['clone', '--depth', '1']
+        if (branch) cloneArgs.push('--branch', branch)
+        cloneArgs.push(cloneUrl, slot.workdir)
+        await runCommand(slot, 'git', cloneArgs, {})
+        ensureWorkspaceGit(slot.workdir)
+      }
     }
     if (myGen !== slot.generation) return
 
+    sanitizePackageJson(slot.workdir)
     injectRuntimeReporter(slot.workdir, slot.ownerKey)
 
     const { cmd, args, env: extraEnv } = detectStartCommand(slot.workdir, slot.port)
@@ -373,12 +436,12 @@ async function runStart(slot, { mode, repoFullName, cloneUrl, branch, files, env
       'run', '--name', `preview-${slot.index}`,
       '-p', `127.0.0.1:${slot.port}:${slot.port}`,
       '-v', `${slot.workdir}:/workspace`,
-      '-v', `/workspace/node_modules`,
+      '-v', `preview-deps-${slot.index}:/workspace/node_modules`,
       '-w', '/workspace',
       '--env-file', envFilePath,
       '--memory=1024m', '--cpus=1.0', '--pids-limit=100', // Sandboxing: Límite de recursos por usuario
       'node:20',
-      'sh', '-c', `rm -rf node_modules/.vite && npm install --prefer-offline --no-audit --no-fund --loglevel=error && ${cmd} ${args.join(' ')}`
+      'sh', '-c', `rm -rf node_modules/.vite && (npm install --prefer-offline --no-audit --no-fund --loglevel=error || npm install --legacy-peer-deps --no-audit --no-fund --loglevel=error) && ${cmd} ${args.join(' ')}`
     ]
 
     slot.child = spawn('docker', dockerArgs, {
@@ -387,22 +450,75 @@ async function runStart(slot, { mode, repoFullName, cloneUrl, branch, files, env
     })
     slot.child.unref()
 
-    const up = await waitForPreviewReady('http://127.0.0.1:' + slot.port, 90, 1000)
+    const up = await waitForPreviewReady('http://127.0.0.1:' + slot.port, 90, 1000, `preview-${slot.index}`)
     if (myGen !== slot.generation) return
     if (up) {
       slot.status = 'running'
       slot.error = null
+      slot.lastBootErrorLog = null
       slot.url = `${PUBLIC_SCHEME}://${slug}.${PUBLIC_HOST}`
       log(slot, `Preview corriendo en ${slot.url}`)
     } else {
+      // Extraer logs para diagnóstico y auto-reparación
+      let rawLogs = ''
+      try {
+        if (fs.existsSync(logFile(slot))) {
+          rawLogs = fs.readFileSync(logFile(slot), 'utf-8')
+        }
+      } catch {}
+
+      const hasCorruptedVolume = isCorruptedVolumeError(rawLogs)
+      const missingPkg = extractMissingPackage(rawLogs)
+
+      if (hasCorruptedVolume) {
+        log(slot, `[AUTO-REPAIR] Volumen corrupto detectado (ENOTEMPTY / errno -39). Purgando preview-deps-${slot.index}...`)
+        purgeNamedVolume(slot.index)
+      }
+
+      if (missingPkg) {
+        log(slot, `[AUTO-REPAIR] Dependencia faltante detectada en logs: "${missingPkg}". Registrando en package.json...`)
+        ensurePackageInManifest(slot.workdir, missingPkg)
+      }
+
+      // Si falló el primer intento, aplicar Kill & Respawn forzoso con limpieza de caché
+      if (!isRetry) {
+        log(slot, 'Timeout o caída detectada. Ejecutando Kill & Respawn limpio con auto-reparación...')
+        killSlot(slot)
+        try { fs.rmSync(path.join(slot.workdir, 'node_modules/.vite'), { recursive: true, force: true }) } catch {}
+        return runStart(slot, { mode, repoFullName, cloneUrl, branch, files, envVars, slug, isRetry: true })
+      }
+
+      // Si falló incluso tras reintento, matar contenedor para liberar puerto y recursos
+      killSlot(slot)
+
+      // Extraer posible error de logs para diagnóstico certero
+      let extractedErr = null
+      for (const line of rawLogs.split('\n').reverse()) {
+        const trimmed = line.trim()
+        if (trimmed && (VITE_ERROR_PATTERNS.some(p => trimmed.includes(p)) || trimmed.includes('Error:') || trimmed.includes('ERR_'))) {
+          extractedErr = trimmed
+          break
+        }
+      }
+
+      const logLines = rawLogs.split('\n').filter(Boolean)
+      slot.lastBootErrorLog = logLines.slice(-40).join('\n')
+
       slot.status = 'error'
-      slot.error = 'Tiempo de espera agotado iniciando el servidor de desarrollo'
+      slot.error = extractedErr || 'Tiempo de espera agotado iniciando el servidor de desarrollo'
     }
   } catch (err) {
     if (myGen !== slot.generation) return
+    killSlot(slot)
     log(slot, `ERROR: ${err.message}`)
     slot.status = 'error'
     slot.error = err.message
+    slot.lastBootErrorLog = err.stack || err.message
+  } finally {
+    if (myGen === slot.generation) {
+      slot.isBusy = false
+      slot.lastActivity = Date.now()
+    }
   }
 }
 
@@ -418,56 +534,152 @@ const VITE_ERROR_PATTERNS = [
   'does not provide an export named'
 ]
 
-function extractViteError(logsTail) {
+async function extractViteError(logsTail, slot) {
   if (!logsTail) return null
-  const parts = logsTail.split('--- VFS REFRESH START ---')
+  const parts = logsTail.split(/--- VFS REFRESH START.*---/)
   const recent = parts[parts.length - 1]
   const clean = recent.replace(/\x1b\[[0-9;]*m/g, '')
 
+  const successMarkers = [
+    'HMR updated cleanly',
+    'optimized dependencies changed. reloading',
+    'page reload',
+    'hmr update'
+  ]
+  const lastSuccessIdx = Math.max(-1, ...successMarkers.map(m => clean.lastIndexOf(m)))
+
   for (const pattern of VITE_ERROR_PATTERNS) {
     if (clean.includes(pattern)) {
+      const errorIdx = clean.lastIndexOf(pattern)
+      if (lastSuccessIdx > errorIdx) {
+        // Hubo una recarga exitosa posterior al error
+        continue
+      }
       const line = clean.split('\n').find((l) => l.includes(pattern)) || pattern
-      return line.trim()
+      const detectedError = line.trim()
+
+      // Verificación activa de resolución (Warm-up Check):
+      if (slot?.port) {
+        const fileMatch = clean.match(/(?:\/workspace)?(\/src\/[^\s:?#]+\.[a-zA-Z0-9]+)/i)
+        const testUri = fileMatch ? fileMatch[1] : '/'
+        try {
+          const res = await fetch(`http://127.0.0.1:${slot.port}${testUri}`, {
+            signal: AbortSignal.timeout(2500)
+          })
+          if (res.ok) {
+            const bodyText = await res.text().catch(() => '')
+            if (!bodyText.includes('Pre-transform error') && !bodyText.includes('Internal server error')) {
+              log(slot, `[Vite Warm-up] Verificado OK para ${testUri}: error en logs ignorado por estar resuelto.`)
+              continue
+            }
+          }
+        } catch (_) {}
+      }
+
+      return detectedError
     }
   }
   return null
 }
 
 // Consultado por el editor mientras hay un turno en curso (ownerKey del usuario autenticado) —
-// SOLO ve su propio cupo. Devuelve status:'error' de forma veraz si Vite arrojó error en el log.
-app.get('/status', (req, res) => {
+// Si se envía repoFullName, devuelve el slot específico de ese repositorio.
+app.get('/status', async (req, res) => {
   const ownerKey = String(req.query.ownerKey || '')
+  const repoFullName = req.query.repoFullName ? String(req.query.repoFullName) : null
   if (!ownerKey) return res.status(400).json({ error: 'falta ownerKey' })
 
-  const slot = findSlotByOwner(ownerKey)
-  if (!slot) return res.json({ status: 'idle', repoFullName: null, url: null, error: null })
+  const slot = repoFullName
+    ? findSlotByOwnerAndRepo(ownerKey, repoFullName)
+    : findSlotByOwner(ownerKey)
+  if (!slot) return res.json({ status: 'idle', repoFullName: null, url: null, error: null, lastBuildTime: null })
 
   slot.lastPing = Date.now()
   const rawLogs = fs.existsSync(logFile(slot)) ? fs.readFileSync(logFile(slot), 'utf-8') : ''
   const logsTail = rawLogs.split('\n').slice(-80).join('\n')
 
-  const detectedError = extractViteError(logsTail)
+  const detectedError = await extractViteError(logsTail, slot)
   if (detectedError && slot.status === 'running') {
     return res.json({
       status: 'error',
       repoFullName: slot.repoFullName,
       url: slot.url,
       error: detectedError,
-      logsTail
+      lastBootErrorLog: slot.lastBootErrorLog || null,
+      logsTail,
+      lastBuildTime: slot.lastBuildTime || null
     })
   }
 
-  res.json({ status: slot.status, repoFullName: slot.repoFullName, url: slot.url, error: slot.error, logsTail })
+  res.json({
+    status: slot.status,
+    repoFullName: slot.repoFullName,
+    url: slot.url,
+    error: slot.error,
+    lastBootErrorLog: slot.lastBootErrorLog || null,
+    logsTail,
+    lastBuildTime: slot.lastBuildTime || null
+  })
 })
 
 app.post('/stop', (req, res) => {
   const ownerKey = String(req.body?.ownerKey || '')
-  const slot = findSlotByOwner(ownerKey)
-  if (slot) {
+  const repoFullName = req.body?.repoFullName ? String(req.body.repoFullName) : null
+  if (!ownerKey) return res.status(400).json({ error: 'falta ownerKey' })
+
+  const targetSlots = repoFullName
+    ? [findSlotByOwnerAndRepo(ownerKey, repoFullName)].filter(Boolean)
+    : findSlotsByOwner(ownerKey)
+
+  for (const slot of targetSlots) {
     resetSlot(slot)
-    rewriteNginxMap()
   }
+  rewriteNginxMap()
   res.json({ status: 'idle' })
+})
+
+// Purga física de archivos de código en disco ante un reinicio total de proyecto (Hard Reset)
+app.post('/reset-workspace', (req, res) => {
+  const ownerKey = String(req.body?.ownerKey || '')
+  const repoFullName = req.body?.repoFullName ? String(req.body.repoFullName) : null
+  if (!ownerKey) return res.status(400).json({ error: 'falta ownerKey' })
+
+  const targetSlots = repoFullName
+    ? [findSlotByOwnerAndRepo(ownerKey, repoFullName)].filter(Boolean)
+    : findSlotsByOwner(ownerKey)
+
+  let purgedCount = 0
+  for (const slot of targetSlots) {
+    if (slot && slot.workdir && fs.existsSync(slot.workdir)) {
+      // Salvaguarda Pre-Reset: Crear snapshot de Git local antes de purgar archivos
+      try {
+        ensureWorkspaceGit(slot.workdir)
+        execSync('git add -A', { cwd: slot.workdir, stdio: 'ignore' })
+        execSync('git commit -m "FlowPro [CHECKPOINT]: Pre-reset automatic snapshot" --no-verify --allow-empty', { cwd: slot.workdir, stdio: 'ignore' })
+      } catch (_) {}
+
+      const srcDir = path.join(slot.workdir, 'src')
+      if (fs.existsSync(srcDir)) {
+        const subdirs = ['components', 'pages', 'views', 'lib', 'utils', 'hooks', 'context', 'services']
+        for (const sub of subdirs) {
+          const target = path.join(srcDir, sub)
+          if (fs.existsSync(target)) {
+            try {
+              fs.rmSync(target, { recursive: true, force: true })
+              purgedCount++
+            } catch (_) {}
+          }
+        }
+      }
+      const appPath = path.join(slot.workdir, 'src/App.jsx')
+      const minimalApp = `import React from 'react'\n\nexport default function App() {\n  return (\n    <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center">\n      <div className="text-center p-6 max-w-md">\n        <h1 className="text-xl font-bold tracking-tight mb-2">Nuevo Proyecto</h1>\n        <p className="text-sm text-zinc-400">Construyendo la nueva aplicación...</p>\n      </div>\n    </div>\n  )\n}\n`
+      try {
+        fs.writeFileSync(appPath, minimalApp, 'utf-8')
+      } catch (_) {}
+      ensureWorkspaceGit(slot.workdir)
+    }
+  }
+  res.json({ ok: true, reset: true, purgedCount })
 })
 
 // Aplica un cambio ya aprobado a una preview que YA está corriendo, sin reinstalar/reiniciar —
@@ -485,22 +697,37 @@ const getDepsKey = (content) => {
 };
 
 app.post('/refresh', async (req, res) => {
-  const { ownerKey, mode, files } = req.body || {}
-  const slot = findSlotByOwner(String(ownerKey || ''))
+  const { ownerKey, repoFullName, mode, files } = req.body || {}
+  const slot = repoFullName
+    ? findSlotByOwnerAndRepo(String(ownerKey || ''), repoFullName)
+    : findSlotByOwner(String(ownerKey || ''))
   if (!slot || slot.status !== 'running') return res.json({ refreshed: false })
 
+  slot.lastBuildTime = Date.now()
+  slot.lastActivity = Date.now()
+  slot.isBusy = true
   try {
     if (files && Object.keys(files).length > 0) {
-      log(slot, '--- VFS REFRESH START ---')
+      log(slot, `--- VFS REFRESH START [${new Date().toISOString()}] ---`)
       const pkgPath = path.join(slot.workdir, 'package.json')
       const pkgBefore = fs.existsSync(pkgPath) ? fs.readFileSync(pkgPath, 'utf-8') : null
       writeFilesOverlay(slot.workdir, files)
+      sanitizePackageJson(slot.workdir)
       injectRuntimeReporter(slot.workdir, slot.ownerKey)
+      ensureWorkspaceGit(slot.workdir)
       const pkgAfter = fs.existsSync(pkgPath) ? fs.readFileSync(pkgPath, 'utf-8') : null
       
       if (getDepsKey(pkgAfter) !== getDepsKey(pkgBefore)) {
         log(slot, 'package.json cambió en VFS overlay — reinstalando dependencias en Docker...')
-        await runCommand(slot, 'docker', ['exec', `preview-${slot.index}`, 'sh', '-c', 'rm -rf node_modules/.vite && npm install --prefer-offline --no-audit --no-fund --loglevel=error && (touch vite.config.* 2>/dev/null || true)'])
+        try {
+          await runCommand(slot, 'docker', ['exec', `preview-${slot.index}`, 'sh', '-c', 'rm -rf node_modules/.vite && (npm install --prefer-offline --no-audit --no-fund --loglevel=error || npm install --legacy-peer-deps --no-audit --no-fund --loglevel=error) && (touch vite.config.* 2>/dev/null || true)'])
+        } catch (installErr) {
+          log(slot, `[REFRESH] Error en npm install: ${installErr.message}`)
+          if (isCorruptedVolumeError(installErr.message)) {
+            log(slot, `[REFRESH] Volumen corrupto detectado. Purgando preview-deps-${slot.index}...`)
+            purgeNamedVolume(slot.index)
+          }
+        }
       }
 
       // Warm-up del grafo de módulos para forzar compilación on-demand de Vite AHORA
@@ -510,23 +737,65 @@ app.post('/refresh', async (req, res) => {
 
       for (const uri of uniqueWarmUps) {
         try {
-          await fetch(`http://127.0.0.1:${slot.port}${uri}`, { signal: AbortSignal.timeout(3000) })
+          const r = await fetch(`http://127.0.0.1:${slot.port}${uri}`, { signal: AbortSignal.timeout(3000) })
+          if (r.ok) log(slot, `[Vite] Warm-up OK: ${uri}`)
         } catch (_) {}
       }
     } else if (mode !== 'virtual') {
+      log(slot, `--- VFS REFRESH START [${new Date().toISOString()}] ---`)
       const pkgPath = path.join(slot.workdir, 'package.json')
       const pkgBefore = fs.existsSync(pkgPath) ? fs.readFileSync(pkgPath, 'utf-8') : null
       await runCommand(slot, 'git', ['fetch', '--depth', '1', 'origin'], { cwd: slot.workdir })
       await runCommand(slot, 'git', ['reset', '--hard', 'FETCH_HEAD'], { cwd: slot.workdir })
+      sanitizePackageJson(slot.workdir)
+      injectRuntimeReporter(slot.workdir, slot.ownerKey)
       const pkgAfter = fs.existsSync(pkgPath) ? fs.readFileSync(pkgPath, 'utf-8') : null
       if (getDepsKey(pkgAfter) !== getDepsKey(pkgBefore)) {
         log(slot, 'package.json cambió en este refresh — reinstalando dependencias en Docker...')
-        await runCommand(slot, 'docker', ['exec', `preview-${slot.index}`, 'sh', '-c', 'rm -rf node_modules/.vite && npm install --prefer-offline --no-audit --no-fund --loglevel=error && (touch vite.config.* 2>/dev/null || true)'])
+        try {
+          await runCommand(slot, 'docker', ['exec', `preview-${slot.index}`, 'sh', '-c', 'rm -rf node_modules/.vite && (npm install --prefer-offline --no-audit --no-fund --loglevel=error || npm install --legacy-peer-deps --no-audit --no-fund --loglevel=error) && (touch vite.config.* 2>/dev/null || true)'])
+        } catch (installErr) {
+          log(slot, `[REFRESH] Error en npm install: ${installErr.message}`)
+          if (isCorruptedVolumeError(installErr.message)) {
+            log(slot, `[REFRESH] Volumen corrupto detectado. Purgando preview-deps-${slot.index}...`)
+            purgeNamedVolume(slot.index)
+          }
+        }
+      }
+
+      // Warm-up check en modo git
+      for (const uri of ['/', '/src/main.jsx', '/src/App.jsx']) {
+        try {
+          const r = await fetch(`http://127.0.0.1:${slot.port}${uri}`, { signal: AbortSignal.timeout(3000) })
+          if (r.ok) log(slot, `[Vite] Warm-up OK: ${uri}`)
+        } catch (_) {}
       }
     }
-    res.json({ refreshed: true })
+    res.json({ refreshed: true, lastBuildTime: slot.lastBuildTime })
   } catch (err) {
     res.status(502).json({ refreshed: false, error: err.message })
+  } finally {
+    slot.isBusy = false
+    slot.lastActivity = Date.now()
+  }
+})
+
+app.post('/restore-git', (req, res) => {
+  const { ownerKey, repoFullName, commitSha } = req.body || {}
+  if (!ownerKey) return res.status(400).json({ error: 'falta ownerKey' })
+  const slot = repoFullName
+    ? findSlotByOwnerAndRepo(ownerKey, repoFullName)
+    : findSlotByOwner(ownerKey)
+  if (!slot || !fs.existsSync(slot.workdir)) {
+    return res.status(404).json({ error: 'Slot o workspace no encontrado' })
+  }
+  try {
+    const targetSha = commitSha || 'HEAD~1'
+    execSync(`git reset --hard ${targetSha} && git clean -fd`, { cwd: slot.workdir, stdio: 'ignore' })
+    log(slot, `[GIT-RESTORE] Workspace restaurado localmente a ${targetSha}`)
+    res.json({ restored: true, commitSha: targetSha })
+  } catch (err) {
+    res.status(500).json({ error: 'Fallo al restaurar git local: ' + err.message })
   }
 })
 

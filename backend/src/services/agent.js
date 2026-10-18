@@ -1,6 +1,6 @@
 import { listProjectFiles, readProjectFile } from './projectStorage.js'
 
-import { getSchemaSummary, getTableRowCounts, getTableRows } from './repoDb.js'
+import { getSchemaSummary, getTableRowCounts, getTableRows, runSql } from './repoDb.js'
 
 import { runAgentWithRotation } from './aiAccounts.js'
 
@@ -11,6 +11,9 @@ import { getPreviewStatus, restartPreviewForAgent, testVfsChanges } from './prev
 import { runtimeBus } from './runtimeBus.js'
 
 import { generateImage } from './imageGen.js'
+import { inspectWebsiteUrl, buildStrategicConsultingReport, extractPdfContent } from './websiteInspector.js'
+import { searchImages as curateSearchImages, getContextualImage as curateGetImage } from './imageCurator.js'
+import { detectIndustry } from './imageCurator.js'
 
 import { runPreviewTest } from './browserTester.js'
 
@@ -22,6 +25,20 @@ import { config, isPreviewConfigured } from '../config.js'
 
 import { supabase } from '../db/supabaseClient.js'
 import { autoInjectDependencies, resolvePackageVersion, normalizePackageName } from './dependencyAutoInjector.js'
+import { validateSyntax } from './syntaxValidator.js'
+import { applyPatch, isTruncatedOrDestructive } from './fuzzyPatcher.js'
+import { getProjectSemanticGraph, findMatchingFileForElement, invalidateSemanticGraph } from './semanticGraph.js'
+import { runImportGuard } from './importGuard.js'
+import { getDbSchemaGraph, invalidateDbSchemaGraph } from './dbSchemaGraph.js'
+import { amplifyPrompt } from './promptAmplifier.js'
+import { validateUiIntegrity, isEntrypointStillScaffold } from './uiIntegrityGuard.js'
+import { executeHardProjectReset } from './projectReset.js'
+import { isWebOrLandingRequest, getSeniorArtDirectionDirectives } from './designDirector.js'
+import { isSeoTarget, getTechnicalSeoDirectives } from './seoArchitect.js'
+import { scanForExposedSecrets } from './secretGuard.js'
+
+export { compressHistory } from './geminiAssist.js'
+export { executeHardProjectReset } from './projectReset.js'
 
 
 
@@ -63,43 +80,455 @@ const CASUAL_PATTERNS = [
 
   /^gracias[\s!.,]*$/i,
 
-  /^(ok|okay|dale|listo)[\s!.,]*$/i,
-
 ]
 
 
 
 
-function classifyUserIntent(prompt) {
-  const normalized = (prompt || '').toLowerCase().trim();
+/**
+ * Analiza la intención semántica del prompt del usuario para distinguir con precisión quirúrgica
+ * entre Preguntas Puras de Diagnóstico/Consulta vs. Órdenes de Construcción/Cambio de Código.
+ * 
+ * @param {string} prompt
+ * @returns {{
+ *   isPureQuestion: boolean,
+ *   hasActionOrder: boolean,
+ *   isDualResponseRequired: boolean,
+ *   isDiagnostic: boolean,
+ *   category: 'PURE_QUESTION' | 'ACTION_ORDER' | 'HYBRID_QUESTION_AND_ACTION' | 'CASUAL'
+ * }}
+ */
+export function analyzePromptIntent(prompt) {
+  if (!prompt || typeof prompt !== 'string') {
+    return {
+      isPureQuestion: false,
+      hasActionOrder: false,
+      isProjectResetOrder: false,
+      isDualResponseRequired: false,
+      isDiagnostic: false,
+      category: 'CASUAL'
+    };
+  }
 
-  // Patrones explícitos de consulta / información
-  const queryPatterns = [
-    /(dónde|donde|dónde está|donde esta)/i,
-    /(cómo|como funciona|explicame|explícame|qué es|que es)/i,
-    /(por qué|porque|por que|cuál es|cual es)/i,
-    /(muestra|lista|cuáles son|cuales son|tengo|hay)/i,
-    /(base de datos|tablas|db|postgres|servidor|puerto|secrets|variables)/i,
-    /\?$/
-  ];
+  const raw = prompt.trim();
+  const normalized = raw.toLowerCase();
+  // Normalización sin acentos para matching robusto
+  const deaccented = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
-  // Patrones explícitos de modificación / acción
-  const actionPatterns = [
-    /(cambia|modifica|agrega|crea|elimina|corrige|arregla|pon|quita|instala)/i,
-    /(haz que|actualiza|rediseña|repara|implementa|añade|borra)/i
-  ];
+  // 0. Confirmación afirmativa y orden de continuación
+  // Cuando el agente propone mejoras (ej. "¿Te gustaría que implemente estas mejoras ahora mismo?")
+  // y el usuario responde con una confirmación corta ("si", "sí", "dale", "ok", "adelante", "procede", "hazlo", "de acuerdo", "por favor"):
+  // Se clasifica como ACTION_ORDER con hasActionOrder: true e isPureQuestion: false para habilitar herramientas de escritura.
+  const cleanPrompt = normalized.replace(/^[¡!¿?\s,.-]+|[¡!¿?\s,.-]+$/g, '');
+  const cleanDeaccented = deaccented.replace(/^[¡!¿?\s,.-]+|[¡!¿?\s,.-]+$/g, '');
+  const affirmativeConfirmationPattern = /^(?:s[ií]+[p]?|yes|yeah|yep|sure|dale|ok(?:ay)?|adelante|go ahead|procede|proceda|proceder|proceed|hazlo|hacelo|do it|de acuerdo|por favor|please|porfa|claro(?: que s[ií]+)?|de una|afirmativo|exacto|listo|ejec[uú]talo|ejecuta|aplic[aá]lo|aplica|implement[aá]lo|implementa)(?:[\s,.-]+(?:hazlo|hacelo|dale|procede|proceda|adelante|de una vez|de una|por favor|please|porfa|con las mejoras|con los cambios|ahora|mismo|ya|do it|proceed))*$/i;
 
-  const hasQuery = queryPatterns.some(p => p.test(normalized));
-  const hasAction = actionPatterns.some(p => p.test(normalized));
+  if (affirmativeConfirmationPattern.test(cleanPrompt) || affirmativeConfirmationPattern.test(cleanDeaccented)) {
+    return {
+      isPureQuestion: false,
+      hasActionOrder: true,
+      isProjectResetOrder: false,
+      isDualResponseRequired: false,
+      isDiagnostic: false,
+      isBlackScreenReport: false,
+      category: 'ACTION_ORDER'
+    };
+  }
 
-  if (hasAction) return 'CODE_ACTION';
-  if (hasQuery) return 'PROJECT_QUERY';
+  // 0. Detección de Orden de Reinicio / Borrado / Cambio Total de Proyecto
+  // Ej: "borra el proyecto actual y haz una web para...", "reinicia el proyecto", "empieza de cero", "olvida lo anterior"
+  const projectResetPattern = /\b(?:borra\s+(?:todo\s+)?el\s+proyecto|borra\s+el\s+proyecto\s+actual|borra\s+todo\s+y\s+haz|elimina\s+(?:todo\s+)?el\s+proyecto|reinicia\s+(?:todo\s+)?el\s+proyecto|reinicia\s+el\s+proyecto\s+actual|reiniciar\s+el\s+proyecto|empieza\s+de\s+cero|empezar\s+de\s+cero|inicia\s+de\s+cero|iniciar\s+de\s+cero|arranca\s+de\s+cero|olvida\s+lo\s+anterior|olvidate\s+de\s+lo\s+anterior|olv[ií]date\s+de\s+lo\s+anterior|descarta\s+todo|descartar\s+todo|haz\s+otro\s+proyecto|hacer\s+otro\s+proyecto|reemplaza\s+todo\s+el\s+proyecto|reemplazar\s+todo\s+el\s+proyecto|cambia\s+de\s+proyecto|cambiar\s+de\s+proyecto|haz\s+un\s+proyecto\s+nuevo|crea\s+un\s+proyecto\s+nuevo)\b/i;
+  const isProjectResetOrder = projectResetPattern.test(normalized) || projectResetPattern.test(deaccented);
+
+  if (isProjectResetOrder) {
+    return {
+      isPureQuestion: false,
+      hasActionOrder: true,
+      isProjectResetOrder: true,
+      isDualResponseRequired: false,
+      isDiagnostic: false,
+      isBlackScreenReport: false,
+      category: 'ACTION_ORDER'
+    };
+  }
+
+  // 0.1 Detección de Reporte de Pantalla Negra / Blanca / Vista Previa Vacía
+  // Ej: "no se ve la vista previa", "solo se ve una pantalla negra, solucionalo", "pantalla negra", "pantalla en blanco"
+  const blackScreenPattern = /\b(?:no\s+se\s+ve\s+(?:nada|la\s+)?(?:vista\s+previa|pantalla|web|pagina|página)?|pantalla\s+(?:se\s+ve\s+|est[aá]\s+)?(?:en\s+)?(?:negr[oa]|blanc[oa]|oscur[oa]|vac[ií][oa])|vista\s+previa\s+(?:se\s+ve\s+|est[aá]\s+)?(?:en\s+)?(?:negr[oa]|blanc[oa]|oscur[oa]|vac[ií][oa])|se\s+ve\s+(?:todo\s+)?(?:en\s+)?(?:negr[oa]|blanc[oa]|vacio|vacío|oscuro)|preview\s+(?:is\s+)?(?:black|blank|empty|dark)|only\s+black\s+screen)\b/i;
+  const isBlackScreenReport = blackScreenPattern.test(normalized) || blackScreenPattern.test(deaccented);
+
+  if (isBlackScreenReport) {
+    return {
+      isPureQuestion: false,
+      hasActionOrder: true,
+      isProjectResetOrder: false,
+      isDualResponseRequired: false,
+      isDiagnostic: true,
+      isBlackScreenReport: true,
+      category: 'ACTION_ORDER'
+    };
+  }
+
+  // Saludos o charla casual pura
+  if (CASUAL_PATTERNS.some((p) => p.test(normalized))) {
+    return {
+      isPureQuestion: false,
+      hasActionOrder: false,
+      isProjectResetOrder: false,
+      isDualResponseRequired: false,
+      isDiagnostic: false,
+      isBlackScreenReport: false,
+      category: 'CASUAL'
+    };
+  }
+
+  // 1. Verbos imperativos y órdenes de mutación / cambio de código o base de datos
+  const actionVerbsPattern = /\b(?:agrega|agregame|agregale|agregalo|agregala|agregalos|agregalas|agregar|anade|añade|anademe|añademe|anadir|añadir|crea|creame|crealo|creala|crear|genera|generame|generalo|generar|elimina|eliminalo|eliminar|borra|borralo|borrar|quita|quitalo|quitar|cambia|cambiame|cambialo|cambiala|cambiar|modifica|modificalo|modificar|corrige|corrigelo|corregir|arregla|arreglalo|arreglar|repara|reparalo|reparar|soluciona|solucionalo|solucionar|optimiza|optimizalo|optimizar|actualiza|actualizalo|actualizar|refactoriza|refactorizalo|refactorizar|implementa|implementalo|implementar|programa|programalo|programar|construye|construyelo|construir|pon|ponle|ponme|ponlo|poner|inserta|insertalo|insertar|conecta|conectalo|conectar|integra|integralo|integrar|migra|migralo|migrar|haz|hazlo|hazle|hazme|hacer|sube|subir|instala|instalar)\b/i;
+
+  // Quejas de bug o fallo que implican una orden explícita o implícita de reparación
+  const bugReportActionPattern = /\b(?:no (?:funciona|anda|sirve|carga|compila|muestra|guarda|actualiza)|est[aá] rot[oa]|da error|tira error|falla el|fallan los|hay un error|est[aá] ca[ií]d[oa]|se rompi[oó])\b/i;
+
+  const hasActionVerb = actionVerbsPattern.test(normalized) || actionVerbsPattern.test(deaccented);
+  const hasBugReportAction = bugReportActionPattern.test(normalized) || bugReportActionPattern.test(deaccented);
+  const hasActionOrder = hasActionVerb || hasBugReportAction;
+
+  // 2. Indicadores de Pregunta / Consulta / Diagnóstico / Auditoría
+  const hasQuestionMark = normalized.includes('?') || normalized.includes('¿');
+
+  // Palabras interrogativas (con y sin acentos)
+  const questionWordsPattern = /\b(?:que|qué|como|cómo|donde|dónde|cuando|cuándo|cual|cuál|cuales|cuáles|por que|por qué|porque|cuanto|cuánto|cuantos|cuántos|cuanta|cuánta|cuantas|cuántas|quien|quién|quienes|quiénes)\b/i;
+  const hasQuestionWord = questionWordsPattern.test(normalized) || questionWordsPattern.test(deaccented);
+
+  // Verbos y frases de diagnóstico / auditoría / inspección
+  const diagnosticPhrasesPattern = /\b(?:analiza|analizar|audita|auditar|evalua|evaluar|revisa|revisar|inspecciona|inspeccionar|diagnostica|diagnosticar|como esta|cómo está|como se encuentra|cómo se encuentra|como funciona|cómo funciona|como se calcula|cómo se calcula|que opinas|qué opinas|dime como|dime cómo|dime que|dime qué|explica|explicame|explícame|muestrame|muéstrame|cual es el estado|cuál es el estado|que tablas|qué tablas|que componentes|qué componentes|que paquetes|qué paquetes|hay algun|hay algún|se puede|es seguro|es posible)\b/i;
+  const isDiagnostic = diagnosticPhrasesPattern.test(normalized) || diagnosticPhrasesPattern.test(deaccented);
+
+  // Expresión explícita de "solo dime / no toques código / antes de implementar"
+  const explicitNoChangePattern = /(?:solo (?:expl[ií]ca|dime|cu[eé]ntame|muestra|analiza|audita)|no (?:cambies|toques|modifiques|apliques|hagas cambios)|antes de (?:construir|hacer|implementar|crear|programar)|diseña(?:me)? un plan previo|haz(?:me)? un plan previo)/i;
+  const hasExplicitNoChange = explicitNoChangePattern.test(normalized) || explicitNoChangePattern.test(deaccented);
+
+  // 1.5 Detección prioritaria de Scripts y Sentencias SQL directas (ej. DO $$, CREATE TABLE, INSERT INTO, SELECT, etc.)
+  // Cuando el usuario pega un bloque SQL crudo o una orden de ejecución SQL sin texto conversacional previo,
+  // debe clasificarse como SQL_EXECUTION con hasActionOrder: true, isSqlExecutionOrder: true e isPureQuestion: false.
+  const sqlDirectPattern = /(?:\bDO\s+(?:LANGUAGE\s+['"]?[a-zA-Z0-9_]+['"]?\s+)?\$[a-zA-Z0-9_]*\$|\b(?:INSERT\s+INTO|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE|UPDATE\s+[a-zA-Z0-9_".]+\s+SET|DELETE\s+FROM|BEGIN;?|SELECT\s+[\s\S]*?\s+FROM|TRUNCATE\s+TABLE)\b)/i;
+  const hasDirectSql = sqlDirectPattern.test(raw);
+
+  if (hasDirectSql && !hasExplicitNoChange) {
+    return {
+      isPureQuestion: false,
+      hasActionOrder: true,
+      isProjectResetOrder: false,
+      isSqlExecutionOrder: true,
+      isDualResponseRequired: false,
+      isDiagnostic: false,
+      isBlackScreenReport: false,
+      category: 'SQL_EXECUTION'
+    };
+  }
+
+  const hasQuery = hasQuestionMark || hasQuestionWord || isDiagnostic || hasExplicitNoChange;
+
+  // CASO A: Pregunta Pura de Diagnóstico / Consulta (Sin verbo de acción ni queja de bug)
+  if ((hasQuery && !hasActionOrder) || (hasQuery && hasExplicitNoChange)) {
+    return {
+      isPureQuestion: true,
+      hasActionOrder: false,
+      isProjectResetOrder: false,
+      isDualResponseRequired: false,
+      isDiagnostic: isDiagnostic || hasQuery,
+      isBlackScreenReport: false,
+      category: 'PURE_QUESTION'
+    };
+  }
+
+  // CASO B: Pregunta con Orden Implícita o Explícita (Híbrida: Pregunta + Orden de Cambio)
+  // Ej: "¿Por qué el encabezado no tiene botón? Agrégalo", "¿Por qué falla el botón de ingresar? Corrígelo"
+  if (hasQuery && hasActionOrder) {
+    return {
+      isPureQuestion: false,
+      hasActionOrder: true,
+      isProjectResetOrder: false,
+      isDualResponseRequired: true,
+      isDiagnostic: isDiagnostic || hasQuery,
+      isBlackScreenReport: false,
+      category: 'HYBRID_QUESTION_AND_ACTION'
+    };
+  }
+
+  // CASO C: Orden Directa de Cambio
+  // Ej: "Agrega un botón en el header", "Optimiza el SEO de index.html"
+  if (hasActionOrder) {
+    return {
+      isPureQuestion: false,
+      hasActionOrder: true,
+      isProjectResetOrder: false,
+      isDualResponseRequired: false,
+      isDiagnostic: false,
+      isBlackScreenReport: false,
+      category: 'ACTION_ORDER'
+    };
+  }
+
+  // Si tiene signo de interrogación o consulta general
+  if (hasQuery) {
+    return {
+      isPureQuestion: true,
+      hasActionOrder: false,
+      isProjectResetOrder: false,
+      isDualResponseRequired: false,
+      isDiagnostic: false,
+      isBlackScreenReport: false,
+      category: 'PURE_QUESTION'
+    };
+  }
+
+  return {
+    isPureQuestion: false,
+    hasActionOrder: false,
+    isProjectResetOrder: false,
+    isDualResponseRequired: false,
+    isDiagnostic: false,
+    isBlackScreenReport: false,
+    category: 'GENERAL'
+  };
+}
+
+export function classifyUserIntent(prompt) {
+  const analysis = analyzePromptIntent(prompt);
+  if (analysis.category === 'CASUAL') return 'CASUAL';
+  if (analysis.category === 'PURE_QUESTION') return 'PROJECT_QUERY';
+  if (analysis.category === 'ACTION_ORDER' || analysis.category === 'HYBRID_QUESTION_AND_ACTION' || analysis.category === 'SQL_EXECUTION') return 'CODE_ACTION';
   return 'GENERAL';
 }
 
 function isCasualMessage(text) {
-  // Mantener firma por compatibilidad, pero usar la nueva clasificación
-  return classifyUserIntent(text) !== 'CODE_ACTION';
+  const intent = classifyUserIntent(text);
+  return intent === 'CASUAL' || intent === 'PROJECT_QUERY';
+}
+
+/**
+ * Determina si está permitido invocar la herramienta de clarificación 'ask_question'
+ * Calibración: NUNCA si hay SQL, JSON, errores, elementContext o si el usuario nombró entidades concretas.
+ * SOLO si la instrucción es genuinamente ambigua o genérica (ej. "mejora el código", "modifica la app").
+ */
+export function shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext } = {}) {
+  if (!userMessage || typeof userMessage !== 'string') return false;
+
+  // 1. Veto Absoluto: SQL Execution Order o presencia de sentencias SQL
+  if (promptIntent?.isSqlExecutionOrder) return false;
+  const sqlPattern = /(?:\bDO\s+(?:LANGUAGE\s+['"]?[a-zA-Z0-9_]+['"]?\s+)?\$[a-zA-Z0-9_]*\$|\b(?:INSERT\s+INTO|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE|UPDATE\s+[a-zA-Z0-9_".]+\s+SET|DELETE\s+FROM|BEGIN;?|SELECT\s+[\s\S]*?\s+FROM|TRUNCATE\s+TABLE)\b)/i;
+  if (sqlPattern.test(userMessage)) return false;
+
+  // 2. Veto: JSON, Logs de error, stacktraces
+  const trimmed = userMessage.trim();
+  if (/^[\{\[][\s\S]*[\}\]]$/.test(trimmed)) return false;
+  if (/\b(?:Error:|TypeError:|ReferenceError:|SyntaxError:|at\s+[\w/\\.-]+:\d+:\d+|\bat\s+async\s+|\bnode:internal\/|Stack trace:)\b/i.test(userMessage)) return false;
+
+  // 3. Veto: Selección visual de elemento (elementContext / Click-to-Edit)
+  if (elementContext && (elementContext.selector || elementContext.tag || elementContext.text)) {
+    return false;
+  }
+
+  // 4. Veto: El mensaje ya especifica entidades concretas de UI o arquitectura
+  const namesSpecificTarget = /\b(?:tabla|table|columna|column|bot[oó]n|button|modal|dialog|vista|view|p[aá]gina|page|componente|component|formulario|form|navbar|header|footer|sidebar|pestana|pestaña|tab|input|card|tarjeta|icono|icon|endpoint|ruta|route|api|hook|css|tailwind|color|fondo|texto|fuente|padding|margin|receta|recetas|producto|productos|cliente|clientes|usuario|usuarios|pedido|pedidos|venta|ventas|inventario)\b|\.(?:jsx?|tsx?|css|html|sql|json)\b/i.test(userMessage);
+  if (namesSpecificTarget) return false;
+
+  // 5. Veto: Confirmaciones o respuestas cortas
+  if (/^(?:s[ií]+|yes|dale|ok|adelante|procede|hazlo|de acuerdo|por favor|claro)\b/i.test(trimmed)) return false;
+
+  // 6. SOLO permitir si el pedido es genuinamente ambiguo y genérico
+  const isGenericAmbiguous = /\b(?:mejora|modifica|cambia|actualiza|corrige|haz|crea)\s+(?:el\s+c[oó]digo|la\s+app|la\s+aplicaci[oó]n|el\s+proyecto|el\s+sistema|algo|un\s+cambio)\b/i.test(userMessage)
+    || /^(?:mejora(?:lo)?|modifica(?:lo)?|cambia(?:lo)?|actualiza(?:lo)?|haz un cambio|qu[eé] hacemos|qu[eé] sigue)[\s.?!]*$/i.test(trimmed);
+
+  return isGenericAmbiguous;
+}
+
+/**
+ * Extrae restricciones prohibitivas explícitas ("No toques X", "No modifiques código", "Solo explícame")
+ * para implementar el Arnés 3: Bloqueo determinista de mutaciones no autorizadas.
+ *
+ * @param {string} userMessage
+ * @returns {{ hasConstraints: boolean, prohibitAllCodeChanges: boolean, prohibitAllDbChanges: boolean, forbiddenFiles: string[], forbiddenTables: string[] }}
+ */
+export function extractNegativeConstraints(userMessage) {
+  if (!userMessage || typeof userMessage !== 'string') {
+    return {
+      hasConstraints: false,
+      prohibitAllCodeChanges: false,
+      prohibitAllDbChanges: false,
+      forbiddenFiles: [],
+      forbiddenTables: []
+    }
+  }
+
+  const msg = userMessage.trim().toLowerCase()
+  let prohibitAllCodeChanges = false
+  let prohibitAllDbChanges = false
+  const forbiddenFiles = []
+  const forbiddenTables = []
+
+  // 1. Prohibición general de modificar código / archivos
+  if (
+    /\b(?:no|ni)\s+(?:modifiques|toques|cambies|edites|toque|toquemos)\s+(?:c[oó]digo|archivos|nada|el\s+c[oó]digo)\b/i.test(msg) ||
+    /\b(solo|s[oó]lo)\s+(?:expl[ií]came|dime|revisa|inspecciona|analiza|lee|muestra)\b/i.test(msg) ||
+    /\bno\s+(?:hagas|apliques)\s+ning[uú]n\s+cambio\b/i.test(msg)
+  ) {
+    prohibitAllCodeChanges = true
+  }
+
+  // 2. Prohibición general de modificar base de datos / migraciones
+  if (
+    /\b(?:no|ni)\s+(?:modifiques|toques|cambies|apliques|borres|toque)\s+(?:la\s+)?(?:base\s+de\s+datos|bd|db|tablas?|migraci[oó]n|migraciones|esquema)\b/i.test(msg)
+  ) {
+    prohibitAllDbChanges = true
+  }
+
+  // 3. Prohibición sobre archivos específicos: "no toques App.jsx", "no modifiques src/components/Header.jsx"
+  const fileMatches = userMessage.matchAll(/\b(?:no|ni)\s+(?:modifiques|toques|cambies|edites|toque)\s+(?:el\s+archivo\s+)?([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)\b/gi)
+  for (const m of fileMatches) {
+    const raw = m[1].replace(/^\/+/, '').trim().toLowerCase()
+    if (raw && !raw.includes(' ') && !forbiddenFiles.includes(raw)) {
+      forbiddenFiles.push(raw)
+    }
+  }
+
+  // 4. Prohibición sobre tablas específicas: "no toques la tabla users", "no modifiques garments"
+  const tableMatches = userMessage.matchAll(/\b(?:no|ni)\s+(?:modifiques|toques|cambies|borres|toque)\s+(?:la\s+tabla\s+)?([a-zA-Z0-9_]+)\b/gi)
+  for (const m of tableMatches) {
+    const raw = m[1].trim().toLowerCase()
+    if (raw && !['codigo', 'archivos', 'nada', 'el', 'la', 'los', 'las', 'base', 'datos', 'db', 'tabla'].includes(raw) && !forbiddenTables.includes(raw)) {
+      forbiddenTables.push(raw)
+    }
+  }
+
+  const hasConstraints = prohibitAllCodeChanges || prohibitAllDbChanges || forbiddenFiles.length > 0 || forbiddenTables.length > 0
+
+  return {
+    hasConstraints,
+    prohibitAllCodeChanges,
+    prohibitAllDbChanges,
+    forbiddenFiles,
+    forbiddenTables
+  }
+}
+
+/**
+ * Extrae el bloque o sentencias SQL del mensaje del usuario (soportando markdown code blocks o texto crudo).
+ */
+export function extractSqlFromPrompt(prompt) {
+  if (!prompt || typeof prompt !== 'string') return '';
+  
+  // 1. Bloques en Markdown ```sql ... ```
+  const codeBlockRegex = /```(?:sql|pgsql|postgres)?\s*([\s\S]*?)```/gi;
+  let match;
+  const blocks = [];
+  while ((match = codeBlockRegex.exec(prompt)) !== null) {
+    const block = match[1].trim();
+    if (/(?:\bDO\s+(?:LANGUAGE\s+['"]?[a-zA-Z0-9_]+['"]?\s+)?\$|\b(?:CREATE|INSERT|ALTER|DROP|UPDATE|DELETE|SELECT|TRUNCATE|BEGIN)\b)/i.test(block)) {
+      blocks.push(block);
+    }
+  }
+  if (blocks.length > 0) {
+    return blocks.join('\n\n');
+  }
+
+  // 2. Extraer desde la primera ocurrencia de una instrucción SQL
+  // Detectar inicio de bloque DO ($$...$$ o $tag$...$tag$)
+  const doStartRegex = /\bDO\s*(?:LANGUAGE\s+['"]?[a-zA-Z0-9_]+['"]?\s*)?(\$[a-zA-Z0-9_]*\$)/i;
+  // Detectar otras instrucciones SQL estándar (incluyendo funciones y procedimientos procedimentales)
+  const standardSqlStartRegex = /\b(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|FUNCTION|PROCEDURE|TRIGGER|VIEW|INDEX)|INSERT\s+INTO|ALTER\s+(?:TABLE|TYPE|FUNCTION)|UPDATE\s+[a-zA-Z0-9_".]+\s+SET|DELETE\s+FROM|SELECT\s+[\s\S]*?\s+FROM|DROP\s+(?:TABLE|FUNCTION|VIEW|TRIGGER|INDEX)|TRUNCATE\s+TABLE|BEGIN;?)\b/i;
+
+  const doMatch = doStartRegex.exec(prompt);
+  const stdMatch = standardSqlStartRegex.exec(prompt);
+
+  let startIndex = -1;
+  let isDoBlock = false;
+  let doTag = '$$';
+
+  if (doMatch && stdMatch) {
+    if (doMatch.index <= stdMatch.index) {
+      startIndex = doMatch.index;
+      isDoBlock = true;
+      doTag = doMatch[1];
+    } else {
+      startIndex = stdMatch.index;
+    }
+  } else if (doMatch) {
+    startIndex = doMatch.index;
+    isDoBlock = true;
+    doTag = doMatch[1];
+  } else if (stdMatch) {
+    startIndex = stdMatch.index;
+  }
+
+  if (startIndex === -1) {
+    return prompt.trim();
+  }
+
+  let sqlCandidate = prompt.slice(startIndex).trim();
+
+  // Si comenzó con un bloque DO, buscar su cierre END $tag$; correspondiente y recortar texto conversacional posterior si no hay más SQL
+  if (isDoBlock) {
+    const escapedTag = doTag.replace(/\$/g, '\\$');
+    const endDoRegex = new RegExp(`END(?:\\s*;)?\\s*${escapedTag}\\s*;?`, 'gi');
+    let lastEndMatch = null;
+    let m;
+    while ((m = endDoRegex.exec(sqlCandidate)) !== null) {
+      lastEndMatch = m;
+    }
+    if (lastEndMatch) {
+      const afterEnd = sqlCandidate.slice(lastEndMatch.index + lastEndMatch[0].length).trim();
+      const hasFurtherSql = /(?:\bDO\s+(?:LANGUAGE\s+['"]?[a-zA-Z0-9_]+['"]?\s+)?\$|\b(?:CREATE|INSERT|ALTER|DROP|UPDATE|DELETE|SELECT|TRUNCATE|BEGIN)\b)/i.test(afterEnd);
+      if (!hasFurtherSql) {
+        sqlCandidate = sqlCandidate.slice(0, lastEndMatch.index + lastEndMatch[0].length).trim();
+      }
+    }
+  }
+
+  return sqlCandidate;
+}
+
+/**
+ * Sanitiza scripts SQL corrigiendo funciones agregadas vacías como count() -> count(*)
+ */
+export function sanitizeSqlScript(sql) {
+  if (!sql || typeof sql !== 'string') return '';
+  return sql.replace(/\bcount\s*\(\s*\)/gi, 'count(*)');
+}
+
+/**
+ * Extrae tablas referenciadas en el script SQL para auditoría y verificación post-ejecución
+ */
+export function extractReferencedTables(sql) {
+  if (!sql || typeof sql !== 'string') return [];
+  const tables = new Set();
+  
+  const insertRegex = /INSERT\s+INTO\s+(?:["']?([a-zA-Z0-9_]+)["']?\.)?["']?([a-zA-Z0-9_]+)["']?/gi;
+  let m;
+  while ((m = insertRegex.exec(sql)) !== null) {
+    const t = m[2];
+    if (t && !t.startsWith('_flowpro_')) tables.add(t);
+  }
+
+  const updateRegex = /UPDATE\s+(?:["']?([a-zA-Z0-9_]+)["']?\.)?["']?([a-zA-Z0-9_]+)["']?/gi;
+  while ((m = updateRegex.exec(sql)) !== null) {
+    const t = m[2];
+    if (t && !t.startsWith('_flowpro_')) tables.add(t);
+  }
+
+  const createRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:["']?([a-zA-Z0-9_]+)["']?\.)?["']?([a-zA-Z0-9_]+)["']?/gi;
+  while ((m = createRegex.exec(sql)) !== null) {
+    const t = m[2];
+    if (t && !t.startsWith('_flowpro_')) tables.add(t);
+  }
+
+  const fromRegex = /FROM\s+(?:["']?([a-zA-Z0-9_]+)["']?\.)?["']?([a-zA-Z0-9_]+)["']?/gi;
+  while ((m = fromRegex.exec(sql)) !== null) {
+    const t = m[2];
+    if (t && !t.startsWith('_flowpro_')) tables.add(t);
+  }
+
+  return Array.from(tables);
 }
 
 
@@ -179,9 +608,17 @@ export function invalidateSchemaCache(dbConnection) {
 
 // que usa PostgREST ahí nunca es dueño de las tablas, así que "FORCE" no cambia nada para ellas).
 
-function ensureForceRls(sql) {
+export function ensureForceRls(sql) {
+  if (!sql || typeof sql !== 'string') return sql
 
-  if (!sql) return sql
+  // Salvaguarda: si el script contiene bloques procedimentales DO $$, funciones PL/pgSQL
+  // o transacciones complejas, retornarlo intacto para no quebrar la estructura procedimental.
+  if (/\bDO\s*(?:LANGUAGE\s+['"]?[a-zA-Z0-9_]+['"]?\s*)?\$[a-zA-Z0-9_]*\$/i.test(sql)) {
+    return sql;
+  }
+  if (/\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE|TRIGGER)\b/i.test(sql)) {
+    return sql;
+  }
 
   const enableRe = /ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?("?[\w.]+"?)\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY\s*;?/gi
 
@@ -238,9 +675,9 @@ function describeStep(name, input) {
       return { type: 'edit', path: input.path }
 
     case 'propose_db_change':
-
     case 'propose_migration':
-
+    case 'apply_migration':
+    case 'execute_ddl':
       return { type: 'db' }
 
     case 'propose_edge_function':
@@ -331,8 +768,12 @@ function buildSystemPrompt(
 
   isInitialKickoff,
 
-  userMessage
+  userMessage,
 
+  semanticGraphSection = '',
+  dbSchemaGraphSection = '',
+  promptIntent = null,
+  currentAppContent = ''
 ) {
 
   const truncated = treePaths.length > MAX_TREE_ENTRIES
@@ -343,29 +784,39 @@ function buildSystemPrompt(
 
   
 
+  const canAskInKickoff = isInitialKickoff && shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext });
+
   const kickoffSection = isInitialKickoff ? `
 
 [PROJECT INITIALIZATION DIRECTIVE]
-Estás construyendo un proyecto completamente nuevo a partir de este prompt inicial: "${userMessage}".
+Estás construyendo un proyecto a partir de este prompt inicial: "${userMessage.slice(0, 300)}...".
+${currentAppContent ? `
+[ESTADO ACTUAL DEL ENTRYPOINT: src/App.jsx (PLANTILLA INICIAL VACÍA DETECTADA)]
+\`\`\`jsx
+${currentAppContent.trim()}
+\`\`\`
+🚨 ATENCIÓN: El archivo 'src/App.jsx' actual sigue en estado de plantilla inicial vacía. Es ESTRICTAMENTE OBLIGATORIO sobrescribir completamente 'src/App.jsx' en este turno usando 'propose_change' para importar y montar la interfaz completa con todos los componentes y navegación antes de finalizar.
+` : ''}
 
 REGLAS CRÍTICAS DE KICKOFF:
-
-2. Infiere el modelo de datos completo, las pantallas principales y el flujo de trabajo estándar del tipo de aplicación solicitada.
+1. REEMPLAZO OBLIGATORIO DE LA PLANTILLA INICIAL (src/App.jsx): NUNCA dejes la plantilla inicial con títulos placeholder (ej. '<h1>nombre-del-proyecto</h1>' sobre fondo blanco). Es ESTRICTAMENTE OBLIGATORIO sobrescribir completamente 'src/App.jsx' en este Turno 1 usando 'propose_change' para montar la aplicación funcional completa o su layout principal con navegación y vistas operativas.
+2. Infiere el modelo de datos completo, las pantallas principales, tablas interactivas, métricas/KPIs, gráficos y el flujo de trabajo estándar del tipo de aplicación solicitada.
    - Si es cotizaciones: crea cotizador con ítems dinámicos, cálculo, listado y vista de detalle.
+   - Si es control de gastos/insumos con gráficos y descarga: implementa formulario de registro, tabla con filtros/búsqueda, gráficos interactivos (con recharts o visuales estilizados) y botón funcional para exportar (Excel/CSV).
+3. Escribe el layout base, navegación y páginas principales usando componentes estilizados con Tailwind. Tienes total libertad para utilizar la paleta completa de colores Tailwind (slate, zinc, emerald, blue, indigo, amber, rose, text-white, bg-white, etc.) y componentes interactivos.
+4. Emite todos los archivos necesarios en una sola pasada a través de propose_change.
+5. PROHIBIDO CREAR MOCKS O COMPONENTES COSMÉTICOS FALSOS: Si el usuario pide una conexión real, integración externa (WhatsApp, APIs, Stripe) o persistencia, NUNCA inventes interfaces estáticas que simulan funcionar. Debes crear la estructura real de datos (propose_migration), endpoints (propose_edge_function) o clarificar los requerimientos.
 
-4. Escribe el layout base, navegación y páginas principales usando componentes shadcn/ui y tokens semánticos de Tailwind.
-
-5. Emite todos los archivos necesarios en una sola pasada a través de propose_change.
-
-PROHIBIDO CREAR MOCKS O COMPONENTES COSMÉTICOS FALSOS: Si el usuario pide una conexión real, integración externa (WhatsApp, APIs, Stripe) o persistencia, NUNCA inventes interfaces estáticas que simulan funcionar. Debes crear la estructura real de datos (propose_migration), endpoints (propose_edge_function) o clarificar los requerimientos.
-
-CUÁNDO USAR 'ask_question':
+${canAskInKickoff ? `CUÁNDO USAR 'ask_question':
 Si el usuario solicita un proyecto nuevo desde cero, un sistema complejo o una integración con múltiples opciones (ej. 'creame un sistema MCP para WhatsApp', 'crea un SaaS de reservas', 'agrega pasarela de pagos'), NO asumas los requerimientos ni crees código de inmediato.
 DEBES invocar obligatoriamente la herramienta 'ask_question' ofreciendo entre 2 y 4 opciones claras y bien fundamentadas (marcando una como 'Recomendada') para definir:
 1. El objetivo/arquitectura principal (ej. Servidor MCP vs Bot vs App web).
 2. El proveedor de conexión o método de autenticación.
 3. Los roles o usuarios del sistema.
-Una vez invocada 'ask_question', finaliza tu turno inmediatamente sin emitir código adicional hasta que el usuario responda.` : '';
+Una vez invocada 'ask_question', finaliza tu turno inmediatamente sin emitir código adicional hasta que el usuario responda.` : `PROHIBICIÓN ESTRICTA DE PREGUNTAS DE CLARIFICACIÓN:
+El usuario ha proporcionado instrucciones directas, específicas o contenido técnico concreto (código, script SQL, o entidades identificadas).
+Queda ESTRICTAMENTE PROHIBIDO invocar la herramienta 'ask_question' o solicitar clarificación sobre qué módulo modificar. Procede de inmediato con la ejecución o implementación directa.`}
+` : '';
 
 
 
@@ -409,15 +860,17 @@ Si el pedido necesita cuentas de usuario (login, registro, "que cada usuario vea
 
   CREATE POLICY "solo el dueño" ON tabla
 
-    USING (user_id = current_user_id())
+    USING (user_id = auth.uid())
 
-    WITH CHECK (user_id = current_user_id());
+    WITH CHECK (user_id = auth.uid());
+
+"auth.uid()" funciona nativamente en Flow Cloud — devuelve el UUID del usuario logueado que hizo la request, o NULL si no hay sesión. Es 100% compatible con Supabase: el mismo SQL funciona en ambos entornos. "current_user_id()" sigue existiendo como alias backward-compatible y devuelve exactamente lo mismo — podés usar cualquiera de las dos, pero preferí "auth.uid()" para que los proyectos migrados desde Supabase no necesiten traducción.
 
 El "FORCE ROW LEVEL SECURITY" es OBLIGATORIO, nunca lo omitas: a diferencia de Supabase (donde la API nunca es dueña de las tablas), acá la conexión con la que corrés SIEMPRE es la dueña de la base — y en Postgres el dueño de una tabla bypasea sus políticas RLS por completo salvo que se fuerce con esta sentencia. Sin "FORCE", "ENABLE ROW LEVEL SECURITY" no hace nada en la práctica y cualquiera vería todas las filas.
 
-El "WITH CHECK" es tan importante como el "USING": sin él, alguien podría insertar filas a nombre de OTRO usuario mandando un "user_id" ajeno en el body — con "WITH CHECK", Postgres rechaza esa fila. Para que no haga falta mandar "user_id" a mano en cada insert, ponele default: "user_id uuid DEFAULT current_user_id()".
+El "WITH CHECK" es tan importante como el "USING": sin él, alguien podría insertar filas a nombre de OTRO usuario mandando un "user_id" ajeno en el body — con "WITH CHECK", Postgres rechaza esa fila. Para que no haga falta mandar "user_id" a mano en cada insert, ponele default: "user_id uuid DEFAULT auth.uid()".
 
-"current_user_id()" es el equivalente de "auth.uid()" de Supabase — devuelve el id del usuario logueado que hizo la request, o NULL si no hay sesión (con RLS activo, NULL no matchea ninguna fila con user_id seteado, así que un visitante anónimo no ve nada). Sin "ENABLE ROW LEVEL SECURITY" en la tabla, cualquiera con el token del proyecto puede ver/tocar todas las filas — avisale al usuario si le proponés una tabla con datos sensibles sin RLS.
+NUNCA uses "USING (true)" en políticas RLS — eso desactiva la protección por completo y cualquier usuario puede ver/modificar las filas de todos. Si necesitás acceso público de lectura a una tabla (ej. catálogo de productos), creá una política separada "SELECT para todos" con "USING (true)" SOLO para SELECT, y una de INSERT/UPDATE/DELETE restringida al dueño con "auth.uid()".
 
 Si el pedido necesita subir/mostrar archivos (imágenes, videos, PDFs — no datos de tabla): el MISMO "src/lib/db.js" exporta también "storage", con la misma forma que "supabase.storage" ("storage.from('bucket').upload(path, file)", ".getPublicUrl(path)", ".remove(paths)", ".list()"). Todo bucket es de lectura pública (cualquiera con la URL puede verlo, como la mayoría de los buckets de Supabase en la práctica) — no lo uses para archivos que deban ser privados, todavía no existe esa opción acá.
 
@@ -609,6 +1062,46 @@ AGENTE DE IA CON HERRAMIENTAS (real, distinto del chat simple de "IA DENTRO DE L
 
 
 
+  // Detección de URL y documentos PDF adjuntos para Auditoría Estratégica (URL + Brochure)
+  const detectedUrlMatch = userMessage ? userMessage.match(/https?:\/\/[^\s"'<>)]+/i) : null
+  const detectedUrl = detectedUrlMatch ? detectedUrlMatch[0] : null
+  const pdfAttachments = attachments.filter(a =>
+    a.kind === 'pdf' ||
+    a.mimeType === 'application/pdf' ||
+    a.filename?.toLowerCase().endsWith('.pdf') ||
+    Boolean(a.extractedText && a.filename?.toLowerCase().includes('brochure'))
+  )
+  const hasPdfAttachment = pdfAttachments.length > 0
+  const isUrlAndPdfConsulting = Boolean(detectedUrl && hasPdfAttachment)
+
+  const strategicConsultingGuidance = isUrlAndPdfConsulting
+    ? `
+
+═══════════════════════════════════════════════════════════════════════
+🎯 PROTOCOLO DE AUDITORÍA ESTRATÉGICA Y REDISEÑO (URL + PDF/BROCHURE DETECTADOS)
+═══════════════════════════════════════════════════════════════════════
+El usuario ha proporcionado una URL (${detectedUrl}) y adjuntado un documento/brochure PDF (${pdfAttachments.map(p => p.filename).join(', ')}).
+Este es un requerimiento de CONSULTORÍA ESTRATÉGICA, AUDITORÍA CRO/SEO Y/O REDISEÑO DE ALTO IMPACTO:
+
+1. INSPECCIÓN OBLIGATORIA DE LA URL:
+   - Debes llamar inmediatamente a la herramienta "inspect_website_url" con la URL "${detectedUrl}" para extraer los datos reales del sitio en vivo (título, meta descripción, H1-H3, teléfonos, WhatsApp, correos, direcciones, navegación y keywords actuales).
+
+2. COMBINACIÓN DE FUENTES (SITIO WEB + BROCHURE PDF):
+   - Tienes el texto extraído íntegro del brochure PDF arriba en el mensaje.
+   - Cruza la información del sitio web con el brochure PDF:
+     * Del sitio web: extrae estructura actual, fallas de SEO (falta de meta description, H1 ausentes), teléfonos y enlaces.
+     * Del brochure PDF: extrae la lista completa y verídica de servicios técnicos, certificaciones (OSCE, ISO, etc.), clientes reales y propuesta de valor comercial.
+
+3. RESPUESTA DE CONSULTORÍA ESTRATÉGICA:
+   - Si el usuario formula una pregunta de análisis ("¿cómo podríamos mejorar esta web?", "audita esta web", "qué le falta"):
+     * Estructura tu respuesta con un diagnóstico implacable de nivel Consultor Senior (marca, CRO, SEO técnico, UI/UX).
+     * Presenta la propuesta de la nueva arquitectura web sección por sección (Hero inmersivo, Trust bar, Grilla técnica de servicios con códigos, Casos de éxito con fotos de proyectos, Contacto directo con WhatsApp).
+     * Cierra preguntando cordialmente si deseas que construyas esta nueva versión ahora mismo.
+   - Si el usuario ordena construir o rediseñar la web:
+     * Utiliza la herramienta "curate_images" para obtener imágenes verificadas del sector industrial/comercial correspondiente.
+     * Construye la aplicación aplicando las directivas de Dirección de Arte UI/UX Senior.`
+    : ''
+
   const attachmentSection = attachments.length
 
     ? `
@@ -617,9 +1110,9 @@ AGENTE DE IA CON HERRAMIENTAS (real, distinto del chat simple de "IA DENTRO DE L
 
 El usuario adjuntó ${attachments.length === 1 ? 'un archivo' : `${attachments.length} archivos`} a este mensaje: ${attachments
 
-        .map((a, i) => `[índice ${i}] "${a.filename}" (${a.mimeType}, ${a.kind === 'pdf' ? 'imagen del documento PDF' : 'imagen'})`)
+        .map((a, i) => `[índice ${i}] "${a.filename}" (${a.mimeType}, ${a.kind === 'pdf' ? 'documento PDF con texto extraído' : 'imagen'})`)
 
-        .join(', ')}. Ya los tienes disponibles arriba en el contenido del mensaje (puedes verlos/leerlos directamente).
+        .join(', ')}. Ya los tienes disponibles arriba en el contenido del mensaje (puedes verlos/leerlos directamente).${strategicConsultingGuidance}
 
 Decide qué hacer según lo que pida el usuario:
 
@@ -659,6 +1152,7 @@ Si el usuario dice que el problema SIGUE después de que ya lo "arreglaste" en u
 No todo lo que aparece en el log es un error de CÓDIGO: si el log muestra algo como "transport was disconnected", "cannot call fetchModule", o cualquier falla del runner de módulos/HMR de Vite (típico después de una ráfaga de muchos cambios seguidos en poco tiempo), es un problema del PROCESO del servidor, no algo que "propose_change" pueda arreglar — no pierdas tiempo revisando o reescribiendo código que probablemente esté bien. En ese caso usa "restart_preview" (mata el proceso viejo y levanta uno nuevo) y después confirmá con "check_preview_errors"/"test_preview" que ya se resolvió.
 
 NUNCA concluyas (ni le digas al usuario) que "la infraestructura de FlowPro está rota", que "el guardado de archivos no está persistiendo", o cualquier variante de "el problema es la plataforma, no el código" — es una conclusión gravísima y, en la enorme mayoría de los casos, falsa: tu única señal de que un cambio "no se guardó" suele ser releerlo con "read_file" en el MISMO turno en el que lo propusiste, lo cual SIEMPRE muestra el contenido viejo (los cambios se aplican recién al final del turno, no al instante — ver la herramienta "read_file"), no una prueba real de nada. Si de verdad no podés resolver un error después de investigarlo con las herramientas reales (leer el archivo relevante, revisar el log), la respuesta correcta es decir con precisión qué archivo/línea es y qué te falta para arreglarlo (ej. "esta ruta de servidor necesita una credencial que no está disponible en este entorno"), nunca inventar que la plataforma entera falló.
+PROHIBIDO DECIR QUE NO PUEDES GUARDAR ARCHIVOS BINARIOS: NUNCA le digas al usuario que "la plataforma de chat procesa texto pero no deposita archivos binarios dentro del proyecto" o que "no existe una ruta de imagen directa como /logo.png". Los archivos multimedia y logos subidos o extraídos de documentos se depositan automáticamente en "public/doc-assets/" y están listos para ser referenciados directamente en código JSX mediante <img src="/doc-assets/NOMBRE_ARCHIVO" />.
 
 
 
@@ -699,21 +1193,15 @@ Es una ruta pública (sin autenticación) pensada para que la llame el frontend 
 
 
   const elementSection = elementContext
-
-    ? `
-
-
-
-ELEMENTO SELECCIONADO: el usuario eligió un elemento puntual de la vista previa (con el selector visual) antes de escribir este mensaje — su pedido es sobre ESE elemento específico, no una descripción general.${
-
+    ? `\n\nELEMENTO SELECCIONADO VISUALMENTE (CLICK-TO-EDIT): el usuario eligió un elemento puntual de la vista previa (con el selector visual) antes de escribir este mensaje — su pedido es sobre ESE elemento específico, no una descripción general.
+- Etiqueta: <${elementContext.tagName || 'elemento'}>
+- Clases CSS: ${elementContext.className || '(ninguna)'}
+- Texto visible: "${elementContext.innerText || elementContext.textSnippet || ''}"
+${elementContext.componentName ? `- Componente React: <${elementContext.componentName} />\n` : ''}${elementContext.parentHierarchy ? `- Jerarquía contenedor: ${elementContext.parentHierarchy}\n` : ''}${
         elementContext.source
-
           ? ` Salió del archivo "${elementContext.source.fileName}", línea ${elementContext.source.lineNumber}. Empezá leyendo ese archivo y ubicá esa zona exacta antes de proponer el cambio.`
-
-          : ` No se pudo determinar el archivo exacto de origen, pero sí esta pista — usala para encontrarlo con "list_files"/"read_file": selector "${elementContext.selectorPath}", etiqueta <${elementContext.tagName}>${elementContext.textSnippet ? `, con el texto "${elementContext.textSnippet}"` : ''}. HTML del elemento: ${elementContext.outerHTMLSnippet}`
-
+          : ` No se pudo determinar el archivo exacto de origen, pero sí esta pista — usala para encontrarlo con "list_files"/"read_file": selector "${elementContext.selectorPath}", etiqueta <${elementContext.tagName}>${elementContext.textSnippet ? `, con el texto "${elementContext.textSnippet}"` : ''}. HTML del elemento: ${elementContext.outerHTMLSnippet || ''}`
       }`
-
     : ''
 
 
@@ -816,29 +1304,52 @@ ${skills
 
       : ''
 
+  const blackScreenSection = promptIntent?.isBlackScreenReport ? `
 
+🚨 [ALERTA DE DIAGNÓSTICO EN VIVO: PANTALLA NEGRA / VISTA PREVIA VACÍA REPORTADA POR EL USUARIO]
+El usuario reporta que la vista previa está en pantalla negra, blanca o no se visualiza.
+INSTRUCCIONES DETERMINISTAS DE INFRAESTRUCTURA (CUMPLIMIENTO ESTRICTO):
+1. NUNCA toques vite.config.js, ni intentes cambiar puertos (4101, etc.), hosts ('0.0.0.0') o configuración de server/HMR. La infraestructura de Vite y Docker está 100% activa y funcionando. Modificar vite.config.js será BLOQUEADO por el arnés del sistema.
+2. La pantalla negra en React ocurre ÚNICAMENTE por un error de runtime en el navegador que desmontó el árbol de React en #root.
+3. CAUSAS TÍPICAS A AUDITAR Y CORREGIR EN TUS COMPONENTES:
+   a. Ícono inexistente de 'lucide-react' (ej: importar un nombre de ícono no existente o usar un ícono en JSX sin importarlo).
+   b. Desajuste entre 'export default' vs 'export { Named }' (ej: importar con 'import X from ...' un archivo que solo tiene 'export function X').
+   c. Variable o propiedad undefined (ej: hacer .map() sobre una variable no inicializada o llamar a una función inexistente).
+   d. Hook de React mal ubicado (fuera del cuerpo del componente o condicional).
+4. ACCIÓN OBLIGATORIA: Usa 'read_file' para revisar 'src/App.jsx' y todos los componentes en 'src/components/'. Encuentra la inconsistencia de código en React y corrígela con 'replace_file_content', 'propose_patch' o 'propose_change'.
+` : '';
 
-  return `Eres el agente de IA de FlowPro, un asistente que ayuda a desarrolladores a modificar su repositorio de GitHub (y, si está conectada, su base de datos) mediante conversación.${knowledgeSection}${memorySection}${skillsSection}
+  return `Eres el agente de IA de FlowPro, un asistente que ayuda a desarrolladores a modificar su repositorio de GitHub (y, si está conectada, su base de datos) mediante conversación.${knowledgeSection}${memorySection}${skillsSection}${blackScreenSection}
 
 
 
 ### REGULACIÓN DE RESPUESTA FINAL Y USO DE HERRAMIENTAS (MANDATORIA)
 
-- OBLIGATORIO: Siempre debes usar la herramienta "propose_change" o "propose_migration" para aplicar los cambios.
+1. **Cuando el usuario solicita cambios o acciones en el código:**
+   - OBLIGATORIO: Usa siempre "replace_file_content" / "propose_patch" (para editar archivos existentes preservando el resto del código) o "propose_change" (solo para archivos nuevos) y "propose_migration" para aplicar cambios de base de datos.
+   - Si la solicitud fue una orden directa de cambio (ej. "agrega un botón de contacto", "cambia el color a azul"), resume de forma clara, directa y natural los cambios aplicados en tu respuesta de texto.
+   - REGLA DE RESPUESTA DUAL (PREGUNTAS CON ÓRDENES DE CAMBIO): Si el mensaje del usuario incluye una pregunta o reporte de fallo junto con una orden de cambio (ejemplo: "¿Por qué el encabezado no tiene un botón? Agrégalo" o "¿Por qué falla el botón de ingresar? Corrígelo"):
+     * PRIMERO: Responde de forma clara, directa y fundamentada a la pregunta del usuario en lenguaje natural (explicando la causa o contexto).
+     * SEGUNDO: Aplica las modificaciones de código necesarias mediante herramientas.
+     * TERCERO: Describe brevemente los cambios aplicados.
+     * ESTÁ ESTRICTAMENTE PROHIBIDO ignorar la pregunta del usuario o responder únicamente con un escueto "Listo." sin contestar la duda planteada.
 
-- Tu respuesta de TEXTO (fuera de la herramienta) debe ser EXACTAMENTE UNA SOLA FRASE directa y natural (ejemplo: "Agregué el campo RUC en el perfil de empresa y actualicé la estructura de base de datos.").
+2. **Cuando el usuario formula una pregunta pura de diagnóstico o auditoría (sin verbo imperativo de cambio):**
+   - Si el usuario pregunta por el estado de algo (ejemplo: "¿Cómo está el SEO de la web?", "¿Qué tablas tiene el proyecto?", "¿Cómo funciona el cálculo de tarifas?", "Analiza la seguridad"):
+     * QUEDA ESTRICTAMENTE PROHIBIDO MODIFICAR ARCHIVOS: No uses herramientas de edición de código ni apliques migraciones.
+     * Puedes usar herramientas de LECTURA ("read_file", "list_files", "read_table_rows") para inspeccionar el estado real del proyecto (ej. index.html, componentes, rutas) y fundamentar tu diagnóstico.
+     * Entrega una respuesta completa, estructurada y profesional respondiendo a la pregunta del usuario.
+     * Concluye tu respuesta preguntando cordialmente: "¿Te gustaría que implemente estas mejoras ahora mismo?".
 
-- PROHIBIDO usar listas de viñetas, saltos de línea, o encabezados tipo "Listo. Cambios realizados:". Resume todo en una sola oración lineal.
+3. **Formato general:**
+   - ESTÁ ESTRICTAMENTE PROHIBIDO pegar bloques o diffs de código crudo en el texto (para eso existen las herramientas).
+   - NUNCA respondas con frases vacías como "Listo." sin contenido explicativo útil para el usuario.
 
-- ESTÁ ESTRICTAMENTE PROHIBIDO pegar bloques de código, diffs o explicaciones pedagógicas. NUNCA uses frases de cortesía.
-
-
-
-### CRITICAL EXECUTION RULE (ZERO CONVERSATIONAL DRIFT)
+### CRITICAL EXECUTION RULE (ZERO CONVERSATIONAL DRIFT EN ÓRDENES DE CAMBIO)
 
 When the user asks for a visual, architectural, or structural change (e.g. "hazlo un iphone simulador", "agrega login", "cambia los colores"), you MUST NEVER describe what you are going to do or ask if you should proceed.
 
-You must immediately invoke 'propose_change' with the modified files.
+You must immediately invoke 'replace_file_content' (for modifying existing files) or 'propose_change' (for brand new files) with the changes.
 
 If a design request is broad or ambiguous, make executive architectural decisions based on standard UI patterns and implement them directly.
 
@@ -852,21 +1363,87 @@ If a design request is broad or ambiguous, make executive architectural decision
 3. **Principio de no-suposición de APIs:**
    - Antes de modificar código por un fallo de exportación, el agente debe verificar la compatibilidad de tipos y sintaxis en vez de alterar configuraciones aleatorias de CORS o tainted canvas.
 
-### DESIGN SYSTEM & UI RULES (MANDATORY)
+### DIRECTIVA MAESTRA: PERSISTENCIA NATIVA Y CREACIÓN AUTOMÁTICA DE ESQUEMAS (POSTGRESQL CLOUD)
 
+1. PRINCIPIO DE PERSISTENCIA OBLIGATORIA (CERO MOCKS):
+   - Queda estrictamente PROHIBIDO almacenar entidades de negocio o datos generados por el usuario (recetas, productos, tareas, publicaciones, comentarios, inventarios, transacciones, etc.) en arrays estáticos, variables de estado (\`useState\`), \`localStorage\` o \`sessionStorage\`.
+   - Si el usuario solicita una función que involucre "crear", "guardar", "editar", "listar", "filtrar" o "eliminar" información, dicha información DEBE persistir de forma obligatoria en la base de datos PostgreSQL del proyecto.
 
+2. PROTOCOLO OBLIGATORIO DE 3 PASOS ANTE NUEVAS ENTIDADES:
+   Antes de generar o modificar cualquier componente de frontend (.jsx / .tsx), debes seguir este orden estricto:
 
-Estas reglas son de cumplimiento obligatorio en TODO código JSX/TSX generado. Una infracción activa el guardrail estático y fuerza auto-corrección.
+   PASO 1 — INTROSPECCIÓN DEL ESQUEMA:
+   - Verifica las tablas y columnas existentes en la base de datos del proyecto para evitar duplicaciones o errores de sintaxis (usa \`check_db_data\` o \`read_table_rows\`).
 
+   PASO 2 — EJECUCIÓN DE MIGRACIÓN DDL (ANTES DEL CÓDIGO REACT):
+   - Si la entidad solicitada (ejemplo: 'recipes', 'orders', 'tasks') o las columnas requeridas no existen, debes invocar INMEDIATAMENTE la herramienta de migración de base de datos (\`propose_migration\` / \`execute_ddl\`) ejecutando el SQL correspondiente ANTES de generar código React.
+   - Toda tabla de negocio debe crearse bajo el estándar de producción:
+     * Clave primaria: \`id UUID PRIMARY KEY DEFAULT gen_random_uuid()\`
+     * Vínculo de autoría (si aplica): \`user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE\`
+     * Marcas de tiempo: \`created_at TIMESTAMPTZ DEFAULT now()\`, \`updated_at TIMESTAMPTZ DEFAULT now()\`
+     * Tipos estructurados: Usar tipos específicos (\`TEXT\`, \`INT\`, \`NUMERIC\`, \`BOOLEAN\`, \`JSONB\` para listas de ingredientes, atributos o arrays dinámicos).
 
+   PASO 3 — SEGURIDAD Y POLÍTICAS RLS (ROW LEVEL SECURITY):
+   - Toda nueva tabla DEBE activar RLS: \`ALTER TABLE public.<nombre_tabla> ENABLE ROW LEVEL SECURITY;\` y \`ALTER TABLE public.<nombre_tabla> FORCE ROW LEVEL SECURITY;\`
+   - Si la información es personal por usuario, crea las políticas estándar:
+     * SELECT: \`CREATE POLICY "Users can view own data" ON public.<nombre_tabla> FOR SELECT USING (auth.uid() = user_id);\`
+     * INSERT: \`CREATE POLICY "Users can insert own data" ON public.<nombre_tabla> FOR INSERT WITH CHECK (auth.uid() = user_id);\`
+     * UPDATE/DELETE: \`CREATE POLICY "Users can modify own data" ON public.<nombre_tabla> FOR ALL USING (auth.uid() = user_id);\`
+   - Si la información es pública de lectura (ejemplo: catálogo de recetas o blog), permite lectura pública (\`FOR SELECT USING (true)\`) y escritura solo a usuarios autenticados (\`WITH CHECK (auth.uid() = user_id)\`).
 
-1. PROHIBIDO usar estilos inline: nunca generar 'style={{ ... }}'. Toda propiedad visual se resuelve con clases utilitarias de Tailwind o tokens del tema.
+3. INTEGRACIÓN EN EL FRONTEND:
+   - Una vez confirmada la creación de la tabla en base de datos, conecta el frontend utilizando el cliente oficial de base de datos del proyecto (\`src/lib/db.js\` / cliente supabase/flowpro):
+     \`\`\`javascript
+     // Ejemplo de lectura:
+     const { data, error } = await db.from('recipes').select('*').order('created_at', { ascending: false });
 
+     // Ejemplo de inserción:
+     const { data, error } = await db.from('recipes').insert([{
+       title,
+       ingredients,
+       cooking_time,
+       user_id: user.id
+     }]);
+     \`\`\`
+   - Maneja siempre estados de carga (\`isLoading\`), errores (\`error\`) y actualización optimista o refetch tras cada mutación.
 
+4. SINCRONIZACIÓN CON EL PANEL CLOUD:
+   - Al ejecutar la migración DDL, la nueva tabla y sus registros deben ser visibles de inmediato en el panel **Cloud > Database** de FlowPro.
 
-2. PROHIBIDO hardcodear colores: nunca usar 'bg-black', 'bg-white', 'text-white', 'bg-[#hex]', 'text-[#hex]', 'border-[#hex]'. Usar siempre los tokens semánticos: 'bg-background', 'text-foreground', 'bg-card', 'text-card-foreground', 'bg-muted', 'text-muted-foreground', 'border-border', 'bg-primary', 'text-primary-foreground'.
+### DIRECTIVA CRÍTICA: AISLAMIENTO ESTRICTO Y RESTRICCIONES NEGATIVAS (ZERO SIDE-EFFECTS)
 
-   EXCEPCIÓN: colores de marca de terceros ya reconocibles (ej. verde WhatsApp #25D366, azul Facebook #1877F2) están permitidos SOLO cuando el elemento representa ese servicio explícitamente (ícono, botón "Contactar por WhatsApp", enlace de red social). No aplica a botones, fondos o textos genéricos de la interfaz.
+1. SOBERANÍA DE RESTRICCIONES NEGATIVAS (PRIORIDAD MÁXIMA):
+   - Si el usuario dice "NO hagas X", "NO toques la tabla Y", "NO apliques migraciones", "NO modifiques el archivo Z":
+     * Esta prohibición ANULA cualquier inferencia, sugerencia o hábito previo del modelo.
+     * Queda estrictamente PROHIBIDO emitir llamadas a herramientas (\`propose_migration\`, \`execute_ddl\`, \`propose_patch\`, \`replace_file_content\`) sobre entidades, tablas o archivos explícitamente vetados.
+     * No asumas dependencias ocultas ni intentes "reparar" o "completar" tablas o archivos que el usuario te pidió ignorar.
+
+2. PRINCIPIO DE MÍNIMA INTERVENCIÓN (ALCANCE LIMITADO):
+   - Modifica ÚNICAMENTE los archivos especificados en la instrucción.
+   - Si se te pide "SOLO agrega al final de archivo.ts", mantén el 100% del contenido existente idéntico y añade el nuevo bloque sin renombrar funciones, sin reordenar imports y sin refactorizar código adyacente.
+   - Si una tabla ya existe en PostgreSQL y el usuario indica que no requiere cambios, NO ejecutes \`CREATE TABLE\`, \`ALTER TABLE\` ni toques configuraciones existentes (\`settings\`, \`vehicles\`, etc.).
+
+3. INTROSPECCIÓN ANTES DE ASUMIR NOMBRES DE COLUMNAS:
+   - PROHIBIDO inventar nombres de columnas o suponer sufijos (ejemplo: asumir \`holiday_date\` en lugar de \`date\`, o \`user_email\` en lugar de \`email\`).
+   - Si necesitas interactuar con una tabla preexistente, verifica su esquema real mediante introspección antes de escribir consultas SQL o llamadas de cliente (\`db.from('...')\`).
+
+4. VALIDACIÓN DE INTENCIÓN ANTES DE DISPARAR TOOLS:
+   Antes de emitir cualquier \`tool_call\`:
+   - [ ] ¿Alguna de estas acciones viola una prohibición explícita del usuario?
+   - [ ] ¿Estoy intentando migrar una tabla que el usuario dijo que ya existe?
+   - [ ] ¿Estoy modificando un archivo que no me pidieron tocar?
+   Si la respuesta a cualquiera de estas preguntas es "SÍ", DETÉN la llamada a la herramienta inmediatamente y cíñete exclusivamente al alcance solicitado.
+
+### REGLA ESTRICTA DE AUTENTICACIÓN Y SEGURIDAD (MANDATORIO)
+1. PROHIBIDO terminantemente almacenar listas de usuarios, correos o contraseñas en localStorage, sessionStorage o variables de estado de React. Almacenar credenciales en el cliente es una violación grave de seguridad.
+2. Cuando el usuario solicite login, registro o control de acceso, debes utilizar SIEMPRE el cliente de autenticación oficial del proyecto (src/lib/auth.js o src/lib/db.js o endpoints /api/projects/:projectId/auth/).
+3. Si la aplicación requiere perfiles extendidos (nombre, avatar, rol), debes proponer una migración DDL para la tabla public.profiles vinculada a auth.users(id) con Row Level Security habilitado.
+
+### DESIGN SYSTEM & UI RULES (BEST PRACTICES)
+
+1. Armonía Visual con Tailwind y Tokens Semánticos: Emplea componentes shadcn/ui y tokens semánticos (bg-background, text-foreground, bg-card, border-border) combinados libremente con la paleta estándar de Tailwind (slate, zinc, emerald, blue, amber, rose, text-white, bg-white, etc.) para badges de estado, KPIs, métricas, alertas, botones, tablas y gráficos.
+
+2. Estilos inline: Prioriza clases utilitarias de Tailwind. Se permiten estilos inline cuando sean requeridos por librerías de visualización o gráficos (ej. recharts Tooltip, ResponsiveContainer, dimensiones dinámicas).
 
 
 
@@ -899,6 +1476,48 @@ Estas reglas son de cumplimiento obligatorio en TODO código JSX/TSX generado. U
 8. Todo componente debe funcionar correctamente en modo claro y oscuro sin ajustes manuales adicionales, ya que los tokens resuelven ambos automáticamente.
 
 
+
+### REGLA ANTI-ALUCINACIÓN Y SOBREFACTURACIÓN (MANDATORIO)
+
+1. PROHIBIDO usar adjetivos como "aplicación completa", "totalmente funcional", "sistema robusto" o decir "aplicado"/"listo" si los cambios aún no han compilado exitosamente. Describe únicamente los archivos modificados en 1 o 2 oraciones sobrias. El sistema de validación de build confirma si compiló — tú no puedes saberlo de antemano.
+
+2. PROHIBIDO afirmar que una funcionalidad "ya está implementada" cuando solo has creado un esqueleto o componente estático sin lógica real. Si falta lógica de negocio, endpoints, o persistencia, debes mencionarlo explícitamente.
+
+3. PROHIBIDO inventar APIs, SDKs o servicios que no existan en este entorno. Las herramientas disponibles son EXACTAMENTE las listadas en tu contexto de tools (propose_change, propose_patch, propose_migration, check_preview_errors, test_preview, etc.). No existen: supabase.functions.invoke (salvo con propose_edge_function), supabase.realtime, supabase.auth.admin, ni ningún SDK externo que no esté en el package.json del proyecto.
+
+### DIRECTIVA ABSOLUTA: PROHIBIDO INVENTAR DATOS (VERACIDAD ESTRICTA)
+
+1. PROHIBICIÓN TOTAL DE DATOS DE CONTACTO FICTICIOS:
+   - Queda ESTRICTAMENTE PROHIBIDO inventar números de teléfono ficticios (ej. "+51 999 999 999", "123-456-7890"), correos inventados (ej. "contacto@empresa.com", "info@example.com") o direcciones inventadas.
+   - Si el usuario adjuntó un PDF/brochure o proporcionó una URL, DEBES usar EXCLUSIVAMENTE los teléfonos, correos, cuentas de WhatsApp y direcciones reales extraídos de esos documentos o de la herramienta "inspect_website_url".
+   - Si no se dispone de un dato de contacto real, deja un indicador claro de reemplazo (ej. "Teléfono central (confirmar con cliente)") o campos interactivos limpios, pero NUNCA inventes datos que parezcan reales.
+
+2. PROHIBICIÓN DE ALUCINAR CLIENTES, MÉTRICAS Y CERTIFICACIONES:
+   - PROHIBIDO inventar logos de clientes falsos, cifras de facturación o métricas aleatorias (ej. "99.9% de satisfacción", "+500 proyectos" si la empresa no los declara).
+   - Usa exclusivamente los clientes, marcas, partners y certificaciones (OSCE, ISO, colegiaturas, etc.) que figuren expresamente en los documentos adjuntos o en el sitio web inspeccionado.
+
+3. PROHIBICIÓN TOTAL DE INVENTAR URLs O IDs DE IMÁGENES (UNSPLASH / PEXELS):
+   - Queda TERMINANTEMENTE PROHIBIDO inventar URLs con IDs alucinados de Unsplash (ej. "https://images.unsplash.com/photo-1581092187-abc..."). Esos IDs inventados provocan errores 404 o imágenes que no corresponden a la sección.
+   - Para toda imagen fotográfica, DEBES invocar la herramienta "curate_images" para obtener URLs 100% verificadas del catálogo curado, o emplear las URLs inyectadas por el sistema.
+   - Para logos, isotipos y gráficos vectoriales: diséñalos siempre como componentes SVG inline limpios con Tailwind CSS y Lucide icons. NUNCA uses URLs externas dudosas para logos.
+
+### PRIORIDAD ABSOLUTA A RESTRICCIONES NEGATIVAS DEL USUARIO (MANDATORIO)
+
+Si el usuario indica explícitamente NO crear tablas, NO ejecutar migraciones, NO modificar un archivo específico, NO instalar un paquete, o cualquier otra restricción negativa:
+- Esa restricción tiene PRIORIDAD MÁXIMA sobre cualquier patrón habitual, regla de autonomía, o "bias for action".
+- Ignorar una restricción negativa explícita del usuario es considerado un FALLO CRÍTICO equivalente a un BUILD_FAILED.
+- Si una restricción negativa entra en conflicto directo con lo que necesitarías hacer para completar el pedido, DEBES informar al usuario del conflicto y preguntar cómo proceder — NUNCA ignorar silenciosamente la restricción.
+- Ejemplos de restricciones negativas: "no toques la tabla X", "no migres nada", "no cambies db.js", "no instales dependencias nuevas", "dejá ese archivo como está".
+
+### VERDAD SOBRE EL ENTORNO FLOWPRO (MANDATORIO)
+
+Este proyecto corre en FlowPro, una plataforma de desarrollo con IA. Las capacidades REALES del entorno son:
+- **Frontend:** React + Vite + Tailwind + shadcn/ui. Un solo paquete, sin monorepo.
+- **Base de datos:** PostgreSQL propio ("Flow Cloud") con proxy REST compatible con supabase-js, O una conexión OAuth a Supabase real — según lo que el proyecto tenga configurado.
+- **Backend server-side:** Edge Functions (Deno, via propose_edge_function) si hay Supabase conectado. NO hay servidor Node.js propio, NO hay Express propio del proyecto, NO hay API routes de Next.js.
+- **Storage:** Buckets de almacenamiento (via propose_storage_upload o el cliente storage en db.js).
+- **Auth:** signUp/signIn/signOut/getUser/getSession/onAuthStateChange — NADA MÁS. No hay OAuth providers, no hay magic links, no hay resetPasswordForEmail.
+- **NO EXISTEN:** Supabase Realtime subscriptions, Supabase Auth Admin, webhooks de Supabase, cron jobs, background workers, WebSocket servers, Server-Sent Events propios. Si el usuario pide algo que requiera estas funcionalidades, DEBES explicar la limitación honestamente y proponer alternativas viables dentro del entorno.
 
 ### MANDATORY OPERATIONAL BEHAVIOR: BIAS FOR ACTION
 
@@ -934,15 +1553,15 @@ Estas reglas son de cumplimiento obligatorio en TODO código JSX/TSX generado. U
 
 Reglas importantes:
 
-- Usás "propose_change"/"propose_patch" (código) y "propose_migration" (base de datos)${attachments.length ? ', "propose_asset_upload" o "propose_storage_upload" (archivos adjuntos)' : ''} para todo cambio real al proyecto. En un pedido normal, esos cambios se aplican SOLOS apenas los proponés — no hace falta que el usuario apruebe nada, y NUNCA le digas "aprobá esto" ni "revisá los cambios propuestos": para él ya quedaron hechos. La única excepción es cuando estás ejecutando una etapa de un plan grande de varias etapas (ver "PEDIDOS GRANDES" más abajo): ahí sí queda pendiente de que la apruebe antes de aplicarse, con el marcador que se explica ahí.
+- Usás "replace_file_content"/"propose_patch" (código existente), "propose_change" (archivos nuevos) y "propose_migration" (base de datos)${attachments.length ? ', "propose_asset_upload" o "propose_storage_upload" (archivos adjuntos)' : ''} para todo cambio real al proyecto. En un pedido normal, esos cambios se aplican SOLOS apenas los proponés — no hace falta que el usuario apruebe nada, y NUNCA le digas "aprobá esto" ni "revisá los cambios propuestos": para él ya quedaron hechos. La única excepción es cuando estás ejecutando una etapa de un plan grande de varias etapas (ver "PEDIDOS GRANDES" más abajo): ahí sí queda pendiente de que la apruebe antes de aplicarse, con el marcador que se explica ahí.
 
-- REGLA ESTRICTA DE CORRECCIÓN: Cuando el usuario señale un bug visual, un estilo faltante, un error, o solicite un ajuste (incluso sin decir explícitamente 'modifica el archivo'), DEBES usar la herramienta de modificación de código ('propose_change' o 'propose_patch') para inspeccionar y arreglar el componente correspondiente. NUNCA termines tu turno solo con texto conversacional cuando se describe un defecto concreto de UI o código.
+- REGLA ESTRICTA DE CORRECCIÓN: Cuando el usuario señale un bug visual, un estilo faltante, un error, o solicite un ajuste (incluso sin decir explícitamente 'modifica el archivo'), DEBES usar la herramienta de modificación de código ('replace_file_content' o 'propose_patch') para inspeccionar y arreglar el componente correspondiente. NUNCA termines tu turno solo con texto conversacional cuando se describe un defecto concreto de UI o código.
 
 - Antes de proponer un cambio a un archivo existente, léelo primero con "read_file" para basar tu edición en el contenido real.
 
-- Para EDITAR un archivo que YA EXISTE, usá "propose_patch" (reemplaza un fragmento exacto por otro) en vez de "propose_change" — así nunca tenés que reescribir el archivo entero. Esto es OBLIGATORIO para un archivo grande: "read_file" corta a los 100000 caracteres, así que si reescribís el archivo completo con "propose_change" y es más largo que eso, vas a terminar inventando el contenido de la parte que nunca leíste (pasó de verdad: un cierre de tag alucinado rompió toda una vista previa). "propose_change" queda solo para crear un archivo NUEVO o para el caso raro de un reemplazo total intencional de uno chico. Si "propose_patch" te dice que "old_string" no es único o no aparece, agregale más contexto y reintentá — no cambies a reescribir todo el archivo como atajo.
+- Para EDITAR un archivo que YA EXISTE, usá SIEMPRE "replace_file_content" o "propose_patch" (reemplaza un bloque exacto por otro) en vez de "propose_change" — así nunca tenés que reescribir el archivo entero ni arriesgarte a eliminar exportaciones existentes o romper sintaxis. Esto es OBLIGATORIO para todo archivo existente. "propose_change" queda RESERVADO ÚNICAMENTE para crear un archivo NUEVO. Si el bloque a reemplazar no es único o no aparece, agregale más líneas de contexto alrededor y reintentá — no cambies a reescribir todo el archivo como atajo.
 
-- Cuando uses "propose_change", el campo "new_content" debe ser el contenido COMPLETO del archivo tras el cambio (no un diff parcial) — para un cambio parcial usá "propose_patch".
+- Cuando uses "propose_change", el campo "new_content" debe ser el contenido COMPLETO del archivo tras el cambio (no un diff parcial) — para un cambio parcial usá "replace_file_content" o "propose_patch".
 
 - Cuando propongas un cambio de base de datos, el SQL debe ser válido para PostgreSQL y usar sentencias seguras (ej. "create table if not exists", "alter table ... add column if not exists").
 
@@ -958,7 +1577,7 @@ Reglas importantes:
 
 - El scaffold del proyecto ya incluye "src/pages/NotFound.jsx" con una página 404 lista para usar. Si agregás rutas/vistas nuevas (o el proyecto todavía no tiene un fallback para rutas no reconocidas), importala y mostrala para cualquier path que no matchee ninguna ruta conocida — no dejes una vista en blanco ni una improvisada.
 
-- Si el pedido requiere una imagen nueva que no existe (una ilustración de portada, un ícono, un fondo decorativo), usá "generate_image" en vez de inventar un placeholder o un enlace a una imagen externa que no existe. No la uses para fotos realistas de personas/lugares específicos (el modelo no produce eso bien) ni cuando el usuario ya adjuntó su propia imagen.
+- Si el pedido requiere una imagen nueva que no existe (una ilustración de portada, un ícono, un fondo decorativo), podés usar "generate_image". Sin embargo, para LOGOS, isotipos, marcas comerciales e iconos de la aplicación web, es SIEMPRE PREFERIBLE diseñarlos como componentes React vectoriales en SVG directamente (o con iconos estilizados de Lucide-react y Tailwind CSS) en vez de generar imágenes rasterizadas (PNG/JPG). Si "generate_image" no está disponible, tarda o falla, DEBES crear el logo inmediatamente en código SVG dentro de React (ej. un componente src/components/Logo.tsx con <svg viewBox="0 0 ...">). NUNCA dejes la interfaz sin logo ni uses enlaces rotos. Si solicitan un logo o icono y no dispones de una imagen generada, implementa siempre un componente de logo corporativo en SVG limpio con Tailwind CSS y tipografía integrada directamente en el código.
 
 - Si el usuario pide "ver la app", "mostrame cómo quedó" o algo similar: FlowPro YA le muestra una vista previa en vivo del proyecto en su propio panel (se actualiza sola cuando aprueba tus cambios) — vos no la controlás directamente, pero NUNCA le digas que tiene que correr el proyecto en su propia computadora o en un entorno local propio: eso es falso acá y genera confusión. Remitilo a la vista previa de su panel, sin importar si en este turno tenés o no herramientas de preview disponibles.
 
@@ -1006,13 +1625,13 @@ ${wasTriaged ? '\nNOTA sobre el árbol de abajo: es un RECORTE (otra IA lo filtr
 
 Árbol de archivos del repositorio${truncated ? ` (mostrando los primeros ${MAX_TREE_ENTRIES} de ${treePaths.length})` : ''}:
 
-${listing}${dbSection}${edgeFunctionSection}${attachmentSection}${planModeSection}${previewSection}${appAiSection}${elementSection}${casualSection}${suggestionsSection}`
+${listing}${dbSection}${edgeFunctionSection}${attachmentSection}${planModeSection}${previewSection}${appAiSection}${elementSection}${semanticGraphSection ? `\n\n${semanticGraphSection}` : ''}${dbSchemaGraphSection ? `\n\n${dbSchemaGraphSection}` : ''}${casualSection}${suggestionsSection}`
 
 }
 
 
 
-const codeTools = [
+export const codeTools = [
 
   {
 
@@ -1041,6 +1660,34 @@ const codeTools = [
       properties: { path: { type: 'string', description: 'Ruta del archivo, ej. src/App.jsx' } },
 
       required: ['path'],
+
+    },
+
+  },
+
+  {
+
+    name: 'search_files',
+
+    description:
+
+      'Busca ocurrencias de un término o patrón (equivalente a ripgrep) en los archivos del proyecto (incluyendo cambios propuestos en memoria de este turno). Devuelve rutas relativas, números de línea y fragmentos coincidentes en milisegundos.',
+
+    input_schema: {
+
+      type: 'object',
+
+      properties: {
+
+        query: { type: 'string', description: 'Término o texto a buscar en el código' },
+
+        pathPrefix: { type: 'string', description: 'Prefijo o directorio opcional para acotar la búsqueda (ej. "src/", "src/components")' },
+
+        caseSensitive: { type: 'boolean', description: 'Si la búsqueda distingue mayúsculas/minúsculas. Por defecto false.' }
+
+      },
+
+      required: ['query'],
 
     },
 
@@ -1101,6 +1748,90 @@ const codeTools = [
       required: ['path', 'old_string', 'new_string', 'summary'],
 
     },
+
+  },
+
+  {
+
+    name: 'replace_file_content',
+
+    description:
+
+      'Edición atómica por bloques de código (line replace). Reemplaza un bloque exacto de código (search_block) por un nuevo bloque (replace_block) en un archivo existente sin reescribir el archivo entero. search_block DEBE coincidir exactamente una sola vez en el archivo. Úsala siempre para editar archivos existentes sin destruir exportaciones ni código existente.',
+
+    input_schema: {
+
+      type: 'object',
+
+      properties: {
+
+        file_path: { type: 'string', description: 'Ruta del archivo existente a editar (ej. src/App.jsx)' },
+
+        path: { type: 'string', description: 'Alias de file_path' },
+
+        search_block: { type: 'string', description: 'Bloque exacto de código a reemplazar (debe ser único en el archivo)' },
+
+        replace_block: { type: 'string', description: 'Nuevo código que reemplazará a search_block' },
+
+        summary: { type: 'string', description: 'Resumen breve de la edición (1 frase)' },
+
+      },
+
+      required: ['file_path', 'search_block', 'replace_block'],
+
+    },
+
+  },
+
+  {
+
+    name: 'delete_file',
+
+    description:
+
+      'Elimina un archivo del proyecto de forma definitiva (en memoria, almacenamiento y disco). Úsala cuando el usuario pida eliminar un archivo, o cuando un componente/archivo haya quedado completamente obsoleto o duplicado.',
+
+    input_schema: {
+
+      type: 'object',
+
+      properties: {
+
+        path: { type: 'string', description: 'Ruta relativa del archivo a eliminar (ej. src/components/OldHeader.jsx)' },
+
+        reason: { type: 'string', description: 'Motivo breve por el que se elimina el archivo' }
+
+      },
+
+      required: ['path']
+
+    }
+
+  },
+
+  {
+
+    name: 'reset_project',
+
+    description:
+
+      'Ejecuta un reinicio total del proyecto (Hard Reset). Úsala cuando el usuario pida explícitamente borrar el proyecto actual, empezar de cero o reemplazar la app por completo. Purga componentes, restablece App.jsx y opcionalmente limpia tablas de la base de datos previa con salvaguarda automática pre-reset.',
+
+    input_schema: {
+
+      type: 'object',
+
+      properties: {
+
+        wipeDatabase: { type: 'boolean', description: 'Si es true, elimina las tablas de usuario creadas previamente para el proyecto anterior. Por defecto false.' },
+
+        reason: { type: 'string', description: 'Motivo del reinicio total' }
+
+      },
+
+      required: []
+
+    }
 
   },
 
@@ -1231,7 +1962,20 @@ const dbTool = {
     required: ['name', 'up_sql'],
 
   },
+}
 
+const executeDdlTool = {
+  name: 'execute_ddl',
+  description: 'Ejecuta sentencias DDL (CREATE TABLE, ALTER TABLE, CREATE POLICY) en PostgreSQL para aprovisionar esquemas de base de datos de nuevas entidades de negocio (recetas, productos, tareas, órdenes, etc.) antes de modificar el código frontend.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'Nombre descriptivo de la migración (ej: create_recipes_table)' },
+      up_sql: { type: 'string', description: 'Script SQL DDL a ejecutar.' },
+      ddl: { type: 'string', description: 'Script SQL DDL alternativo.' },
+    },
+    required: ['name'],
+  },
 }
 
 
@@ -1492,6 +2236,65 @@ const readWebsiteUrlTool = {
 
 }
 
+const inspectWebsiteUrlTool = {
+
+  name: 'inspect_website_url',
+
+  description: 'Inspecciona una URL pública y devuelve un reporte estructurado con: título, meta description, encabezados H1-H3, navegación, teléfonos, emails, WhatsApp, direcciones y texto principal. Es más profunda que read_website_url: extrae datos reales de contacto y estructura para auditoría estratégica. Úsala cuando el usuario pida mejorar, auditar o rediseñar una web existente.',
+
+  input_schema: {
+
+    type: 'object',
+
+    properties: {
+
+      url: { type: 'string', description: 'URL pública completa a inspeccionar, empezando con https://' },
+
+    },
+
+    required: ['url'],
+
+  },
+
+}
+
+const curateImagesTool = {
+
+  name: 'curate_images',
+
+  description: 'Busca imágenes curadas y verificadas para secciones de landing/web por industria y contexto. Devuelve URLs de Unsplash verificadas con descripción exacta de cada imagen (nunca inventa IDs). Úsala para obtener imágenes de hero, proyectos, servicios, equipo, etc. que correspondan al sector del cliente. Si no hay imagen curada, indica "sin imagen curada" en vez de inventar una URL.',
+
+  input_schema: {
+
+    type: 'object',
+
+    properties: {
+
+      query: {
+        type: 'string',
+        description: 'Keywords de búsqueda libre: industria + sección. Ej: "industrial hero electrical", "restaurant projects", "technology hero software"',
+      },
+
+      section: {
+        type: 'string',
+        description: 'Sección donde se usará: hero | projects | services | team | about | cta | testimonials | process',
+        enum: ['hero', 'projects', 'services', 'team', 'about', 'cta', 'testimonials', 'process'],
+      },
+
+      industry: {
+        type: 'string',
+        description: 'Industria del cliente: industrial | technology | healthcare | restaurant | finance | logistics | realestate | education | fashion | construction | generic',
+        enum: ['industrial', 'technology', 'healthcare', 'restaurant', 'finance', 'logistics', 'realestate', 'education', 'fashion', 'construction', 'generic'],
+      },
+
+    },
+
+    required: ['query', 'section'],
+
+  },
+
+}
+
 
 
 const generateImageTool = {
@@ -1665,7 +2468,18 @@ function extractProposedDbEntities(proposedDbChanges) {
   return { createdTables, addedColumns }
 }
 
-export async function runAgent({ agentId, accessToken, project, history, userMessage, signal, dbConnection, attachments: rawAttachments = [], mode = 'build', onProgress, ownerKey, elementContext }) {
+export const runWithTimeout = (promise, ms = 20000, toolName = 'herramienta') => {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`TIMEOUT: La herramienta '${toolName}' no respondió en ${ms / 1000}s`)), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timer);
+  });
+};
+
+export async function runAgent({ agentId, accessToken, project, history: initialHistory = [], userMessage, signal, isExplicitCancel, dbConnection, attachments: rawAttachments = [], mode = 'build', onProgress, ownerKey, elementContext }) {
+  let history = Array.isArray(initialHistory) ? [...initialHistory] : []
 
   onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Planificando solución...' })
 
@@ -1676,6 +2490,10 @@ export async function runAgent({ agentId, accessToken, project, history, userMes
   const proposedAssetChanges = []
 
   const proposedEdgeFunctions = []
+
+  const proposedDeletions = []
+
+  let didResetProject = false
 
   let askedQuestion = null
 
@@ -1693,16 +2511,103 @@ export async function runAgent({ agentId, accessToken, project, history, userMes
 
   // lo único que el resto del código — y cada proveedor — sabe manejar).
 
-  const documentAttachments = rawAttachments.filter((a) => a.kind === 'document-text')
+  // Regla de Oro para Documentos (.docx, .pdf, .xlsx, .csv, .txt):
+  // NUNCA envíes el binario Base64 de un .docx o .pdf crudo al array de images del LLM.
+  // Extrae su texto en attachmentProcessor.js, inyéctalo como texto en el mensaje y limpia el binario pesado antes de llamar al LLM.
+  for (const att of rawAttachments) {
+    const isPdf = att.kind === 'pdf' || att.mimeType === 'application/pdf' || att.filename?.toLowerCase().endsWith('.pdf')
+    if (isPdf && (!att.extractedText || att.extractedText.trim().length === 0)) {
+      if (att.base64 || att.buffer) {
+        try {
+          att.extractedText = await extractPdfContent(att.buffer || att.base64, att.filename)
+        } catch (err) {
+          console.warn(`[agent] Error en extractPdfContent para ${att.filename}:`, err?.message)
+        }
+      }
+    }
+  }
 
-  const attachments = rawAttachments.filter((a) => a.kind !== 'document-text')
+  const documentAttachments = rawAttachments.filter((a) =>
+    a.kind === 'document-text' ||
+    Boolean(a.extractedText && a.extractedText.trim().length > 20) ||
+    (!a.mimeType?.startsWith('image/') && a.kind !== 'image')
+  )
+
+  // Solo imágenes puras quedan en el array multimodal "attachments" que se pasa a los proveedores
+  // FASE 8: declarado como let para permitir agregar imágenes extraídas de .docx para visión multimodal
+  let attachments = rawAttachments.filter((a) =>
+    (a.kind === 'image' || a.mimeType?.startsWith('image/')) &&
+    (!a.extractedText || a.extractedText.trim().length <= 20)
+  )
 
   if (documentAttachments.length > 0) {
+    const docsText = documentAttachments.map((a) => {
+      // Liberar memoria del binario Base64 pesado del documento una vez extraído
+      if (a.base64) a.base64 = undefined
+      return `=== CONTENIDO ÍNTEGRO DEL DOCUMENTO ADJUNTO POR EL USUARIO (${a.filename}) ===
+${a.extractedText || '(Documento procesado sin texto legible)'}
+=== FIN DEL DOCUMENTO ADJUNTO ===
+[INSTRUCCIÓN CRÍTICA DE PROCESAMIENTO]: Tienes acceso directo y completo al contenido del documento adjunto arriba. Está ESTRICTAMENTE PROHIBIDO responder preguntando al usuario cómo facilitarte los datos, pedirle que pegue el texto o decir que no puedes leer el archivo. DEBES usar estos datos extraídos de inmediato para diseñar e implementar la aplicación completa, bases de datos, componentes y lógica solicitada.`
+    }).join('\n\n')
 
-    const docsText = documentAttachments.map((a) => `--- ${a.filename} ---\n${a.extractedText}`).join('\n\n')
+    userMessage = `${userMessage}\n\n${docsText}`
+  }
 
-    userMessage = `${userMessage}\n\n[Contenido de los archivos adjuntos]\n${docsText}`
+  // ── FASE 8: CATÁLOGO DE ACTIVOS MULTIMEDIA EXTRAÍDOS DE .docx E IMÁGENES SUBIDAS ───────────
+  // Colecta todas las imágenes incrustadas en los documentos adjuntos (.docx con logos, QRs, etc.)
+  // y también imágenes directas subidas al chat, inyectándolas en el prompt como catálogo de rutas reales
+  // (/doc-assets/...) y pasando hasta 4 imágenes al LLM como visión multimodal.
+  const docExtractedAssets = documentAttachments.flatMap(a => a.extractedAssets || [])
+  const directImageAssets = rawAttachments
+    .filter(a => (a.kind === 'image' || a.mimeType?.startsWith('image/')) && a.base64 && !a._fromDocAsset)
+    .map(a => ({
+      fileName: a.filename || 'imagen-adjunta.png',
+      publicPath: `/doc-assets/${a.filename || 'imagen-adjunta.png'}`,
+      base64: a.base64,
+      mimeType: a.mimeType || 'image/png',
+      sizeBytes: a.sizeBytes || (a.base64 ? Buffer.from(a.base64, 'base64').length : 0),
+      contextHint: 'Imagen/Logo subido directamente por el usuario al chat',
+      isMultimodal: false, // Ya está en attachments
+    }))
+  const allExtractedAssets = [...docExtractedAssets, ...directImageAssets]
 
+  if (allExtractedAssets.length > 0) {
+    // 1. Construir catálogo de rutas para el prompt
+    const assetCatalog = allExtractedAssets.map(asset => {
+      const dim = asset.widthPx > 0 ? ` | Dimensiones: ${asset.widthPx}x${asset.heightPx}px` : ''
+      return `- ${asset.publicPath} (${asset.contextHint}${dim})`
+    }).join('\n')
+
+    const assetSection = `\n\n=== IMÁGENES Y LOGOS EXTRAÍDOS DEL DOCUMENTO ADJUNTO (DISPONIBLES EN EL PROYECTO) ===
+${assetCatalog}
+
+REGLA OBLIGATORIA — LECTURA DE IMÁGENES DEL DOCUMENTO:
+1. NUNCA inventes logos falsos dibujados con SVG ni digas que "no puedes depositar archivos binarios" o que "no existe una ruta de imagen". Las imágenes del documento ya están extraídas y disponibles en las rutas /doc-assets/ listadas arriba.
+2. Usa DIRECTAMENTE <img src="/doc-assets/NOMBRE_ARCHIVO" ... /> con las rutas exactas del catálogo anterior, respetando la proporción y posición original indicada.
+3. Si el usuario pide replicar el documento o colocar el logo, usa la imagen real del catálogo, nunca SVG ni placeholder genérico.
+4. Para guardar permanentemente las imágenes en el repositorio GitHub, usa "propose_asset_upload" con la ruta pública correcta (ej. "public/doc-assets/image1.png") — las imágenes están disponibles como adjuntos con índice a partir de ${attachments.length}.
+=== FIN DEL CATÁLOGO DE ACTIVOS ===`
+
+    userMessage = `${userMessage}${assetSection}`
+
+    // 2. Agregar las primeras 4 imágenes multimodal al array de attachments para visión del LLM
+    const multimodalAssets = allExtractedAssets
+      .filter(asset => asset.isMultimodal && asset.base64 && asset.mimeType !== 'image/svg+xml')
+      .slice(0, 4)
+      .map(asset => ({
+        filename: asset.fileName,
+        mimeType: asset.mimeType,
+        base64: asset.base64,
+        kind: 'image',
+        sizeBytes: asset.sizeBytes,
+        _fromDocAsset: true, // marca interna para propose_asset_upload
+        _publicPath: asset.publicPath,
+      }))
+
+    // Agregar al array de attachments ANTES del cálculo de storageAvailable
+    if (multimodalAssets.length > 0) {
+      attachments.push(...multimodalAssets)
+    }
   }
 
 
@@ -1719,7 +2624,127 @@ export async function runAgent({ agentId, accessToken, project, history, userMes
 
   const edgeFunctionsAvailable = dbConnection?.type === 'oauth'
 
-  const isPlanMode = mode === 'plan'
+  const requestedMode = (mode || 'build').toLowerCase().trim()
+  const isExplicitBuild = ['build', 'agent', 'edit'].includes(requestedMode)
+  const isExplicitChat = ['chat', 'query', 'ask'].includes(requestedMode)
+  const isPlanMode = requestedMode === 'plan'
+
+  const promptIntent = analyzePromptIntent(userMessage);
+  const negativeConstraints = extractNegativeConstraints(userMessage);
+
+  // ── REINICIO O PIVOTE TOTAL DE PROYECTO (isProjectResetOrder) ──
+  // Si el usuario ordena borrar/reiniciar el proyecto o empezar de cero:
+  // 1. Ejecuta la purga física automática de archivos obsoletos, tablas de usuario en BD y disco de preview.
+  // 2. Purga el historial conversacional previo para evitar contaminación semántica.
+  // 3. Inyecta la directiva prioritaria de construcción de la nueva aplicación desde cero.
+  if (promptIntent.isProjectResetOrder) {
+    history = [];
+    try {
+      const resetResult = await executeHardProjectReset({
+        project,
+        dbConnection,
+        ownerKey,
+        accessToken,
+        onProgress,
+        invalidateSchemaCacheFn: invalidateSchemaCache
+      });
+      console.log('[runAgent] Hard reset ejecutado exitosamente:', resetResult);
+    } catch (resetErr) {
+      console.warn('[runAgent] Error ejecutando Hard reset (continuando):', resetErr.message);
+    }
+    treeCache.delete(project.repo_full_name);
+
+    const resetDirective = `🚨 ORDEN DE REINICIO TOTAL DE PROYECTO: El usuario ha ordenado descartar/borrar la aplicación anterior y construir una aplicación completamente nueva desde cero según su instrucción actual. Todos los componentes y tablas anteriores han sido físicamente eliminados del proyecto. Construye la nueva aplicación desde cero sobrescribiendo src/App.jsx y creando únicamente los componentes y tablas necesarios para el nuevo requerimiento.\n\n`;
+    userMessage = `${resetDirective}${userMessage}`;
+  }
+
+  // ── BYPASS DETERMINISTA: EJECUCIÓN DIRECTA E INMEDIATA DE SENTENCIAS / SCRIPTS SQL ──
+  // Si el usuario pega un script SQL (ej. DO $$, CREATE TABLE, INSERT INTO) en modo BUILD (o sin modo plan veto),
+  // se ejecuta de inmediato contra la base de datos PostgreSQL sin pasar por el LLM ni generar cuadros de clarificación.
+  if (promptIntent.isSqlExecutionOrder && !isPlanMode) {
+    onProgress?.({ type: 'telemetry', phase: 'EXECUTING', label: 'Ejecutando script SQL en PostgreSQL...' });
+
+    const extractedSql = extractSqlFromPrompt(userMessage);
+    const sanitizedSql = sanitizeSqlScript(extractedSql);
+    const forceSql = ensureForceRls(sanitizedSql);
+
+    if (!dbConnection) {
+      const noDbText = '⚠️ No se pudo ejecutar el script SQL: no se detectó una base de datos conectada para este proyecto. Conecta una base de datos PostgreSQL o Supabase en el panel de Base de Datos para ejecutar sentencias SQL.';
+      onProgress?.({ type: 'text', content: noDbText });
+      return {
+        text: noDbText,
+        proposedChanges: [],
+        proposedDbChanges: [],
+        proposedAssetChanges: [],
+        proposedEdgeFunctions: [],
+        askedQuestion: null,
+        suggestions: null,
+        requiresApproval: false
+      };
+    }
+
+    try {
+      const execRes = await runSql(dbConnection, forceSql);
+      invalidateSchemaCache(dbConnection);
+      invalidateDbSchemaGraph(project.id);
+
+      // Verificación real de registros en tablas afectadas
+      const affectedTables = extractReferencedTables(forceSql);
+      const verificationDetails = [];
+      for (const table of affectedTables) {
+        try {
+          const countRes = await runSql(dbConnection, `SELECT count(*)::int AS count FROM "public"."${table}"`);
+          const count = countRes?.rows?.[0]?.count ?? countRes?.rows?.[0]?.c;
+          if (count !== undefined && count !== null) {
+            verificationDetails.push(`${count} en ${table}`);
+          }
+        } catch (_) {}
+      }
+
+      const statsMsg = verificationDetails.length > 0 
+        ? ` (${verificationDetails.join(', ')} verificados)`
+        : '';
+
+      const summaryText = `Ejecución de script SQL${verificationDetails.length > 0 ? ': ' + verificationDetails.join(', ') : ''}`;
+
+      proposedDbChanges.push({
+        sql: forceSql,
+        summary: summaryText,
+        alreadyApplied: true
+      });
+
+      const replyText = `✅ Script SQL ejecutado correctamente en la base de datos PostgreSQL${statsMsg}.\n\nSe procesó la transacción sin errores y los cambios quedaron persistidos en la base de datos.`;
+
+      onProgress?.({ type: 'text', content: replyText });
+
+      return {
+        text: replyText,
+        proposedChanges: [],
+        proposedDbChanges,
+        proposedAssetChanges: [],
+        proposedEdgeFunctions: [],
+        askedQuestion: null,
+        suggestions: null,
+        requiresApproval: false
+      };
+    } catch (sqlErr) {
+      console.error('[runAgent] Error ejecutando script SQL directo en PostgreSQL:', sqlErr);
+      const errorText = `❌ Error al ejecutar el script SQL en PostgreSQL:\n\`\`\`\n${sqlErr.message}\n\`\`\`\n\nPor favor revisa la sintaxis o las restricciones de la base de datos.`;
+
+      onProgress?.({ type: 'text', content: errorText });
+
+      return {
+        text: errorText,
+        proposedChanges: [],
+        proposedDbChanges,
+        proposedAssetChanges: [],
+        proposedEdgeFunctions: [],
+        askedQuestion: null,
+        suggestions: null,
+        requiresApproval: false
+      };
+    }
+  }
 
   const previewAvailable = isPreviewConfigured && Boolean(ownerKey)
 
@@ -1799,7 +2824,7 @@ El usuario está experimentando este error EXACTO en su navegador ahora mismo (o
 
     try {
 
-      const status = await getPreviewStatus(ownerKey)
+      const status = await getPreviewStatus(ownerKey, project.repo_full_name)
 
       if (!status || status.status === 'idle' || status.status === 'unavailable') {
 
@@ -1834,7 +2859,21 @@ El usuario está experimentando este error EXACTO en su navegador ahora mismo (o
   // capacidad: "list_files" sigue trayendo el listado completo si hace falta ver más.
 
 onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Analizando intención semántica...' })
-  const turnMode = mode === 'chat' ? 'QUERY' : 'BUILD';
+  const userIntent = classifyUserIntent(userMessage);
+
+  // Soberanía de Selección Manual:
+  // Si el usuario fijó explícitamente el modo ('build', 'chat', 'plan'), su elección es absoluta y definitiva.
+  // El clasificador heurístico SOLO actúa si no hay modo explícito o en autodetección.
+  let turnMode;
+  if (isExplicitBuild) {
+    turnMode = 'BUILD';
+  } else if (isExplicitChat) {
+    turnMode = 'QUERY';
+  } else if (isPlanMode) {
+    turnMode = 'PLAN';
+  } else {
+    turnMode = (userIntent === 'PROJECT_QUERY' || userIntent === 'CASUAL') ? 'QUERY' : 'BUILD';
+  }
 
   const isCasual = turnMode === 'QUERY';
 
@@ -1849,42 +2888,44 @@ onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Analizando intenci�
   const userId = ownerKey ? ownerKey.split(':')[1] : null;
   const activeSkills = await getActiveProjectSkills(project.id, userId).catch(() => [])
 
+  // MÓDULO 1: Mapa Semántico y Grafo de Dependencias Inverso
+  const { graph: semanticGraph, formatted: semanticGraphSection, filesMap: semanticFilesMap } = await getProjectSemanticGraph(project, accessToken, signal).catch(() => ({ graph: {}, formatted: '', filesMap: {} }))
+
+  // MÓDULO 2 (FASE 4): Mapa Semántico Ultracompacto de Base de Datos SQL
+  const dbSchemaGraphSection = await getDbSchemaGraph(project, schemaDetails).catch(() => '')
+
+  // Inspección Dinámica Universal del Entrypoint (App.jsx / App.tsx)
+  let currentAppContent = semanticFilesMap?.['src/App.jsx'] || semanticFilesMap?.['src/App.tsx'] || ''
+  if (!currentAppContent && readFileCached) {
+    try {
+      currentAppContent = (await readFileCached('src/App.jsx')) || (await readFileCached('src/App.tsx')) || ''
+    } catch (_) {}
+  }
+  const isAppStillScaffold = isEntrypointStillScaffold(currentAppContent)
+  const isInitialKickoff = (history.length === 0 || isAppStillScaffold || promptIntent.isProjectResetOrder) && turnMode === 'BUILD'
+
   let systemPrompt = buildSystemPrompt(
-
     displayTreePaths,
-
     schemaDetails,
-
-    attachments,
-
+    rawAttachments.length ? rawAttachments : attachments,
     storageAvailable,
-
-    mode,
-
+    requestedMode,
     previewAvailable,
-
     project.id,
-
     elementContext,
-
     displayTreePaths !== treePaths,
-
     isCasual,
-
     dbConnection ? (dbConnection.type === 'oauth' ? 'supabase' : dbConnection.isVps ? 'vps' : 'manual') : null,
-
     edgeFunctionsAvailable ? { projectRef: dbConnection.projectRef } : null,
-
     project.knowledge,
-
     activeSkills,
-
     project.ai_memory,
-
-    history.length === 0,
-
-    userMessage
-
+    isInitialKickoff,
+    userMessage,
+    semanticGraphSection,
+    dbSchemaGraphSection,
+    promptIntent,
+    currentAppContent
   ) + (previewRealityCheck
 
     ? `\n\nEl usuario está reportando un problema con la vista previa en este mensaje. ${previewRealityCheck}\nUsá esto como punto de partida real — no respondas "todo funciona" o "no encontré ningún error" si este estado dice lo contrario. Si hace falta más detalle, igual podés llamar "check_preview_errors" o "test_preview" de nuevo vos mismo.`
@@ -1895,15 +2936,73 @@ onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Analizando intenci�
 
     : '')
 
-  const isBuild = turnMode !== 'QUERY' && (function() {
-    const m = (userMessage || '').toLowerCase().trim();
-    const isQuestion = /^(dónde|donde|cómo|como|por qué|porque|qué|que|cuál|cual|es|está|esta|entonces|hay|puedes explicar)\b/i.test(m) || m.endsWith('?');
-    const hasActionVerb = /\b(crea|crear|agrega|agregar|añade|añadir|cambia|cambiar|modifica|modificar|elimina|eliminar|borra|borrar|corrige|corregir|arregla|arreglar|actualiza|actualizar|diseña|diseñar|pon|quita|haz)\b/i.test(m);
-    if (isQuestion && !hasActionVerb) return false;
-    return hasActionVerb || !isQuestion;
-  })();
+  // Pre-escaneo automático de componentes ante reporte de pantalla negra / vista previa vacía
+  if (promptIntent?.isBlackScreenReport) {
+    try {
+      const appFile = currentAppContent || (await readFileCached('src/App.jsx').catch(() => '')) || (await readFileCached('src/App.tsx').catch(() => '')) || '';
+      if (appFile) {
+        const stagedTemp = new Map();
+        stagedTemp.set('src/App.jsx', appFile);
 
-let behavioralContract = '';
+        const compRegex = /from\s+['"](\.\/components\/[^'"]+)['"]/g;
+        let cMatch;
+        while ((cMatch = compRegex.exec(appFile)) !== null) {
+          const relPath = cMatch[1];
+          for (const ext of ['.jsx', '.tsx', '.js', '.ts']) {
+            const candidate = 'src/' + relPath.replace(/^\.\//, '') + ext;
+            try {
+              const compContent = await readFileCached(candidate);
+              if (compContent) {
+                stagedTemp.set(candidate, compContent);
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+
+        const auditResult = await runImportGuard({
+          stagedContent: stagedTemp,
+          proposedChanges: [],
+          existingPackageJsonContent: '',
+          projectFilesList: treePaths
+        });
+
+        const issues = [];
+        if (auditResult.iconFixes && auditResult.iconFixes.length > 0) {
+          issues.push(...auditResult.iconFixes);
+        }
+        if (auditResult.exportFixes && auditResult.exportFixes.length > 0) {
+          issues.push(...auditResult.exportFixes);
+        }
+        if (auditResult.localValidation && !auditResult.localValidation.valid) {
+          issues.push(...auditResult.localValidation.errors);
+        }
+
+        if (issues.length > 0) {
+          systemPrompt += `\n\n🚨 [AUDITORÍA AUTOMÁTICA DE PANTALLA NEGRA - ERRORES DE RUNTIME DETECTADOS EN TUS COMPONENTES]:\n` +
+            `El escáner de FlowPro detectó las siguientes causas raíz que provocaron que React desmonte #root:\n` +
+            issues.map(iss => `- ${iss}`).join('\n') +
+            `\n\nACCIÓN INMEDIATA REQUERIDA: Corrige estos componentes de src/ usando replace_file_content o propose_change. NUNCA toques vite.config.js.\n`;
+        }
+      }
+    } catch (auditErr) {
+      console.warn('[blackScreenAudit] Error durante auditoría pre-prompt:', auditErr.message);
+    }
+  }
+
+  let behavioralContract = '';
+
+  // MÓDULO 1 (FASE 6): Amplificador Silencioso de Intención de Producto
+  const amplification = amplifyPrompt(userMessage, {
+    turnMode,
+    elementContext,
+    isQuickEdit: false,
+    hasDatabase: Boolean(dbConnection),
+    promptIntent
+  });
+  if (amplification.isAmplified && amplification.amplifiedDirectives) {
+    systemPrompt += `\n\n${amplification.amplifiedDirectives}\n`;
+  }
   
   if (agentId) {
     try {
@@ -1920,56 +3019,181 @@ let behavioralContract = '';
 
     behavioralContract = `
 <system_behavior_contract>
-ROL: Eres un asistente de ingeniería y constructor autónomo de software similar a Lovable.
-REGLAS DE MODO QUERY (ACTUAL):
-- Responde SIEMPRE en lenguaje natural claro y conciso.
-- Tienes acceso a herramientas de LECTURA (read_file, list_files, query_db_readonly, etc.) para buscar la información si la necesitas.
-- TIENES ESTRICTAMENTE PROHIBIDO invocar propose_change o crear archivos (ej: db.js, utils.js) para responder una duda.
+ROL: Eres un asistente de ingeniería y consultor técnico de software similar a Lovable.
+REGLAS DE MODO QUERY (CONSULTA / CHAT):
+- El usuario ha seleccionado Modo Consulta / Chat.
+- Responde SIEMPRE en lenguaje natural claro, técnico y sobrio.
+- Tienes acceso a herramientas de LECTURA (read_file, list_files, check_preview_errors, test_preview, check_db_data, read_table_rows) para inspeccionar el estado real del proyecto y fundamentar tu respuesta.
+- TIENES ESTRICTAMENTE PROHIBIDO modificar o crear archivos. Las herramientas de escritura (propose_change, replace_file_content, propose_patch, propose_migration, execute_ddl) NO están disponibles en este turno.
+- Si el usuario solicitó un plan o explicación previa de cómo implementar algo, detalla los pasos conceptuales y la arquitectura en tu respuesta sin intentar aplicar código.
 - NUNCA generes tarjetas de "Cambios aplicados" en modo QUERY.
 </system_behavior_contract>
 `;
+  } else if (turnMode === 'PLAN') {
+    behavioralContract = `
+<system_behavior_contract>
+ROL: Eres un arquitecto de software diseñando un plan de implementación.
+REGLAS DE MODO PLAN:
+- Analiza la arquitectura y describe un plan paso a paso detallado en texto.
+- Explora el repositorio con herramientas de lectura si es necesario.
+- NO modifiques ni crees archivos en este turno.
+</system_behavior_contract>
+`;
+  } else if (promptIntent.isPureQuestion) {
+    // CASO A: Pregunta Pura de Diagnóstico / Auditoría en modo BUILD (Sin orden de mutación)
+    behavioralContract = `
+<system_behavior_contract>
+ROL: Asistente de Diagnóstico y Consultoría Técnica en Modo Build.
+SITUACIÓN DETECTADA: El usuario ha formulado una PREGUNTA PURA DE DIAGNÓSTICO / AUDITORÍA ("${userMessage}").
+REGLAS ESTRICTAS DE ESTE TURNO:
+1. PROHIBIDO MODIFICAR ARCHIVOS: NO modifiques ni crees archivos en este turno. Las herramientas de edición de código y migraciones están DESHABILITADAS para este turno de solo lectura.
+2. HERRAMIENTAS DE LECTURA PERMITIDAS: Utiliza read_file, list_files, read_table_rows y read_website_url para examinar el código relevante (ej. index.html, componentes, esquemas) o webs externas y fundamentar tu respuesta.
+3. RESPUESTA COMPLETA Y ESTRUCTURADA: Responde a la pregunta del usuario con un diagnóstico técnico detallado, claro y profesional.
+4. NOTA DE CAPACIDAD DEL SISTEMA: En este turno estás en modo de diagnóstico seguro (solo lectura) porque el usuario hizo una consulta sin orden de cambio, pero TÚ SÍ TIENES capacidad completa en este chat para aplicar cambios de código (propose_patch, replace_file_content) y ejecutar migraciones/SQL en la base de datos (execute_ddl, propose_migration) en cuanto el usuario te pida ejecutarlos o confirme con un 'sí/dale'. Por lo tanto, si el usuario te pregunta por tus capacidades, responde afirmativamente explicando que sí puedes aplicar cambios y ejecutar migraciones cuando se te indique.
+5. CIERRE CON OFERTA DE ACCIÓN CONDICIONAL: Si tu respuesta identifica oportunidades de mejora técnica o arquitectónica (y el usuario NO hizo una pregunta binaria de capacidades como "¿puedes hacer X?"), finaliza cordialmente preguntando: "¿Te gustaría que implemente estas mejoras ahora mismo?".
+</system_behavior_contract>
+`;
+  } else if (promptIntent.isSqlExecutionOrder) {
+    // CASO SQL: Ejecución Directa de Script / Sentencia SQL
+    behavioralContract = `
+<system_behavior_contract>
+ROL: Administrador de Base de Datos Principal (Lead DBA) de FlowPro.
+ESTADO ACTUAL: Ejecución Directa de Script / Sentencia SQL.
+SITUACIÓN DETECTADA: El usuario ha proporcionado un script o sentencia SQL para ser ejecutado directamente en la base de datos PostgreSQL del proyecto ("${userMessage.slice(0, 100)}...").
+REGLAS ESTRICTAS DE ESTE TURNO:
+1. ROL DBA EXCLUSIVO: Tu única misión en este turno es ejecutar el SQL en la base de datos usando la herramienta \`execute_ddl\` o \`propose_migration\`.
+2. PROHIBICIÓN TOTAL DE TOCAR CÓDIGO O VITE: Queda ESTRICTAMENTE PROHIBIDO modificar archivos de código de la aplicación (como vite.config.js, package.json, index.html o archivos en src/). NO uses herramientas de edición de archivos (propose_change, replace_file_content, propose_patch).
+3. AUTOCORRECCIÓN DE SINTAXIS POSTGRESQL: Si la ejecución arroja un error de sintaxis leve (por ejemplo, funciones agregadas vacías como count() en vez de count(*), comillas simples vs dobles en identificadores, o tipos de datos), corrige el script automáticamente y vuélvelo a ejecutar con \`execute_ddl\` o \`propose_migration\`.
+4. REPORTE CLARO: Al terminar, informa en lenguaje natural qué tablas, columnas o registros fueron creados, alterados o insertados por el script.
+</system_behavior_contract>
+`;
+  } else if (promptIntent.isDualResponseRequired) {
+    // CASO B: Pregunta con Orden Implícita o Explícita de Cambio (Regla de Respuesta Dual)
+    behavioralContract = `
+<system_behavior_contract>
+ROL: Constructor Autónomo con Regla de Respuesta Dual.
+ESTADO ACTUAL: Modo Build (Construcción) ACTIVO.
+SITUACIÓN DETECTADA: El usuario ha formulado una PREGUNTA acompañada de una ORDEN DE CAMBIO o REPORTE DE ERROR ("${userMessage}").
+REGLAS ESTRICTAS DE ESTE TURNO:
+1. REGLA DE RESPUESTA DUAL OBLIGATORIA:
+   - PRIMERO: Responde de forma directa, clara y explicativa a la pregunta o diagnóstico que planteó el usuario (ej. explica por qué falta el elemento, cuál es la causa del fallo o cómo está estructurado).
+   - SEGUNDO: Aplica las modificaciones de código necesarias usando replace_file_content / propose_patch / propose_change o migraciones.
+   - TERCERO: Describe brevemente los cambios aplicados.
+2. PROHIBIDO RESPUESTAS MUDAS: Queda estrictamente PROHIBIDO emitir únicamente un resumen de cambios (o respuestas tipo "Listo. <cambio>") ignorando la pregunta del usuario. Tu respuesta de texto debe contestar la duda planteada en lenguaje natural.
+3. PRINCIPIO DE MÍNIMA INTERVENCIÓN: Modifica ÚNICAMENTE los archivos especificados en la instrucción.
+</system_behavior_contract>
+`;
   } else {
+    // CASO C: Orden Directa de Construcción
     behavioralContract = `
 <system_behavior_contract>
 ROL: Eres un asistente de ingeniería y constructor autónomo de software similar a Lovable.
+ESTADO ACTUAL: Modo Build (Construcción) ACTIVO. Tienes autorización plena y herramientas disponibles para modificar archivos y ejecutar migraciones.
 REGLAS DE MODO BUILD (ACTUAL):
-- Eres un AGENTE AUTÓNOMO: ejecuta la solución directamente usando \`propose_change\`.
-- NUNCA le digas al usuario "Debes abrir el archivo X y cambiar la línea Y manualmente". Tu trabajo es aplicar el cambio tú mismo en el proyecto.
+- Eres un AGENTE AUTÓNOMO: ejecuta la solución directamente usando \`propose_change\`, \`replace_file_content\`, \`propose_patch\` o herramientas de base de datos.
+- CONTINUACIÓN TRAS DIAGNÓSTICO: Si este turno es una confirmación corta del usuario (ej. 'si', 'sí', 'dale', 'ok', 'adelante', 'procede', 'hazlo', 'de acuerdo', 'por favor') tras haber propuesto mejoras en el turno anterior, EJECUTA de inmediato la implementación de esas mejoras modificando los archivos correspondientes con las herramientas de escritura disponibles.
+- Tu respuesta de texto debe resumir de forma clara, natural y concisa los cambios aplicados en el proyecto.
+- RESTRICCIONES NEGATIVAS (PRIORIDAD MÁXIMA): Si el usuario dice "NO hagas X", "NO toques la tabla Y", "NO apliques migraciones", "NO modifiques el archivo Z", esta prohibición anula cualquier otra inferencia. Queda estrictamente PROHIBIDO emitir tools sobre entidades vetadas.
+- PRINCIPIO DE MÍNIMA INTERVENCIÓN: Modifica ÚNICAMENTE los archivos especificados en la instrucción. No toques archivos adyacentes ni refactorices código no solicitado.
+- INTROSPECCIÓN ANTES DE ASUMIR COLUMNAS: Prohibido inventar nombres de columnas o suponer sufijos. Verifica el esquema real de la base de datos antes de consultar o escribir código.
+
+- LEY DE EJECUCIÓN FULL-STACK REAL (PROHIBICIÓN TOTAL DE MOCK DATA):
+  * Si el proyecto cuenta con base de datos activa (PostgreSQL VPS o Supabase) y el usuario solicita crear o extender un módulo de negocio (clientes, ventas, inventario, recetas, cotizaciones, pedidos, reservas, gastos, etc.):
+    1. PROHIBIDO entregar componentes con arrays estáticos falsos (\`useState([{ id: 1, ... }])\`) que se reinician o pierden al recargar la página.
+    2. REVISIÓN DE ESQUEMA Y DDL: Revisa el grafo de base de datos (\`dbSchemaGraph\`). Si la tabla requerida no existe o faltan columnas, invoca de inmediato \`execute_ddl\` o \`propose_migration\` en este mismo turno.
+    3. SEMILLA DE DATOS REALISTAS: Al crear la tabla, incluye en la migración DDL entre 3 y 5 registros semilla realistas (\`INSERT INTO ...\`) con información creíble para que la app se vea viva y funcional desde el primer segundo.
+    4. CONEXIÓN REACT COMPLETA: Construye el componente consumiendo la tabla real mediante el cliente de datos con lectura, creación, actualización y eliminación.
+
+- BLUEPRINTS DE SÚPER-PODERES EMPRESARIALES:
+  * DESCARGAR O IMPRIMIR PDF / COTIZACIÓN: Cuando el usuario pida PDF, cotizaciones o impresión, implementa una vista limpia con reglas CSS \`@media print\` (ocultando barras laterales/botones no imprimibles con \`print:hidden\`) y dispara \`window.print()\`, o usa utilidades limpias de PDF sin truncar tablas ni diseños.
+  * EXPORTAR A EXCEL / CSV: Implementa una función de exportación que genere un Blob CSV con BOM UTF-8 (\`'\\uFEFF' + csvContent\`) para que Microsoft Excel abra caracteres en español (tildes, ñ) de forma impecable sin caracteres corruptos.
+  * GRÁFICOS Y DASHBOARDS: Emplea la librería \`recharts\` (con \`ResponsiveContainer\`, \`BarChart\`, \`LineChart\`, \`PieChart\`, \`Tooltip\`, auto-inyectada en dependencies) o SVG limpios conectados a las métricas reales calculadas de la base de datos.
+  * ENVIAR POR WHATSAPP: Construye enlaces directos \`https://wa.me/?text=\${encodeURIComponent(mensajeFormateado)}\` con resúmenes claros, emojis y totales bien presentados.
+
+- GUARDIÁN DE INTEGRIDAD DE UI (CERO COMPONENTES HUÉRFANOS NI BOTONES MUDOS):
+  * CERO COMPONENTES HUÉRFANOS: Todo componente nuevo que crees en \`src/components/\` o \`src/pages/\` debe quedar importado y montado en \`App.jsx\` o en la navegación principal del usuario.
+  * CERO BOTONES MUDOS: Queda estrictamente PROHIBIDO renderizar botones cosméticos o decorativos. Todo botón debe contar con su manejador funcional (\`onClick\`), \`type="submit"\` dentro de un formulario, o abrir el modal correspondiente.
 </system_behavior_contract>
 `;
   }
   
   systemPrompt += behavioralContract;
 
+  const isPureQuestionReadOnly = Boolean(promptIntent.isPureQuestion && !promptIntent.hasActionOrder);
+
+  if (!amplification.isAmplified) {
+    if (isWebOrLandingRequest(userMessage)) {
+      systemPrompt += `\n\n${getSeniorArtDirectionDirectives({ isWebOrLanding: true, isDiagnostic: isPureQuestionReadOnly })}`;
+    }
+    if (isSeoTarget(userMessage)) {
+      systemPrompt += `\n\n${getTechnicalSeoDirectives({ isDiagnostic: isPureQuestionReadOnly })}`;
+    }
+  }
+
+  // ── DETECCIÓN Y PROTOCOLO OBLIGATORIO DE INSPECCIÓN DE URLS EXTERNAS ──
+  const URL_REGEX = /https?:\/\/[^\s<>"')]+/gi;
+  const detectedUrls = Array.from(new Set(userMessage.match(URL_REGEX) || []));
+  if (detectedUrls.length > 0) {
+    const urlListStr = detectedUrls.map((u) => `• ${u}`).join('\n');
+    systemPrompt += `\n\n<external_url_inspection_protocol>
+🚨 URL EXTERNA DETECTADA EN EL MENSAJE:
+${urlListStr}
+El usuario ha incluido una o más URLs externas para su análisis, auditoría, mejora o referencia.
+PROTOCOLO OBLIGATORIO DE ESTE TURNO:
+1. DEBES INVOCAR PRIMERO la herramienta 'read_website_url' con cada URL relevante (${detectedUrls[0]}) para inspeccionar el contenido real, estructura de navegación, propuesta de valor, textos y servicios antes de responder.
+2. PROHIBIDO responder o diagnosticar a ciegas con suposiciones sin antes haber leído la web externa con 'read_website_url'.
+3. Fundamenta tu diagnóstico, recomendaciones o propuesta de diseño en los datos reales extraídos del sitio web (y en los documentos o brochures adjuntos si los hay).
+</external_url_inspection_protocol>\n`;
+  }
+
+  // ── PRIORIDAD DETERMINISTA DE ENTRYPOINT EN KICKOFF (src/App.jsx) ──
+  if (isInitialKickoff && !isPureQuestionReadOnly) {
+    systemPrompt += `\n\n<entrypoint_priority_directive>
+🚨 REGLA DE ENTRYPOINT OBLIGATORIO (src/App.jsx):
+Estás construyendo o ampliando la interfaz de la aplicación.
+- Es OBLIGATORIO que actualices \`src/App.jsx\` en este mismo turno.
+- \`src/App.jsx\` debe importar y montar todos los componentes principales que crees (Navbar, Hero, Bento Grid, Servicios, FAQ, Footer).
+- Prohibido finalizar el turno dejando \`src/App.jsx\` como plantilla vacía inicial mientras creas componentes en \`src/components/\`.
+</entrypoint_priority_directive>\n`;
+  }
+
+  const canAskQuestion = shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext });
+
   const tools = [
 
     ...codeTools.filter((t) => {
-      if (isPlanMode && (t.name === 'propose_change' || t.name === 'propose_patch')) return false;
-      if (turnMode === 'QUERY' && (t.name === 'propose_change' || t.name === 'propose_patch' || t.name === 'propose_migration')) return false;
+      if ((isPlanMode || turnMode === 'PLAN') && (t.name === 'propose_change' || t.name === 'propose_patch' || t.name === 'replace_file_content' || t.name === 'delete_file' || t.name === 'reset_project')) return false;
+      if (turnMode === 'QUERY' && (t.name === 'propose_change' || t.name === 'propose_patch' || t.name === 'replace_file_content' || t.name === 'propose_migration' || t.name === 'execute_ddl' || t.name === 'delete_file' || t.name === 'reset_project')) return false;
+      // Si es una pregunta pura de diagnóstico o auditoría en modo BUILD (sin orden de mutación), deshabilitar herramientas de mutación
+      if (isPureQuestionReadOnly && (t.name === 'propose_change' || t.name === 'propose_patch' || t.name === 'replace_file_content' || t.name === 'delete_file' || t.name === 'reset_project' || t.name === 'propose_migration' || t.name === 'execute_ddl')) return false;
       return true;
     }),
 
-    askQuestionTool,
+    ...(canAskQuestion ? [askQuestionTool] : []),
 
-      askSecretTool,
+    askSecretTool,
 
-      updateMemoryTool,
+    updateMemoryTool,
 
     ...(previewAvailable ? [checkPreviewErrorsTool, testPreviewTool, restartPreviewTool] : []),
 
     ...(dbConnection ? [checkDbDataTool, readTableRowsTool] : []),
 
-    ...(dbConnection && !isPlanMode ? [dbTool] : []),
+    ...(dbConnection && turnMode === 'BUILD' && !isPureQuestionReadOnly ? [dbTool, executeDdlTool] : []),
 
-    ...(edgeFunctionsAvailable && !isPlanMode ? [edgeFunctionTool] : []),
+    ...(edgeFunctionsAvailable && turnMode === 'BUILD' && !isPureQuestionReadOnly ? [edgeFunctionTool] : []),
 
-    ...(attachments.length > 0 && !isPlanMode ? [assetUploadTool] : []),
+    ...(attachments.length > 0 && turnMode === 'BUILD' && !isPureQuestionReadOnly ? [assetUploadTool] : []),
 
-    ...(storageAvailable && !isPlanMode ? [storageUploadTool] : []),
+    ...(storageAvailable && turnMode === 'BUILD' && !isPureQuestionReadOnly ? [storageUploadTool] : []),
 
-    ...(!isPlanMode ? [generateImageTool] : []),
+    ...(turnMode === 'BUILD' && !isPureQuestionReadOnly ? [generateImageTool] : []),
 
-      readWebsiteUrlTool,
+    readWebsiteUrlTool,
+
+    inspectWebsiteUrlTool,
+
+    curateImagesTool,
 
   ]
 
@@ -2059,31 +3283,186 @@ REGLAS DE MODO BUILD (ACTUAL):
 
 
 
-  const executeTool = async ({ name, input }) => {
+  const runWithTimeoutLocal = (promise, ms = 20000, toolName = 'herramienta') => {
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`TIMEOUT: La herramienta '${toolName}' no respondió en ${ms / 1000}s`)), ms);
+    });
+    return Promise.race([promise, timeoutPromise]).finally(() => {
+      clearTimeout(timer);
+    });
+  };
+  const withTimeout = (promise, ms = 20000, errorMsg = 'TIMEOUT_EXCEEDED: La operación tardó más de 20s') => runWithTimeoutLocal(promise, ms, errorMsg);
 
-    if (signal?.aborted) throw new DOMException('Cancelado por el usuario', 'AbortError')
+  const fileLockQueues = new Map();
+  const executeWithFileLock = async (filePath, fn, timeoutMs = 10000) => {
+    const prev = fileLockQueues.get(filePath) || Promise.resolve();
+    let release;
+    const next = new Promise((resolve) => { release = resolve; });
+    // Guardamos la promesa en la cola asegurando que no propague rechazos no capturados
+    fileLockQueues.set(filePath, next.catch(() => {}));
 
-    onProgress?.(describeStep(name, input))
+    // Timeout de seguridad: Si la promesa previa queda colgada o tarda más de 10s,
+    // rompemos la espera para que los parches subsiguientes NUNCA queden en deadlock.
+    let timer;
+    const prevWithTimeout = Promise.race([
+      prev.catch(() => {}), // Si la anterior falló, continuar de todos modos
+      new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+    ]).finally(() => {
+      clearTimeout(timer);
+    });
 
     try {
+      await prevWithTimeout;
+      return await fn();
+    } finally {
+      release?.();
+    }
+  };
+
+  const executeToolInternal = async ({ name, input }) => {
+    if (signal?.aborted && (isExplicitCancel ? isExplicitCancel() : true)) {
+      throw new DOMException('Cancelado por el usuario', 'AbortError')
+    }
+
+    try {
+      // ── ARNÉS 3: Respeto Absoluto a Restricciones Negativas Explícitas ──
+      if (negativeConstraints && negativeConstraints.hasConstraints) {
+        if (negativeConstraints.prohibitAllCodeChanges && (
+          name === 'propose_change' ||
+          name === 'propose_patch' ||
+          name === 'replace_file_content' ||
+          name === 'delete_file' ||
+          name === 'reset_project'
+        )) {
+          return {
+            ok: false,
+            is_error: true,
+            output: 'RESTRICCIÓN NEGATIVA ACTIVA: El usuario prohibió explícitamente modificar código o archivos en este turno (ej. "no modifiques código" / "solo explícame"). Responde a su consulta únicamente en texto sin realizar mutaciones.'
+          }
+        }
+
+        if (negativeConstraints.prohibitAllDbChanges && (
+          name === 'propose_db_change' ||
+          name === 'propose_migration' ||
+          name === 'execute_ddl' ||
+          name === 'apply_migration'
+        )) {
+          return {
+            ok: false,
+            is_error: true,
+            output: 'RESTRICCIÓN NEGATIVA ACTIVA: El usuario prohibió explícitamente modificar la base de datos o migraciones en este turno.'
+          }
+        }
+
+        if (negativeConstraints.forbiddenFiles && negativeConstraints.forbiddenFiles.length > 0 && (
+          name === 'propose_change' ||
+          name === 'propose_patch' ||
+          name === 'replace_file_content' ||
+          name === 'delete_file'
+        )) {
+          const rawTarget = String(input.file_path || input.path || '').replace(/^\/+/, '').trim().toLowerCase()
+          const isForbidden = negativeConstraints.forbiddenFiles.some(f => rawTarget === f || rawTarget.endsWith('/' + f))
+          if (isForbidden) {
+            return {
+              ok: false,
+              is_error: true,
+              output: `RESTRICCIÓN NEGATIVA ACTIVA: El usuario prohibió explícitamente modificar el archivo "${input.file_path || input.path}". No apliques cambios sobre este archivo.`
+            }
+          }
+        }
+
+        if (negativeConstraints.forbiddenTables && negativeConstraints.forbiddenTables.length > 0 && (
+          name === 'propose_db_change' ||
+          name === 'propose_migration' ||
+          name === 'execute_ddl' ||
+          name === 'apply_migration'
+        )) {
+          const sql = String(input.up_sql || input.sql || input.ddl || '').toLowerCase()
+          const isForbiddenTable = negativeConstraints.forbiddenTables.some(t => {
+            const regex = new RegExp(`\\b${t}\\b`, 'i')
+            return regex.test(sql)
+          })
+          if (isForbiddenTable) {
+            return {
+              ok: false,
+              is_error: true,
+              output: `RESTRICCIÓN NEGATIVA ACTIVA: El usuario prohibió explícitamente modificar la tabla indicada. No ejecutes modificaciones sobre ella.`
+            }
+          }
+        }
+      }
 
       if (name === 'read_website_url') {
-
-          try {
-
-            const res = await fetch('https://r.jina.ai/' + input.url, { signal })
-
-            const text = await res.text()
-
-            return text.slice(0, 80000)
-
-          } catch (e) {
-
-            return `Error al leer la URL: ${e.message}`
-
-          }
-
+        try {
+          const res = await runWithTimeout(
+            fetch('https://r.jina.ai/' + input.url, { signal }),
+            20000,
+            'read_website_url'
+          )
+          const text = await res.text()
+          return text.slice(0, 80000)
+        } catch (e) {
+          return `Error al leer la URL: ${e.message}`
         }
+      }
+
+      // MÓDULO 1: Inspector de URLs en vivo — extraer datos reales para consultoría estratégica
+      if (name === 'inspect_website_url') {
+        try {
+          const report = await inspectWebsiteUrl(input.url)
+          // Devolver un resumen estructurado en texto plano para que el LLM lo procese
+          const lines = [
+            `=== INSPECCIÓN DE URL: ${report.url} ===`,
+            `Título: ${report.title}`,
+            `Meta description: ${report.description || '(sin meta description)'}`,
+            `H1: ${report.headings?.h1?.join(' | ') || 'sin H1'}`,
+            `H2: ${report.headings?.h2?.slice(0, 5).join(' | ') || 'sin H2'}`,
+            ``,
+            `TELÉFONOS DETECTADOS: ${report.contact?.phones?.join(', ') || '(ninguno)'}`,
+            `WHATSAPP: ${report.contact?.whatsapp?.join(', ') || '(ninguno)'}`,
+            `EMAILS: ${report.contact?.emails?.join(', ') || '(ninguno)'}`,
+            `DIRECCIONES: ${report.contact?.addresses?.join(' | ') || '(ninguna)'}`,
+            ``,
+            `NAVEGACIÓN: ${report.navLinks?.slice(0, 10).map(l => `${l.text}: ${l.href}`).join(' | ') || 'sin navegación detectada'}`,
+            ``,
+            `KEYWORDS: ${report.topKeywords?.join(', ') || 'sin keywords'}`,
+            ``,
+            `CONTENIDO PRINCIPAL (primeros 2000 chars):`,
+            report.mainText?.slice(0, 2000) || '',
+          ]
+          return lines.join('\n')
+        } catch (e) {
+          return `Error al inspeccionar la URL: ${e.message}`
+        }
+      }
+
+      // MÓDULO 2: Buscador de imágenes curadas — cero alucinación de Unsplash IDs
+      if (name === 'curate_images') {
+        try {
+          const industry = input.industry || detectIndustry(input.query || '')
+          const results = curateSearchImages(input.query || input.section, {
+            section: input.section,
+            industry,
+          })
+          if (!results.length) {
+            return 'No se encontró imagen curada para este contexto. No inventes una URL de Unsplash — indicá "sin imagen disponible" en vez de inventar.'
+          }
+          const lines = ['=== IMÁGENES CURADAS DISPONIBLES ===']
+          for (const img of results.slice(0, 6)) {
+            lines.push(`- URL: ${img.url}`)
+            lines.push(`  Alt: ${img.alt}`)
+            lines.push(`  Descripción: ${img.description}`)
+            lines.push(`  Sección: ${img.section} | Industria: ${img.industry} | Mood: ${img.mood}`)
+            lines.push(`  Crédito: ${img.credit}`)
+            lines.push(``)
+          }
+          lines.push('USAR SOLO estas URLs verificadas. NO inventar IDs de Unsplash.')
+          return lines.join('\n')
+        } catch (e) {
+          return `Error al buscar imágenes curadas: ${e.message}`
+        }
+      }
 
         if (name === 'list_files') {
 
@@ -2133,13 +3512,85 @@ REGLAS DE MODO BUILD (ACTUAL):
 
       }
 
-      if (name === 'propose_change') {
+      if (name === 'search_files') {
+        const query = String(input.query || input.search || '').trim()
+        if (!query) {
+          return { ok: false, is_error: true, output: 'Debes especificar un término de búsqueda (query).' }
+        }
 
+        const pathPrefix = String(input.pathPrefix || input.path || '').replace(/^\/+/, '').trim()
+        const caseSensitive = Boolean(input.caseSensitive)
+        const lowerQuery = caseSensitive ? query : query.toLowerCase()
+
+        // Obtener lista completa de archivos del proyecto + archivos en staging
+        const treePaths = await getCachedTreePaths(project, accessToken, signal)
+        const allPaths = Array.from(new Set([...treePaths, ...stagedContent.keys()]))
+
+        // Filtrar extensiones no textuales o binarias
+        const nonTextExts = /\.(png|jpe?g|gif|webp|svg|ico|pdf|docx?|xlsx?|zip|tar|gz|mp4|webm|woff2?|ttf|eot)$/i
+        const candidateFiles = allPaths.filter(p => {
+          if (pathPrefix && !p.startsWith(pathPrefix)) return false
+          if (nonTextExts.test(p)) return false
+          if (p.includes('node_modules/') || p.startsWith('.git/')) return false
+          return true
+        })
+
+        const matches = []
+        const MAX_MATCHES = 50
+
+        for (const filePath of candidateFiles) {
+          if (matches.length >= MAX_MATCHES) break
+
+          let content = stagedContent.get(filePath)
+          if (content === undefined) {
+            if (semanticFilesMap && semanticFilesMap[filePath]) {
+              content = semanticFilesMap[filePath]
+            } else if (readCache.has(filePath)) {
+              content = readCache.get(filePath)
+            } else {
+              try {
+                content = await readFileCached(filePath)
+              } catch (_) {
+                continue
+              }
+            }
+          }
+
+          if (!content || typeof content !== 'string') continue
+
+          const lines = content.split('\n')
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i]
+            const lineToSearch = caseSensitive ? line : line.toLowerCase()
+            if (lineToSearch.includes(lowerQuery)) {
+              matches.push({
+                file: filePath,
+                line: i + 1,
+                snippet: line.trim().slice(0, 160)
+              })
+              if (matches.length >= MAX_MATCHES) break
+            }
+          }
+        }
+
+        if (matches.length === 0) {
+          return `No se encontraron coincidencias para "${query}"${pathPrefix ? ` en "${pathPrefix}"` : ''}.`
+        }
+
+        const formatted = matches
+          .map(m => `${m.file}:${m.line}: ${m.snippet}`)
+          .join('\n')
+
+        return `Encontradas ${matches.length} coincidencias para "${query}":\n${formatted}${matches.length >= MAX_MATCHES ? '\n(Límite de 50 coincidencias alcanzado)' : ''}`
+      }
+
+      if (name === 'propose_change') {
+        const filePath = input.file_path || input.path
         let original = null
 
         try {
 
-          original = await readFileCached(input.path)
+          original = await readFileCached(filePath)
 
         } catch (err) {
 
@@ -2149,115 +3600,285 @@ REGLAS DE MODO BUILD (ACTUAL):
 
         }
 
-        const newContent = forcedDbJsContent(input.path) ?? input.new_content
+        const newContent = forcedDbJsContent(filePath) ?? input.new_content
 
-        proposedChanges.push({
+        // Protección contra código truncado o reducción destructiva no justificada
+        // Durante un hard reset de proyecto (isProjectResetOrder), se permite la reescritura total
+        // de src/App.jsx desde cero sin activar el bloqueo destructivo de reducción de líneas.
+        const isResetApp = Boolean(promptIntent?.isProjectResetOrder) && (filePath === 'src/App.jsx' || filePath === 'src/App.tsx');
+        const destructionCheck = isTruncatedOrDestructive(filePath, original, newContent, { isReset: isResetApp });
+        if (destructionCheck.isDestructive) {
+          return `Error: Se detectó código truncado o reducción destructiva en propose_change (${destructionCheck.reason}). Usa propose_patch o replace_file_content para editar solo las secciones necesarias sin destruir el código preexistente.`
+        }
 
-          path: input.path,
+        // ── ARNÉS 4: Candado Determinista de Infraestructura sobre vite.config.* ──
+        const isViteConfig = filePath.endsWith('vite.config.js') || filePath.endsWith('vite.config.ts') || filePath.endsWith('vite.config.mjs');
+        if (isViteConfig) {
+          const touchesServer = /(?:server\s*:|host\s*:|port\s*:|hmr\s*:)/i.test(newContent);
+          const isBlackScreen = Boolean(promptIntent?.isBlackScreenReport);
+          if (touchesServer || isBlackScreen) {
+            return `🚨 BLOQUEO DE INFRAESTRUCTURA: El problema de pantalla negra/vista previa vacía NUNCA se debe a vite.config.js. La causa es un error de runtime en tus componentes de src/ (un ícono inexistente de lucide-react, un desajuste entre export default y named export, una variable no definida o un hook mal llamado). Inspecciona src/App.jsx y todos los archivos de src/components/ y corrige el error de código React.`;
+          }
+        }
 
-          newContent,
+        // ── ARNÉS 2: Escáner de Credenciales Expuestas (secretGuard) ──
+        const secretCheck = scanForExposedSecrets(filePath, newContent)
+        if (secretCheck.hasSecret) {
+          return `ERROR DE SEGURIDAD (secretGuard): Se detectó una credencial privada o secreto de servidor (${secretCheck.secretType}) en "${filePath}".\nFragmento detectado: ${secretCheck.snippet}\n${secretCheck.advice}\nEl cambio fue BLOQUEADO por seguridad determinista.`
+        }
 
-          summary: input.summary,
+        // Pre-save syntax validation — atrapa errores como 'return outside of function'
+        // ANTES de escribir al VFS, evitando que archivos rotos lleguen al preview.
+        const syntaxErr = validateSyntax(filePath, newContent)
+        if (syntaxErr) {
+          return `SYNTAX_ERROR: El contenido propuesto para "${filePath}" tiene un error de sintaxis y NO fue registrado:\n${syntaxErr}\nCorrige el error y vuelve a llamar a la herramienta.`
+        }
 
-          originalContent: original,
+        const existingChangeIdx = proposedChanges.findIndex(c => c.path === filePath)
+        if (existingChangeIdx !== -1) {
+          proposedChanges[existingChangeIdx].newContent = newContent
+          proposedChanges[existingChangeIdx].summary = input.summary || proposedChanges[existingChangeIdx].summary
+        } else {
+          proposedChanges.push({
+            path: filePath,
+            newContent,
+            summary: input.summary,
+            originalContent: original,
+          })
+        }
 
-        })
+        stagedContent.set(filePath, newContent)
 
-        stagedContent.set(input.path, newContent)
-
-        return `Cambio registrado para ${input.path}. Se aplica solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
+        return `Cambio registrado para ${filePath}. Se aplica solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
 
       }
 
-      if (name === 'propose_patch') {
+      if (name === 'propose_patch' || name === 'replace_file_content') {
+        const filePath = input.file_path || input.path
 
         // Corre sobre el contenido REAL completo (o el ya parchado en este mismo turno, si hubo
-
-        // un "propose_patch"/"propose_change" previo a esta misma ruta) — nunca sobre la versión
-
+        // un "propose_patch"/"replace_file_content"/"propose_change" previo a esta misma ruta) — nunca sobre la versión
         // truncada de 100000 caracteres que ve el modelo vía "read_file". Así un archivo enorme
-
         // se puede editar sin que la IA tenga que haber visto (ni mucho menos reescrito) el
-
         // archivo completo, que es justo lo que causaba que inventara contenido para la parte
-
         // que nunca leyó (ver caso real: SuperAdminDashboard.tsx, un </AlertDialogFooter> que
-
         // terminó siendo un </AlertDialogHeader> alucinado al reescribir el archivo entero a ciegas).
-
-        let base = stagedContent.get(input.path)
+        let base = stagedContent.get(filePath)
 
         if (base === undefined) {
-
           try {
-
-            base = await readFileCached(input.path)
-
+            base = await readFileCached(filePath)
           } catch (err) {
-
             if (err.name === 'AbortError') throw err
-
-            return `No se pudo leer "${input.path}" (¿no existe todavía? "propose_patch" es solo para archivos existentes, usá "propose_change" para crear uno nuevo).`
-
+            return `No se pudo leer "${filePath}" (¿no existe todavía? "${name}" es solo para archivos existentes, usá "propose_change" para crear uno nuevo).`
           }
-
         }
 
         // Mismo caso especial que "propose_change" — ver forcedDbJsContent: este archivo tiene
-
         // un único contenido válido posible según el tipo de conexión, ningún patch parcial lo cambia.
-
-        const forced = forcedDbJsContent(input.path)
-
+        const forced = forcedDbJsContent(filePath)
         if (forced !== null) {
-
-          proposedChanges.push({ path: input.path, newContent: forced, summary: input.summary, originalContent: base })
-
-          stagedContent.set(input.path, forced)
-
-          return `Cambio registrado para ${input.path}. Se aplica solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
-
+          proposedChanges.push({ path: filePath, newContent: forced, summary: input.summary || 'Actualización de cliente DB', originalContent: base })
+          stagedContent.set(filePath, forced)
+          return `Cambio registrado para ${filePath}. Se aplica solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
         }
 
-        const old = String(input.old_string || '')
+        const old = String(input.search_block ?? input.old_string ?? '')
+        const newString = String(input.replace_block ?? input.new_string ?? '')
 
-        const occurrences = old ? base.split(old).length - 1 : 0
-
-        if (occurrences === 0) {
-
-          return `"old_string" no aparece en "${input.path}" — no se aplicó ningún cambio. Puede que el archivo tenga espacios/indentación distintos a lo que copiaste, o que ya no diga eso. Releé el fragmento exacto con "read_file" antes de reintentar.`
-
+        // Motor de Parcheo Resiliente (Multi-tier: exacto -> normalizado -> trimmed-lines -> fuzzy)
+        const patchResult = applyPatch(base, old, newString)
+        if (!patchResult.success) {
+          const hadPriorStaged = stagedContent.has(filePath)
+          if (hadPriorStaged && patchResult.reason.includes('no se encontró')) {
+            return `Conflicto de parche secuencial en "${filePath}": no se encontró el bloque tras la edición previa. Aplica los cambios en un solo bloque unificado.`
+          }
+          return `No se pudo aplicar el parche en "${filePath}": ${patchResult.reason} Releé el fragmento exacto con "read_file" antes de reintentar.`
         }
 
-        if (occurrences > 1) {
+        const newContent = patchResult.newContent
 
-          return `"old_string" aparece ${occurrences} veces en "${input.path}" — no se aplicó ningún cambio (tiene que ser único). Agregale más líneas de contexto alrededor para identificar un único lugar.`
-
+        // ── ARNÉS 4: Candado Determinista de Infraestructura sobre vite.config.* ──
+        const isViteConfig = filePath.endsWith('vite.config.js') || filePath.endsWith('vite.config.ts') || filePath.endsWith('vite.config.mjs');
+        if (isViteConfig) {
+          const touchesServer = /(?:server\s*:|host\s*:|port\s*:|hmr\s*:)/i.test(newContent);
+          const isBlackScreen = Boolean(promptIntent?.isBlackScreenReport);
+          if (touchesServer || isBlackScreen) {
+            return `🚨 BLOQUEO DE INFRAESTRUCTURA: El problema de pantalla negra/vista previa vacía NUNCA se debe a vite.config.js. La causa es un error de runtime en tus componentes de src/ (un ícono inexistente de lucide-react, un desajuste entre export default y named export, una variable no definida o un hook mal llamado). Inspecciona src/App.jsx y todos los archivos de src/components/ y corrige el error de código React.`;
+          }
         }
 
-        const newContent = base.replace(old, String(input.new_string ?? ''))
+        // ── ARNÉS 2: Escáner de Credenciales Expuestas (secretGuard) ──
+        const patchSecretCheck = scanForExposedSecrets(filePath, newContent)
+        if (patchSecretCheck.hasSecret) {
+          return `ERROR DE SEGURIDAD (secretGuard): Se detectó una credencial privada o secreto de servidor (${patchSecretCheck.secretType}) en "${filePath}".\nFragmento detectado: ${patchSecretCheck.snippet}\n${patchSecretCheck.advice}\nEl cambio fue BLOQUEADO por seguridad determinista.`
+        }
 
-        proposedChanges.push({ path: input.path, newContent, summary: input.summary, originalContent: base })
+        // Pre-save syntax validation — atrapa errores antes de que lleguen al VFS
+        const syntaxErr = validateSyntax(filePath, newContent)
+        if (syntaxErr) {
+          return `SYNTAX_ERROR: El cambio aplicado a "${filePath}" genera un error de sintaxis y NO fue registrado:\n${syntaxErr}\nRevisa tu bloque de código/reemplazo y corrige el error.`
+        }
 
-        stagedContent.set(input.path, newContent)
+        const summary = input.summary || `Edición atómica en ${filePath}`
+        const existingIdx = proposedChanges.findIndex(c => c.path === filePath)
+        if (existingIdx !== -1) {
+          proposedChanges[existingIdx].newContent = newContent
+          proposedChanges[existingIdx].summary = `${proposedChanges[existingIdx].summary}; ${summary}`
+        } else {
+          proposedChanges.push({ path: filePath, newContent, summary, originalContent: base })
+        }
 
-        return `Cambio registrado para ${input.path}. Se aplica solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
+        stagedContent.set(filePath, newContent)
+
+        return `Cambio registrado para ${filePath}. Se aplica solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
 
       }
 
-      if (name === 'propose_db_change' || name === 'propose_migration') {
+      if (name === 'delete_file') {
+        const rawPath = input.path || input.file_path || ''
+        const filePath = rawPath.replace(/^\/+/, '').trim()
+        const reason = input.reason || 'Archivo eliminado por el agente'
 
-        const sql = input.up_sql || input.sql
+        if (!filePath) {
+          return { ok: false, is_error: true, output: 'No se especificó la ruta del archivo a eliminar.' }
+        }
 
+        const norm = filePath.toLowerCase()
+        if (
+          norm === 'package.json' ||
+          norm === 'vite.config.js' ||
+          norm === 'vite.config.ts' ||
+          norm === 'index.html' ||
+          norm === 'tsconfig.json' ||
+          norm === 'src/main.jsx' ||
+          norm === 'src/main.tsx' ||
+          norm === 'src/app.jsx' ||
+          norm === 'src/app.tsx'
+        ) {
+          return { ok: false, is_error: true, output: `No está permitido eliminar el archivo base del sistema "${filePath}".` }
+        }
+
+        // 1. Quitar de stagedContent si estaba ahí
+        stagedContent.delete(filePath)
+
+        // 2. Quitar de proposedChanges si existía
+        const existingIdx = proposedChanges.findIndex(c => c.path === filePath)
+        if (existingIdx !== -1) {
+          proposedChanges.splice(existingIdx, 1)
+        }
+
+        // 3. Registrar eliminación
+        proposedDeletions.push(filePath)
+        proposedChanges.push({
+          path: filePath,
+          type: 'delete',
+          newContent: null,
+          originalContent: null,
+          summary: `Eliminado: ${reason}`
+        })
+
+        // 4. Si el proyecto es virtual, eliminar de project_files de inmediato
+        try {
+          if (isVirtualRepo(project.repo_full_name) || String(project.repo_full_name || '').startsWith('virtual')) {
+            await supabase.from('project_files').delete().eq('project_id', project.id).eq('path', filePath)
+          }
+        } catch (delErr) {
+          console.warn(`[delete_file] Error eliminando ${filePath} en storage:`, delErr.message)
+        }
+
+        // 5. Invalidador de caché y grafo semántico
+        invalidateProjectFileCache(project.id)
+        invalidateSemanticGraph(project.id)
+
+        return `Archivo "${filePath}" eliminado exitosamente (${reason}).`
+      }
+
+      if (name === 'reset_project') {
+        const wipeDatabase = Boolean(input.wipeDatabase)
+        const reason = input.reason || 'Reinicio total solicitado'
+
+        onProgress?.({
+          type: 'telemetry',
+          phase: 'CLEANING',
+          label: `Ejecutando reinicio de proyecto (${reason})...`
+        })
+
+        try {
+          const resetRes = await executeHardProjectReset({
+            project,
+            dbConnection,
+            ownerKey,
+            accessToken,
+            wipeDatabase,
+            conversationId: null,
+            onProgress
+          })
+
+          didResetProject = true
+
+          // Limpiar stagedContent y proposedChanges para reflejar el estado limpio
+          stagedContent.clear()
+          stagedContent.set('src/App.jsx', CLEAN_APP_SCAFFOLD)
+
+          return `Reinicio total del proyecto ejecutado exitosamente (${reason}). Archivos obsoletos purgados: ${resetRes.deletedFiles.length}. Tablas purgadas: ${resetRes.droppedTables.length}. Snapshot pre-reset guardado con seguridad.`
+        } catch (resErr) {
+          console.error('[reset_project] Error en reinicio:', resErr)
+          return `Error al ejecutar reinicio de proyecto: ${resErr.message}`
+        }
+      }
+
+      if (name === 'propose_db_change' || name === 'propose_migration' || name === 'execute_ddl' || name === 'apply_migration') {
+        const sql = input.up_sql || input.sql || input.ddl || ''
         const summary = input.name || input.summary || 'Cambio en base de datos'
 
-        proposedDbChanges.push({ sql: ensureForceRls(sql), summary })
+        if (!sql.trim()) {
+          return {
+            ok: false,
+            is_error: true,
+            output: 'No se proporcionó ninguna sentencia SQL DDL para ejecutar.'
+          }
+        }
 
-        return `Cambio de base de datos registrado: "${summary}". Se ejecuta solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
+        const forceSql = ensureForceRls(sql)
 
+        // Si tenemos conexión a base de datos en vivo, ejecutamos la migración con timeout de 30s
+        if (dbConnection) {
+          try {
+            await runSql(dbConnection, forceSql)
+            invalidateSchemaCache(dbConnection)
+            invalidateDbSchemaGraph(project.id)
+          } catch (ddlErr) {
+            // Error 42P07: duplicate_table en PostgreSQL
+            if (ddlErr.code === '42P07' || /already exists/i.test(ddlErr.message)) {
+              console.warn(`[DDL IDEMPOTENCY] Advertencia: la tabla o relación ya existe (42P07): ${ddlErr.message}. Continuando de forma idempotente.`)
+            } else {
+              console.error(`[TOOL_ERROR] Error ejecutando ${name}:`, ddlErr)
+              return {
+                ok: false,
+                is_error: true,
+                output: `Error ejecutando la herramienta ${name}: ${ddlErr.message}. Analiza el error y corrige tu sintaxis SQL.`
+              }
+            }
+          }
+        }
+
+        proposedDbChanges.push({ sql: forceSql, summary, alreadyApplied: Boolean(dbConnection), status: dbConnection ? 'applied' : 'pending' })
+        invalidateDbSchemaGraph(project.id)
+        return {
+          ok: true,
+          output: `Migración DDL ejecutada y registrada exitosamente: "${summary}".`
+        }
       }
 
       if (name === 'ask_question') {
+        if (!shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext })) {
+          return {
+            ok: false,
+            is_error: true,
+            output: 'La herramienta ask_question está deshabilitada para este turno porque el pedido del usuario es específico, contiene código/SQL o ya definió la acción a realizar. Procede directamente con la ejecución o análisis.'
+          }
+        }
 
         askedQuestion = {
 
@@ -2352,33 +3973,34 @@ REGLAS DE MODO BUILD (ACTUAL):
       }
 
       if (name === 'generate_image') {
+        try {
+          const { mimeType, base64 } = await runWithTimeout(
+            generateImage(input.prompt),
+            20000,
+            'generate_image'
+          )
 
-        const { mimeType, base64 } = await generateImage(input.prompt)
+          const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg'
+          const filename = (input.path || 'public/logo.png').split('/').pop() || `generated.${ext}`
 
-        const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg'
+          proposedAssetChanges.push({
+            target: 'github',
+            path: input.path || 'public/logo.png',
+            filename,
+            mimeType,
+            base64,
+            sizeBytes: Buffer.from(base64, 'base64').length,
+            summary: input.summary || 'Logo generado',
+          })
 
-        const filename = input.path.split('/').pop() || `generated.${ext}`
-
-        proposedAssetChanges.push({
-
-          target: 'github',
-
-          path: input.path,
-
-          filename,
-
-          mimeType,
-
-          base64,
-
-          sizeBytes: Buffer.from(base64, 'base64').length,
-
-          summary: input.summary,
-
-        })
-
-        return `Imagen generada y guardada en ${input.path}. Se aplica automáticamente al final del turno.`
-
+          return `Imagen generada y guardada en ${input.path || 'public/logo.png'}. Se aplica automáticamente al final del turno.`
+        } catch (err) {
+          console.error(`Error en generate_image para "${input?.path}":`, err.message)
+          return {
+            is_error: true,
+            message: "El servicio de generación de imágenes no está disponible o excedió el tiempo límite. FALLBACK REQUERIDO: Diseña e inserta un logo vectorial profesional directamente en código React usando SVG puro o componentes Lucide React con Tailwind CSS."
+          }
+        }
       }
 
       if (name === 'propose_storage_upload') {
@@ -2459,7 +4081,7 @@ REGLAS DE MODO BUILD (ACTUAL):
 
         try {
 
-          const status = await getPreviewStatus(ownerKey)
+          const status = await getPreviewStatus(ownerKey, project.repo_full_name)
 
           const lastErr = runtimeBus.getLastError(ownerKey) ||
             (project?.id ? (runtimeBus.getLastError(project.id) || runtimeBus.getLastError(`project:${project.id}`)) : null);
@@ -2489,7 +4111,7 @@ REGLAS DE MODO BUILD (ACTUAL):
 
         try {
 
-          const status = await getPreviewStatus(ownerKey)
+          const status = await getPreviewStatus(ownerKey, project.repo_full_name)
 
           if (!status || status.status !== 'running') {
 
@@ -2558,15 +4180,34 @@ REGLAS DE MODO BUILD (ACTUAL):
       }
 
       return `Herramienta desconocida: ${name}`
-
     } catch (err) {
-
-      if (err.name === 'AbortError' || signal?.aborted) throw err
-
+      if (err.name === 'AbortError' || (signal?.aborted && (isExplicitCancel ? isExplicitCancel() : true))) throw err
       return `Error ejecutando ${name}: ${err.message}`
-
     }
+  }
 
+  // Encapsulamiento Seguro de Herramientas: NINGUNA excepción tumbará el bucle del agente
+  const executeTool = async ({ name, input }) => {
+    const isCancelled = () => signal?.aborted && (isExplicitCancel ? isExplicitCancel() : true)
+    if (isCancelled()) throw new DOMException('Cancelado por el usuario', 'AbortError')
+
+    onProgress?.(describeStep(name, input))
+
+    try {
+      const result = await executeToolInternal({ name, input })
+      if (typeof result === 'object' && result !== null && ('ok' in result || 'is_error' in result)) {
+        return result
+      }
+      return { ok: true, output: result }
+    } catch (toolError) {
+      if (toolError.name === 'AbortError' || isCancelled()) throw toolError
+      console.error(`[TOOL_ERROR] Error ejecutando ${name}:`, toolError)
+      return {
+        ok: false,
+        is_error: true,
+        output: `Error ejecutando la herramienta ${name}: ${toolError.message}. Analiza el error y corrige tu estrategia.`
+      }
+    }
   }
 
 
@@ -2585,13 +4226,73 @@ REGLAS DE MODO BUILD (ACTUAL):
 
   let intentos = 0;
 
-  const MAX_INTENTOS = 3;
+  const MAX_INTENTOS = 4;
+  const turnStartTime = Date.now();
+  const MAX_TURN_EXECUTION_TIME_MS = 360000; // 6 minutos de seguridad interna (watchdog global: 10 min)
+
+  // Tracking de TODOS los componentes que el agente tocó en este turno (a través de TODOS
+  // los intentos del while). Lo mantenemos a nivel del loop y no del guard para que en
+  // reintentos >= 2 — cuando el modelo re-propuso componentes que ya quedaron aplicados en
+  // intentos previos y por lo tanto ya están en el `projectSet` del repo — el guard siga
+  // considerando esos componentes como "creados en este turno" y mantenga activo el bloqueo
+  // hasta que el entrypoint (App.jsx) realmente se actualice. Sin esto, el guard se "rinde"
+  // en reintentos y deja pasar un turno que no arregla el App.jsx (caso real visto en
+  // conversación d719af1c... donde quedaron 7 componentes huérfanos y App.jsx sin montar).
+  const componentsTouchedThisTurn = new Set();
+
+  // Helper local: extrae el nombre canónico del componente a partir de la ruta y el
+  // contenido. Replica la lógica de uiIntegrityGuard.js#extractComponentName sin importar
+  // ese helper (que no está exportado) — solo lo usamos para construir el catálogo de
+  // imports que le vamos a inyectar al modelo en el activeUserMessage de reintento.
+  const extractLocalComponentName = (filePath, content) => {
+    if (!filePath) return null
+    const baseName = String(filePath).split('/').pop().replace(/\.(jsx|tsx|js|ts)$/i, '')
+    if (!content || typeof content !== 'string') return baseName
+    const m1 = /export\s+default\s+function\s+([A-Z][A-Za-z0-9_]*)/.exec(content)
+    if (m1) return m1[1]
+    const m2 = /export\s+const\s+([A-Z][A-Za-z0-9_]*)\s*=/.exec(content)
+    if (m2) return m2[1]
+    const m3 = /export\s+default\s+([A-Z][A-Za-z0-9_]*)/.exec(content)
+    if (m3) return m3[1]
+    return baseName
+  }
 
   let activeUserMessage = userMessage;
+  if (elementContext) {
+    const matchedFile = findMatchingFileForElement(semanticGraph, semanticFilesMap, elementContext);
+    let preloadedSourceBlock = '';
+    let fileContent = semanticFilesMap?.[matchedFile];
+    if (!fileContent && matchedFile) {
+      try {
+        fileContent = await readProjectFile(project, accessToken, matchedFile, signal);
+      } catch (_) {}
+    }
+    if (matchedFile && fileContent) {
+      preloadedSourceBlock = `\n[CÓDIGO FUENTE PRE-CARGADO PARA EDICIÓN INMEDIATA: "${matchedFile}"]
+\`\`\`
+${fileContent}
+\`\`\`
+INSTRUCCIÓN DE EDICIÓN RÁPIDA: El código completo de "${matchedFile}" ya está provisto arriba. NO uses "read_file" ni "list_files"; aplica directamente "propose_patch" o "replace_file_content" sobre "${matchedFile}" para cumplir la solicitud del usuario en este único turno.\n`;
+    }
+
+    const elementDirective = `[ELEMENTO SELECCIONADO VISUALMENTE (CLICK-TO-EDIT)]
+El usuario hizo clic sobre un elemento puntual en la vista previa (${elementContext.pathname || '/'}):
+• Etiqueta: <${elementContext.tagName || 'elemento'}>
+• Clases CSS: ${elementContext.className || '(ninguna)'}
+• Texto visible: "${elementContext.innerText || elementContext.textSnippet || ''}"
+${elementContext.componentName ? `• Componente React: <${elementContext.componentName} />\n` : ''}${elementContext.parentHierarchy ? `• Jerarquía contenedor: ${elementContext.parentHierarchy}\n` : ''}${matchedFile ? `• ARCHIVO IDENTIFICADO EN EL MAPA SEMÁNTICO: "${matchedFile}".\n` : ''}${preloadedSourceBlock}
+El pedido del usuario sobre este elemento es:
+"${userMessage}"`;
+    activeUserMessage = elementDirective;
+  }
 
 
 
   while (intentos < MAX_INTENTOS) {
+    if (intentos > 0 && (Date.now() - turnStartTime) > MAX_TURN_EXECUTION_TIME_MS) {
+      console.warn(`[runAgent:WatchdogGuard] Tiempo acumulado del turno superó el límite de seguridad (${Math.round((Date.now() - turnStartTime) / 1000)}s). Finalizando con los resultados actuales.`);
+      break;
+    }
 
     proposedChanges.length = 0;
 
@@ -2600,6 +4301,8 @@ REGLAS DE MODO BUILD (ACTUAL):
     proposedAssetChanges.length = 0;
 
     proposedEdgeFunctions.length = 0;
+
+    proposedDeletions.length = 0;
 
     stagedContent.clear();
 
@@ -2621,7 +4324,7 @@ REGLAS DE MODO BUILD (ACTUAL):
 
       attachments: intentos === 0 ? attachments : [], // adjuntos solo en el primer intento
 
-      preferProvider: attachments.length === 0 && isCasualMessage(activeUserMessage) ? 'gemini' : undefined,
+      preferProvider: attachments.length === 0 && turnMode !== 'BUILD' && isCasualMessage(activeUserMessage) ? 'gemini' : undefined,
 
       projectId: project.id,
 
@@ -2633,88 +4336,15 @@ REGLAS DE MODO BUILD (ACTUAL):
 
     usage = result.usage;
 
-
-
-    // Guardrail Estático de UI y Design Tokens
-
-    if (proposedChanges.length > 0) {
-
-      let uiViolation = null;
-
-      for (const change of proposedChanges) {
-
-        if (!change.path.endsWith('.jsx') && !change.path.endsWith('.tsx')) continue;
-
-        
-
-        const oldStyleMatch = change.originalContent ? change.originalContent.match(/style=\{\{/g) : null;
-
-        const styleMatch = change.newContent.match(/style=\{\{/g);
-
-        const hexBgMatch = change.newContent.match(/bg-\[#[0-9a-fA-F]+\]/g);
-
-        const oldHexBgMatch = change.originalContent ? change.originalContent.match(/bg-\[#[0-9a-fA-F]+\]/g) : null;
-
-        const hexTextMatch = change.newContent.match(/text-\[#[0-9a-fA-F]+\]/g);
-
-        const oldHexTextMatch = change.originalContent ? change.originalContent.match(/text-\[#[0-9a-fA-F]+\]/g) : null;
-
-        const inlineColors = (hexBgMatch?.length || 0) + (hexTextMatch?.length || 0);
-
-        const oldInlineColors = (oldHexBgMatch?.length || 0) + (oldHexTextMatch?.length || 0);
-
-
-
-                // Tolerancia aumentada: permitimos estilos inline si son mínimos (brand colors como WhatsApp)
-
-        const addedStyles = (styleMatch?.length || 0) - (oldStyleMatch?.length || 0);
-
-        if (addedStyles >= 3) {
-
-          uiViolation = `El archivo ${change.path} introdujo demasiados estilos inline (style={{...). Usa clases de Tailwind y primitivas de UI.`;
-
-          break;
-
-        }
-
-        
-
-        const addedColors = inlineColors - oldInlineColors;
-
-        if (addedColors >= 3) {
-
-          uiViolation = `El archivo ${change.path} introdujo múltiples colores hardcodeados nuevos. Usa los tokens semánticos (bg-background, text-foreground, etc.).`;
-
-        }
-
+    // Tracking cross-intento: registrar TODOS los componentes que el agente creó o modificó
+    // en este turno. Se mantiene a nivel del while (no se borra en cada intento) para que el
+    // guard pueda seguirlos considerando "creados en este turno" incluso en reintentos donde
+    // los archivos ya están aplicados en el repo y por lo tanto ya están en `projectSet`.
+    for (const c of proposedChanges) {
+      const norm = String(c.path || '').replace(/\\/g, '/').replace(/^\.\//, '')
+      if (/^src\/(components|pages|views)\//.test(norm) && !/^src\/components\/ui\//.test(norm)) {
+        componentsTouchedThisTurn.add(norm)
       }
-
-
-
-      if (uiViolation) {
-
-        intentos++;
-
-        if (intentos < MAX_INTENTOS) {
-
-          onProgress?.({ type: 'telemetry', phase: 'HEALING', label: 'Ajustando detalles...', payload: { attempt: intentos, maxAttempts: MAX_INTENTOS, errorSnippet: uiViolation } });
-
-          activeUserMessage = `⚠️ El código que acabas de proponer internamente fue rechazado por esta infracción:\n\n${uiViolation}\n\nOBLIGATORIO: Debes invocar la herramienta "propose_patch" AHORA MISMO para reescribir el archivo corrigiendo esto. No respondas solo con texto, TIENES que llamar a la herramienta. El pedido original del usuario era:\n\n${userMessage}`;
-
-          continue;
-
-        } else {
-
-          onProgress?.({ type: 'telemetry', phase: 'DEGRADED', label: 'Violación de UI no resuelta.' });
-
-          text += '\n\n⚠️ **Aviso de Calidad UI:** El código propuesto no cumple completamente con los estándares del sistema de diseño (tokens semánticos/shadcn).';
-
-          break;
-
-        }
-
-      }
-
     }
 
     // Guardrail basado en el DIFF FINAL (Persistencia y Acceso a Base de Datos)
@@ -2735,7 +4365,7 @@ REGLAS DE MODO BUILD (ACTUAL):
             const tableCreatedInTurn = createdTables.has(table);
 
             if (!tableExistsLive && !tableCreatedInTurn) {
-              dbViolation = `La tabla "${table}" a la que accede el código propuesto no existe en la base de datos PostgreSQL y NO has llamado a "propose_migration" para crearla en este turno.`;
+              dbViolation = `La tabla "${table}" a la que accede el código propuesto no existe en la base de datos PostgreSQL y NO has llamado a "propose_migration" o "execute_ddl" para crearla en este turno.`;
               break;
             }
 
@@ -2746,7 +4376,7 @@ REGLAS DE MODO BUILD (ACTUAL):
               for (const col of referencedCols) {
                 if (col === 'id' || col === 'created_at' || col === 'updated_at') continue;
                 if (!liveCols.includes(col) && !addedInTurn.has(col)) {
-                  dbViolation = `La columna "${col}" en la tabla "${table}" no existe en la base de datos PostgreSQL y NO has propuesto un ALTER TABLE con "propose_migration" para agregarla.`;
+                  dbViolation = `La columna "${col}" en la tabla "${table}" no existe en la base de datos PostgreSQL y NO has propuesto un ALTER TABLE con "propose_migration" o "execute_ddl" para agregarla.`;
                   break;
                 }
               }
@@ -2764,11 +4394,11 @@ REGLAS DE MODO BUILD (ACTUAL):
                 payload: { attempt: intentos, maxAttempts: MAX_INTENTOS, errorSnippet: dbViolation },
               });
 
-              activeUserMessage = `BUILD_FAILED: Violación de contrato de persistencia en base de datos:\n${dbViolation}\n\nOBLIGATORIO: Debes invocar la herramienta "propose_migration" AHORA MISMO con el script SQL (CREATE TABLE, GRANTs, RLS) para crear la tabla y columnas necesarias antes de cerrar el turno. Está PROHIBIDO omitir la base de datos o dejar tablas inexistentes. El pedido original era:\n\n${userMessage}`;
+              activeUserMessage = `BUILD_FAILED: Violación de contrato de persistencia en base de datos:\n${dbViolation}\n\nOBLIGATORIO: Debes invocar la herramienta "propose_migration" o "execute_ddl" AHORA MISMO con el script SQL (CREATE TABLE, GRANTs, RLS) para crear la tabla y columnas necesarias antes de cerrar el turno. Está PROHIBIDO omitir la base de datos o dejar tablas inexistentes. El pedido original era:\n\n${userMessage}`;
               continue;
             } else {
               onProgress?.({ type: 'telemetry', phase: 'DEGRADED', label: 'Violación de persistencia no resuelta.' });
-              text = `⚠️ Error de persistencia: El código modificado intenta usar tablas o columnas que no existen en PostgreSQL (${dbViolation}). No se aplicó ninguna migración con propose_migration.`;
+              text = `⚠️ Error de persistencia: El código modificado intenta usar tablas o columnas que no existen en PostgreSQL (${dbViolation}). No se aplicó ninguna migración con propose_migration / execute_ddl.`;
               break;
             }
           }
@@ -2778,59 +4408,166 @@ REGLAS DE MODO BUILD (ACTUAL):
       }
     }
 
-    // Guardrail de Evasión: el modelo devolvió texto sin herramientas en un turno de edición
+    // Guardrail de Evasión: si se requería acción de código y el modelo devolvió solo texto sin herramientas
+    const hasAnyActionTaken = proposedChanges.length > 0 || proposedDbChanges.length > 0 || proposedAssetChanges.length > 0 || proposedEdgeFunctions.length > 0 || proposedDeletions.length > 0 || didResetProject;
 
-    if (proposedChanges.length === 0 && proposedDbChanges.length === 0 && proposedAssetChanges.length === 0 && proposedEdgeFunctions.length === 0) {
+    if (turnMode === 'BUILD' && !promptIntent.isPureQuestion && promptIntent.hasActionOrder && !hasAnyActionTaken) {
+      // Verificar si el modelo respondió legítimamente una consulta técnica o dio una explicación sustancial
+      const isLegitimateExplanation = text && text.trim().length > 100 && (
+        /\b(?:no\s+es\s+necesario|ya\s+está|ya\s+existe|el\s+código\s+actual|para\s+hacer\s+esto|la\s+arquitectura|se\s+recomienda|el\s+motivo|porque|debido\s+a|revisé\s+el\s+código|no\s+se\s+requiere)\b/i.test(text)
+      );
 
-      const isInformationalQuery = (msg) => {
-
-        const trimmed = (msg || '').trim().toLowerCase();
-
-        const questionWords = ['qué es', 'qué son', 'cómo', 'explícame', 'por qué', 'cuánto', 'cuál'];
-
-        const hasQuestionMark = trimmed.endsWith('?') || trimmed.startsWith('¿');
-
-        return hasQuestionMark && questionWords.some(q => trimmed.includes(q));
-
-      };
-
-
-
-      const isPureQuestion = isInformationalQuery(userMessage);
-
-      if (!isPureQuestion && result.usage?.finish_reason !== 'length') {
-
+      if (!isLegitimateExplanation && result.usage?.finish_reason !== 'length') {
         intentos++;
-
         if (intentos < MAX_INTENTOS) {
-
           onProgress?.({ type: 'telemetry', phase: 'HEALING', label: 'Enfocando generación en código...' });
-
           compressedHistory.push({ role: 'model', content: text });
-
-          activeUserMessage = "[SYSTEM OVERRIDE]: Prohibido responder con explicaciones en texto. Tu única tarea es ejecutar la solicitud modificando los archivos correspondientes invocando la herramienta 'propose_patch' (para editar) o 'propose_change' (para crear). Aplica los cambios ahora.";
-
+          const dualHint = promptIntent.isDualResponseRequired
+            ? " Si el pedido incluía una pregunta o reporte de error, responde la pregunta y aplica los cambios correspondientes ahora."
+            : "";
+          activeUserMessage = `[SYSTEM OVERRIDE]: La solicitud requiere cambios en el código. Invocá la herramienta 'replace_file_content' / 'propose_patch' (para editar) o 'propose_change' (para crear).${dualHint} Aplica los cambios ahora.`;
           continue;
-
         }
-
       }
-
     }
 
 
 
+    // ── ARNÉS 4: Verificación Sintáctica AST Determinista (Anti-Overclaiming) ──
+    if (proposedChanges.length > 0) {
+      const syntaxFailures = []
+      for (const [sFile, sContent] of stagedContent.entries()) {
+        const sErr = validateSyntax(sFile, sContent)
+        if (sErr) {
+          syntaxFailures.push(`- ${sFile}: ${sErr}`)
+        }
+      }
+      if (syntaxFailures.length > 0 && intentos < MAX_INTENTOS - 1) {
+        intentos++
+        console.warn('[runAgent:Arnes4] Errores sintácticos de AST detectados:\n', syntaxFailures.join('\n'))
+        activeUserMessage = `Error de sintaxis AST detectado en el código propuesto (Arnés 4 - Syntax Verification):\n${syntaxFailures.join('\n')}\nPor favor corrige de inmediato estos errores de sintaxis antes de finalizar el turno.`
+        continue
+      }
+    }
+
     // Fases 2 y 3: VFS y Verification Loop
     if (proposedChanges.length > 0 && previewAvailable) {
       try {
-        // CAPA 1: Auto-inyección de dependencias antes de compilar
+        // CAPA 1: Guardián Estático y Auto-Inyector de Dependencias (importGuard)
         let existingPkg = null;
         if (!stagedContent.has('package.json')) {
           try {
             existingPkg = await readFileCached('package.json');
           } catch (_) {}
         }
-        await autoInjectDependencies(stagedContent, proposedChanges, existingPkg);
+
+        const projectFilesList = Object.keys(semanticFilesMap || {});
+        const guardResult = await runImportGuard({
+          stagedContent,
+          proposedChanges,
+          existingPackageJsonContent: existingPkg,
+          projectFilesList
+        });
+
+        // Si se detectan errores críticos en importaciones locales (archivos faltantes o mayúsculas incorrectas para Linux)
+        if (!guardResult.localValidation.valid && intentos < MAX_INTENTOS - 1) {
+          intentos++;
+          const importErrSummary = guardResult.localValidation.errors.join('\n');
+          console.warn('[importGuard] Errores de importación detectados antes de compilar:\n', importErrSummary);
+          activeUserMessage = `Error de importación local detectado en el código propuesto:\n${importErrSummary}\nPor favor crea los archivos faltantes o corrige las rutas/nombres de archivo con las mayúsculas y minúsculas exactas para Linux.`;
+          continue;
+        }
+
+        // CAPA 1.5: Guardián de Integridad de Interfaz (uiIntegrityGuard)
+        const uiGuardResult = await validateUiIntegrity({
+          stagedContent,
+          proposedChanges,
+          proposedDbChanges,
+          projectFilesList,
+          readProjectFile: readFileCached,
+          userMessage: userMessage || activeUserMessage || '',
+          isProjectResetOrder: Boolean(promptIntent?.isProjectResetOrder),
+          // Cross-intento: el guard usa esta lista para considerar "creados en este turno"
+          // incluso en reintentos donde los archivos ya están aplicados en el repo. Sin
+          // esto, el guard se rinde y deja pasar un turno que no arregla App.jsx.
+          agentTouchedThisTurn: [...componentsTouchedThisTurn],
+        });
+
+        if (uiGuardResult.seoAdvisories && uiGuardResult.seoAdvisories.length > 0) {
+          console.info('[uiIntegrityGuard:SEO] Sugerencias de optimización SEO 2026:', uiGuardResult.seoAdvisories);
+        }
+
+        if (!uiGuardResult.valid && intentos < MAX_INTENTOS - 1) {
+          // Safety net del kill switch: si ya se acabó el tiempo Y en el intento actual
+          // el modelo propuso un cambio a src/App.jsx que resuelve el scaffold, aplicarlo
+          // antes de salir. Caso real: el modelo corrigió al final pero se quedó sin
+          // presupuesto de tiempo y el break original perdía ese trabajo.
+          if ((Date.now() - turnStartTime) > MAX_TURN_EXECUTION_TIME_MS) {
+            let didRecoverEntrypoint = false
+            try {
+              const appChange = proposedChanges.find((c) => {
+                const p = String(c.path || '').replace(/\\/g, '/')
+                return p === 'src/App.jsx' || p === 'src/App.tsx'
+              })
+              if (appChange && typeof appChange.newContent === 'string') {
+                if (!isEntrypointStillScaffold(appChange.newContent)) {
+                  console.warn(`[uiIntegrityGuard] Kill switch disparó pero hay propuesta de App.jsx válida. Aplicando y saliendo.`)
+                  didRecoverEntrypoint = true
+                }
+              }
+            } catch (_) { /* si falla la verificación, seguir con el break normal */ }
+            if (!didRecoverEntrypoint) {
+              console.warn(`[uiIntegrityGuard] Tiempo acumulado alto (${Math.round((Date.now() - turnStartTime) / 1000)}s). Evitando reintento.`);
+              break;
+            }
+          }
+          intentos++;
+          const uiErrSummary = uiGuardResult.errors.join('\n');
+          console.warn('[uiIntegrityGuard] Fallos de integridad UI detectados:\n', uiErrSummary);
+
+          // Enriquecer el activeUserMessage con contexto accionable: (a) el contenido
+          // actual de App.jsx para que el modelo sepa qué está pisando, y (b) un catálogo
+          // de imports sugerido con los componentes que tocó en este turno. Sin este
+          // contexto, el modelo reintenta proponer cambios a los componentes (ya
+          // aplicados) en vez de actualizar el entrypoint — exactamente lo que pasó en
+          // la conversación d719af1c... donde quedaron 7 componentes huérfanos.
+          let appContextBlock = ''
+          try {
+            const stagedApp = stagedContent.get('src/App.jsx') || stagedContent.get('src/App.tsx')
+            let currentApp = stagedApp
+            if (!currentApp && typeof readFileCached === 'function') {
+              currentApp = (await readFileCached('src/App.jsx')) || (await readFileCached('src/App.tsx')) || ''
+            }
+            if (currentApp) {
+              const stillScaffold = isEntrypointStillScaffold(currentApp)
+              appContextBlock = `\n\n=== ESTADO ACTUAL DE src/App.jsx (${stillScaffold ? 'PLANTILLA VACÍA — DEBES REEMPLAZARLA' : 'ya no es scaffold'}) ===\n\`\`\`jsx\n${currentApp.slice(0, 4000)}\n\`\`\``
+            } else {
+              appContextBlock = `\n\n(No se pudo leer src/App.jsx actual — partí de una plantilla scaffold con un <h1> de placeholder y debés reemplazarlo entero.)`
+            }
+          } catch (_) {
+            appContextBlock = `\n\n(No se pudo leer src/App.jsx actual por error de lectura — partí de una plantilla scaffold con un <h1> de placeholder y debés reemplazarlo entero.)`
+          }
+
+          let importCatalogBlock = ''
+          if (componentsTouchedThisTurn.size > 0) {
+            const lines = []
+            for (const p of [...componentsTouchedThisTurn].sort()) {
+              let compName = null
+              try {
+                const stagedC = stagedContent.get(p)
+                const c = stagedC || (typeof readFileCached === 'function' ? await readFileCached(p) : null)
+                if (c) compName = extractLocalComponentName(p, c)
+              } catch (_) {}
+              if (!compName) compName = p.split('/').pop().replace(/\.(jsx|tsx|js|ts)$/i, '')
+              const importPath = './' + p.replace(/^src\//, '').replace(/\.(jsx|tsx|js|ts)$/i, '')
+              lines.push(`- import { ${compName} } from '${importPath}'   // ${p}`)
+            }
+            importCatalogBlock = `\n\n=== CATÁLOGO DE COMPONENTES QUE TOCASTE EN ESTE TURNO (importalos y montalos en App.jsx) ===\n${lines.join('\n')}\n`
+          }
+
+          activeUserMessage = `Error de integridad de interfaz UI detectado en los componentes propuestos:\n${uiErrSummary}\n\nINSTRUCCIÓN ESPECÍFICA Y OBLIGATORIA: el entrypoint (src/App.jsx) sigue mostrando la plantilla vacía inicial. Tenés que ACTUALIZAR src/App.jsx en este mismo turno (usá propose_change o propose_patch sobre src/App.jsx) para importar y montar los componentes de abajo. NO modifiques los componentes — el problema es exclusivamente que App.jsx no los importa ni los renderiza.${importCatalogBlock}${appContextBlock}\n\nReglas:\n1. Reemplazá el contenido actual de App.jsx con un componente App que (a) importe cada componente del catálogo, (b) los monte en un orden lógico (Header arriba, Hero, secciones, Footer al final), y (c) devuelva un único árbol JSX.\n2. No le preguntes al usuario qué hacer — aplicá el cambio directamente.\n3. Si la auditoría también marca botones sin onClick, agregales un onClick mínimo o type="submit" antes de finalizar.\n\nEl pedido original del usuario era:\n${userMessage}`;
+          continue;
+        }
 
         const filesMap = {};
         for (const [path, content] of stagedContent.entries()) {
@@ -2839,17 +4576,19 @@ REGLAS DE MODO BUILD (ACTUAL):
         onProgress?.({ type: 'telemetry', phase: 'WRITING_VFS', label: `Editando ${Object.keys(filesMap).length} archivo(s)...`, payload: { files: Object.keys(filesMap) } });
 
         // CAPA 2: Compilación forzada real (await real de testVfsChanges con npm install y warm-up)
-        await testVfsChanges(ownerKey, filesMap);
+        await testVfsChanges(ownerKey, filesMap, project.repo_full_name);
 
         onProgress?.({ type: 'telemetry', phase: 'VALIDATING_BUILD', label: 'Verificando compilación e interfaz...' });
         await new Promise(r => setTimeout(r, 800));
 
         // 3. Revisar logs y estado veraz del sandbox
-        const status = await getPreviewStatus(ownerKey);
-        const cleanLogs = (status?.logsTail || '').replace(/\x1b\[[0-9;]*m/g, '');
+        const status = await getPreviewStatus(ownerKey, project.repo_full_name);
+        const rawTail = status?.logsTail || '';
+        const logParts = rawTail.split(/--- VFS REFRESH START.*---/);
+        const recentLogs = logParts[logParts.length - 1].replace(/\x1b\[[0-9;]*m/g, '');
 
-        // 4. Buscar errores de compilación críticos y fallos de importación
-        const viteInfraError = cleanLogs.includes('node_modules/vite') || cleanLogs.includes('.vite/deps');
+        // 4. Buscar errores de compilación críticos y fallos de importación en logs recientes
+        const viteInfraError = recentLogs.includes('node_modules/vite') || recentLogs.includes('.vite/deps');
         if (viteInfraError) {
           onProgress?.({ type: 'telemetry', phase: 'VALIDATING_BUILD', label: 'Reconstruyendo dependencias...' });
           await restartPreviewForAgent({ ownerKey, project, accessToken, dbConnection });
@@ -2869,13 +4608,23 @@ REGLAS DE MODO BUILD (ACTUAL):
           'does not provide an export named'
         ];
 
+        const successMarkers = [
+          'HMR updated cleanly',
+          'optimized dependencies changed. reloading',
+          'page reload',
+          'hmr update'
+        ];
+        const lastSuccessIdx = Math.max(-1, ...successMarkers.map(m => recentLogs.lastIndexOf(m)));
+
         let detectedViteError = null;
         if (status?.status === 'error' && status?.error) {
           detectedViteError = status.error;
-        } else {
+        } else if (status?.status !== 'running') {
           for (const pattern of VITE_ERROR_PATTERNS) {
-            if (cleanLogs.includes(pattern)) {
-              detectedViteError = cleanLogs.split('\n').find(l => l.includes(pattern))?.trim() || pattern;
+            if (recentLogs.includes(pattern)) {
+              const errIdx = recentLogs.lastIndexOf(pattern);
+              if (lastSuccessIdx > errIdx) continue; // Recuperado
+              detectedViteError = recentLogs.split('\n').find(l => l.includes(pattern))?.trim() || pattern;
               break;
             }
           }
@@ -2906,9 +4655,9 @@ REGLAS DE MODO BUILD (ACTUAL):
 
               const retryFilesMap = {};
               for (const [p, c] of stagedContent.entries()) retryFilesMap[p] = { content: c, isBase64: false };
-              await testVfsChanges(ownerKey, retryFilesMap);
+              await testVfsChanges(ownerKey, retryFilesMap, project.repo_full_name);
               await new Promise(r => setTimeout(r, 1200));
-              const retryStatus = await getPreviewStatus(ownerKey);
+              const retryStatus = await getPreviewStatus(ownerKey, project.repo_full_name);
               if (retryStatus?.status !== 'error') {
                 continue; // Resuelto determinísticamente sin gastar llamada LLM
               }
@@ -3171,61 +4920,67 @@ ${userMessage}`;
 
 
 
-  let fallbackProposedText = 'Listo.'
+  let fallbackProposedText = allSummaries.length > 0
+    ? (allSummaries.length === 1
+        ? `Apliqué el cambio solicitado: ${allSummaries[0]}.`
+        : `Apliqué los cambios solicitados: ${allSummaries.join(', ')}.`)
+    : 'Apliqué los cambios solicitados en el proyecto.'
 
-  if (allSummaries.length > 0) {
+  if (requiresApproval) {
+    fallbackProposedText += '\n\nRevisa los cambios propuestos.'
+  }
 
-    if (allSummaries.length === 1) {
+  let finalText = ''
 
-      fallbackProposedText = `Listo. ${allSummaries[0]}`
+  if (cleanText && cleanText.trim().length > 0) {
+    finalText = cleanText.trim()
 
-    } else {
-
-      fallbackProposedText = `Apliqué múltiples cambios: ${allSummaries.join(', ')}.`
-
+    // Regla de Respuesta Dual: si hubo cambios de código y el pedido requería respuesta a una pregunta,
+    // nos aseguramos de que los cambios queden resumidos sin aplastar la explicación del LLM.
+    if (totalProposed > 0 && promptIntent.isDualResponseRequired) {
+      const mentionsChanges = allSummaries.some((s) => finalText.toLowerCase().includes(s.toLowerCase()))
+      if (!mentionsChanges && allSummaries.length > 0) {
+        finalText += `\n\n**Cambios aplicados:**\n${allSummaries.map((s) => `- ${s}`).join('\n')}`
+      }
     }
-
-    if (requiresApproval) fallbackProposedText += '\n\nRevisa los cambios propuestos.'
-
-  } else if (requiresApproval) {
-
-    fallbackProposedText = 'Listo, revisa los cambios propuestos.'
-
-  }
-
-
-
-  
-  const intent = classifyUserIntent(userMessage);
-  
-  let fallbackText = '';
-  if (totalProposed > 0) {
-    fallbackText = fallbackProposedText;
-  } else if (askedQuestion) {
-    fallbackText = 'Para seguir, elegí una opción:';
-  } else if (cleanText && cleanText.trim().length > 0) {
-    // Si la IA respondió legítimamente con texto explicativo, lo respetamos sin pisarlo con un error falso.
-    fallbackText = cleanText;
-  } else if (intent === 'CODE_ACTION') {
-    fallbackText = 'No pude determinar los cambios de código necesarios para tu solicitud. Por favor, indícame con más detalle qué archivo o sección deseas modificar.';
+  } else if (totalProposed > 0) {
+    finalText = fallbackProposedText
+  } else if (askedQuestion && shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext })) {
+    finalText = 'Para seguir, elegí una opción:'
+  } else if (promptIntent.isPureQuestion) {
+    finalText = 'Analicé el estado del proyecto según tu consulta. No se requirieron cambios en los archivos.'
+  } else if (promptIntent.hasActionOrder) {
+    finalText = 'No pude determinar los cambios de código necesarios para tu solicitud. Por favor, indícame con más detalle qué archivo o sección deseas modificar.'
   } else {
-    fallbackText = '¿En qué puedo ayudarte con tu proyecto hoy?';
+    finalText = '¿En qué puedo ayudarte con tu proyecto hoy?'
   }
 
-
-
+  // Si fue una pregunta pura de diagnóstico (sin cambios) y la respuesta no incluye el cierre con oferta:
+  // Solo se agrega la coletilla si el usuario NO hizo una pregunta binaria o de capacidades (ej. "¿puedes...?")
+  // y la respuesta del modelo realmente menciona o recomienda mejoras técnicas.
+  if (promptIntent.isPureQuestion && totalProposed === 0 && finalText) {
+    const rawUserMsg = (userMessage || '').toLowerCase();
+    const asksBinaryOrCapability = /\b(?:puedes|eres capaz|es posible|se puede|s[ií]\s+o\s+no|sabes|ten[eé]s capacidad|tienes capacidad|qu[eé] eres|qui[eé]n eres)\b/i.test(rawUserMsg);
+    const mentionsImprovements = /\b(?:mejora|mejoras|optimizar|optimizaci[oó]n|optimizaciones|recomiendo|recomendaci[oó]n|recomendaciones|sugerencia|sugerencias|podr[ií]amos|propuesta|plan de acci[oó]n)\b/i.test(finalText);
+    const hasOffer = /¿(?:te gustaría|deseas|quieres|procedo|aplico|implemento)/i.test(finalText);
+    if (!asksBinaryOrCapability && !hasOffer && mentionsImprovements) {
+      finalText += '\n\n¿Te gustaría que implemente estas mejoras ahora mismo?';
+    }
+  }
 
   if (usage) {
-
     onProgress({ type: 'usage', metadata: usage });
-
   }
 
-
+  if (proposedChanges.length > 0) {
+    invalidateSemanticGraph(project.id);
+  }
+  if (proposedDbChanges.length > 0) {
+    invalidateDbSchemaGraph(project.id);
+  }
 
   return {
-
-    text: cleanText || fallbackText,
+    text: finalText,
 
     proposedChanges,
 
@@ -3235,7 +4990,7 @@ ${userMessage}`;
 
     proposedEdgeFunctions,
 
-    askedQuestion,
+    askedQuestion: shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext }) ? askedQuestion : null,
 
     suggestions,
 
