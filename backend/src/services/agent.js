@@ -1541,13 +1541,18 @@ Este proyecto corre en FlowPro, una plataforma de desarrollo con IA. Las capacid
 
 
 
-3. **END-OF-TURN RESPONSE DISCIPLINE:**
+3. **ESTILO DE RESPUESTA AL USUARIO (ESTÁNDAR LOVABLE — AMIGABLE, CLARO Y ESTRUCTURADO):**
 
-   - Never write a lengthy preamble about what you are going to do.
+   - Never write a lengthy preamble about what you are going to do before calling tools; let the tool calls and VFS file writes do the work.
 
-   - Let the tool calls and VFS file writes do the work.
+   - Cada vez que construyas o modifiques la aplicación, NUNCA respondas con un párrafo corrido separado por comas ni con jerga cruda de commits. Escribe siempre para el usuario con esta estructura limpia en Markdown:
 
-   - In the final assistant text, provide ONLY a concise, high-level summary (2-3 sentences max) detailing the files changed and the newly available features or routes.
+     1. **Apertura directa y amigable (1-2 líneas):** Resume qué acabas de construir o cómo integraste sus ideas (ej. "Tu aplicación ya está lista y combina los módulos solicitados en tres vistas principales:").
+     2. **Viñetas por Pantalla o Funcionalidad (con títulos en negrita):**
+        - **Nombre de la pantalla o función:** explica en lenguaje claro y directo qué ve el usuario ahí y qué botones, controles o interacciones puede usar (usando comillas para nombres de botones, ej. "Reconocer alarma").
+     3. **Verificación / Caso de prueba (1 línea):** Menciona brevemente cómo se comporta el flujo principal o qué dato de prueba dejaste activo para que lo pruebe de inmediato.
+     4. **Ten en cuenta estos detalles / alcance (Solo si aplica en proyectos complejos como hardware, PLC, IA local o integraciones externas):**
+        - Si el usuario pidió algo que involucra hardware físico (PLCs, Modbus, Mini-PC, modelos .onnx pesados o APIs externas sin credenciales aún), añade una sección breve con viñetas en **negrita** explicando con total transparencia qué parte está simulada en el navegador y qué requiere conexión externa.
 
 
 
@@ -1571,7 +1576,7 @@ Reglas importantes:
 
 - Si hay una base de datos conectada, TÚ la administras con "propose_migration" (crear tablas, columnas, políticas, lo que haga falta). Nunca le pidas al usuario que entre a Supabase a hacerlo manualmente: él solo aprueba lo que le propones, igual que con el código.
 
-- Cuando termines de proponer todos los cambios de este turno, cierra tu respuesta con un resumen MUY breve de qué hiciste (una linea, dos como mucho — ej. "Agregué validación al formulario de contacto", nunca un desglose largo de cada archivo tocado ni tecnicismos de implementación). Cortito y directo, al estilo de un changelog, no una explicación.
+- Cuando termines de proponer todos los cambios de este turno, cierra SIEMPRE con el formato estructurado estándar Lovable (Apertura amigable, Viñetas por Pantalla o Funcionalidad en negrita, Verificación, y Detalles de alcance si aplica). NUNCA uses un párrafo corrido separado por comas ni estilo changelog telegráfico.
 
 - Usá "update_memory" cuando construyas algo estructuralmente importante (una convención de carpetas/estado que vas a repetir, una decisión de arquitectura, algo no obvio que te costó descubrir) o cuando el usuario te cuente algo durable del proyecto que no esté ya en tu memoria — así no lo tenés que redescubrir leyendo archivos en un turno futuro. No la actualices por cambios chicos/triviales (un texto, un color, un ajuste de estilo).
 
@@ -2477,6 +2482,60 @@ export const runWithTimeout = (promise, ms = 20000, toolName = 'herramienta') =>
     clearTimeout(timer);
   });
 };
+
+export function buildLovableStructuredResponse(allSummaries = [], options = {}) {
+  const { requiresApproval = false, proposedChanges = [] } = options;
+
+  let opening = 'Tu aplicación ya está lista con los siguientes cambios integrados:';
+
+  const bullets = allSummaries.map((summary, idx) => {
+    const clean = String(summary || '').trim();
+
+    // 1. Si ya viene con formato "Título: Descripción"
+    const colonIdx = clean.indexOf(':');
+    if (colonIdx > 0 && colonIdx < 50) {
+      const title = clean.slice(0, colonIdx).trim().replace(/^\*+|\*+$/g, '');
+      const desc = clean.slice(colonIdx + 1).trim();
+      return `- **${title}:** ${desc}`;
+    }
+
+    // 2. Si contiene "Cambio/Ajuste en path: desc" o "Cambio en path"
+    const matchEn = clean.match(/^(?:Cambio|Ajuste|Creación|Modificación|Implementación)\s+(?:en|de)\s+([^\s:]+)(?::\s*(.*))?$/i);
+    if (matchEn) {
+      const filePart = matchEn[1].split('/').pop()?.replace(/\.[^.]+$/, '') || matchEn[1];
+      const desc = matchEn[2] ? matchEn[2].trim() : `Actualizado y configurado ${matchEn[1]}`;
+      return `- **${filePart}:** ${desc}`;
+    }
+
+    // 3. Si coincide con algún archivo propuesto
+    const relatedChange = proposedChanges[idx];
+    if (relatedChange?.path) {
+      const fileName = relatedChange.path.split('/').pop()?.replace(/\.[^.]+$/, '') || 'Componente';
+      return `- **${fileName}:** ${clean}`;
+    }
+
+    // 4. Si tiene "X en Y.ext" (ej. "Script de entrenamiento en scripts/train.py")
+    const matchEnPath = clean.match(/^(.+?)\s+en\s+([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)$/i);
+    if (matchEnPath) {
+      const target = matchEnPath[2].split('/').pop()?.replace(/\.[^.]+$/, '') || matchEnPath[2];
+      return `- **${target}:** ${matchEnPath[1]}`;
+    }
+
+    return `- **Módulo ${idx + 1}:** ${clean}`;
+  });
+
+  const bulletsText = bullets.length > 0
+    ? bullets.join('\n')
+    : '- **Actualización general:** Componentes y vistas actualizados según tu requerimiento.';
+
+  let response = `${opening}\n\n${bulletsText}\n\n**Verificación:** Puedes probar los nuevos controles e interactuar con la vista previa de inmediato.`;
+
+  if (requiresApproval) {
+    response += '\n\nRevisa los cambios propuestos para continuar con la siguiente etapa del proyecto.';
+  }
+
+  return response;
+}
 
 export async function runAgent({ agentId, accessToken, project, history: initialHistory = [], userMessage, signal, isExplicitCancel, dbConnection, attachments: rawAttachments = [], mode = 'build', onProgress, ownerKey, elementContext }) {
   let history = Array.isArray(initialHistory) ? [...initialHistory] : []
@@ -4938,20 +4997,29 @@ ${userMessage}`;
 
 
 
-  let fallbackProposedText = allSummaries.length > 0
-    ? (allSummaries.length === 1
-        ? `Apliqué el cambio solicitado: ${allSummaries[0]}.`
-        : `Apliqué los cambios solicitados: ${allSummaries.join(', ')}.`)
-    : 'Apliqué los cambios solicitados en el proyecto.'
+  const allProposedChangesList = [
+    ...proposedChanges,
+    ...proposedDbChanges,
+    ...proposedAssetChanges,
+    ...proposedEdgeFunctions
+  ]
 
-  if (requiresApproval) {
-    fallbackProposedText += '\n\nRevisa los cambios propuestos.'
-  }
+  const fallbackProposedText = buildLovableStructuredResponse(allSummaries, {
+    requiresApproval,
+    proposedChanges: allProposedChangesList
+  })
 
   let finalText = ''
 
   if (cleanText && cleanText.trim().length > 0) {
-    finalText = cleanText.trim()
+    const trimmed = cleanText.trim()
+    // Si por alguna razón el modelo o un runner devolvió el viejo ladrillo plano "Apliqué los cambios solicitados...",
+    // lo convertimos inmediatamente a la estructura limpia y amigable de Lovable
+    if (/^Apliqu[eé]\s+(?:el|los|m[uú]ltiples)\s+cambios?\s+solicitados?:/i.test(trimmed)) {
+      finalText = fallbackProposedText
+    } else {
+      finalText = trimmed
+    }
 
     // Regla de Respuesta Dual: si hubo cambios de código y el pedido requería respuesta a una pregunta,
     // nos aseguramos de que los cambios queden resumidos sin aplastar la explicación del LLM.
