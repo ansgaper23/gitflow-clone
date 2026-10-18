@@ -297,7 +297,12 @@ ${MASTER_UI_UX_DESIGN_DIRECTIVE}
 6. LAYOUTS ASIMÉTRICOS Y BENTO GRIDS:
    - BENTO GRID asimétrico: \`grid-cols-12\` con tarjetas principales \`col-span-12 md:col-span-7\` + bloques con métricas \`text-3xl font-bold\` en \`col-span-12 md:col-span-5\`.
    - Servicios: \`grid-cols-1 md:grid-cols-2 lg:grid-cols-3\` con gap generoso \`gap-6\` o \`gap-8\`.
-   - Proyectos: grid asimétrico con \`col-span-8\` + \`col-span-4\` para casos destacados.${landingCroSection}
+   - Proyectos: grid asimétrico con \`col-span-8\` + \`col-span-4\` para casos destacados.
+
+7. INGENIERÍA Y VISUALIZACIÓN CIENTÍFICA (REDES NEURONALES, GRAFOS Y MCP):
+   - CERO PARTÍCULAS FLOTANTES LIBRES: Prohibido simular redes neuronales o grafos con partículas flotando al azar en el aire ('x += vx, y += vy').
+   - PROPAGACIÓN SINÁPTICA ANCLADA A ARISTAS: Los pulsos deben viajar estrictamente sobre las líneas de conexión con interpolación P(t) = (1 - t)P1 + tP2 (t ∈ [0, 1]), estela luminosa ('shadowBlur') y avance en cascada por capas activando 'activationGlow = 1.0' en cada neurona destino.
+   - MODELADO MCP REAL: Arquitectura Host ↔ Client ↔ Servers con transporte stdio/SSE y payloads JSON-RPC 2.0.${landingCroSection}
 </senior_ui_ux_art_direction_standards>
 `.trim()
 }
