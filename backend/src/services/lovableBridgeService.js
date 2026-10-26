@@ -16,6 +16,61 @@ const WORKSPACES_BASE_DIR = process.env.LOVABLE_WORKSPACES_DIR ||
     ? path.join(process.cwd(), 'temp-lovable-workspaces')
     : '/opt/flowpro-workspaces');
 
+// Mapeo semántico de componentes y archivos a lenguaje humano
+const FRIENDLY_NAMES = {
+  'Index.tsx': 'la página de inicio (Index.tsx)',
+  'Index.jsx': 'la página de inicio (Index.jsx)',
+  'App.tsx': 'la estructura principal (App.tsx)',
+  'App.jsx': 'la estructura principal (App.jsx)',
+  'Navbar.tsx': 'la barra de navegación (Navbar)',
+  'Navbar.jsx': 'la barra de navegación (Navbar)',
+  'Header.tsx': 'el encabezado superior (Header)',
+  'Footer.tsx': 'el pie de página (Footer)',
+  'Hero.tsx': 'la portada principal (Hero)',
+  'HeroSection.tsx': 'la portada principal (HeroSection)',
+  'index.css': 'el sistema de estilos globales (CSS)',
+  'tailwind.config.ts': 'la paleta y tema de Tailwind CSS',
+  'tailwind.config.js': 'la paleta y tema de Tailwind CSS',
+};
+
+function getFriendlyFileName(relPath) {
+  if (!relPath) return 'un archivo';
+  const base = path.basename(relPath);
+  if (FRIENDLY_NAMES[base]) return FRIENDLY_NAMES[base];
+  if (base.endsWith('.tsx') || base.endsWith('.jsx')) return `el componente ${base}`;
+  if (base.endsWith('.ts') || base.endsWith('.js')) return `el módulo ${base}`;
+  if (base.endsWith('.css')) return `el archivo de estilos ${base}`;
+  return `"${relPath}"`;
+}
+
+function buildHumanActivityDescription(toolName, toolArgs) {
+  const targetPath = toolArgs.path || toolArgs.filePath || '';
+  const cleanPath = targetPath.replace(/^\.?\//, '');
+  const friendly = getFriendlyFileName(cleanPath);
+
+  if (toolName === 'search_files') {
+    const q = (toolArgs.query || '').trim();
+    return q ? `Buscando "${q}" en los componentes del proyecto...` : 'Buscando elementos en los archivos...';
+  }
+  if (toolName === 'read_file') {
+    return `Analizando ${friendly}...`;
+  }
+  if (toolName === 'propose_change' || toolName === 'replace_file_content') {
+    const sum = toolArgs.summary ? ` (${toolArgs.summary})` : '';
+    return `Actualizando código en ${friendly}${sum}...`;
+  }
+  if (toolName === 'create_file') {
+    return `Creando nuevo archivo en ${friendly}...`;
+  }
+  if (toolName === 'list_files') {
+    return 'Explorando la estructura del proyecto...';
+  }
+  if (toolName === 'message_user') {
+    return 'Finalizando y redactando resumen de cambios...';
+  }
+  return 'Procesando cambios...';
+}
+
 /**
  * Obtiene el token de GitHub configurado para clonar y pushear repositorios
  */
@@ -91,9 +146,18 @@ async function clearGitLocks(workspaceDir) {
  * @param {string} params.prompt
  * @param {Object} params.github { owner, repo, branch, token }
  * @param {string} [params.activeRoute]
- * @returns {Promise<{ ok: boolean, summary: string, filesModified: string[], commitSha: string }>}
+ * @param {Function} [params.onActivity] Callback para telemetría efímera en vivo
+ * @returns {Promise<{ ok: boolean, summary: string, message?: string, filesModified: string[], commitSha: string }>}
  */
-export async function processLovableDispatch({ projectId, prompt, github, activeRoute }) {
+export async function processLovableDispatch({ projectId, prompt, github, activeRoute, onActivity }) {
+  const notifyActivity = (desc) => {
+    if (typeof onActivity === 'function') {
+      try {
+        onActivity(desc);
+      } catch (_) {}
+    }
+  };
+
   if (!github || !github.owner || !github.repo) {
     return {
       ok: false,
@@ -122,6 +186,7 @@ export async function processLovableDispatch({ projectId, prompt, github, active
   const workspaceDir = path.join(WORKSPACES_BASE_DIR, `lovable-${safeProjectId}`);
 
   // ── PASO A: Clonación o Actualización del Repositorio de GitHub ──
+  notifyActivity(`Conectando con repositorio ${owner}/${repo}...`);
   console.log(`[LovableBridge] Preparando repositorio ${owner}/${repo} (${branch}) en ${workspaceDir}...`);
 
   const gitAuthUrl = token 
@@ -130,6 +195,7 @@ export async function processLovableDispatch({ projectId, prompt, github, active
 
   try {
     if (fs.existsSync(path.join(workspaceDir, '.git'))) {
+      notifyActivity('Sincronizando cambios locales con GitHub (git pull)...');
       console.log(`[LovableBridge] Repositorio existente detectado en caché. Actualizando con git pull...`);
       await clearGitLocks(workspaceDir);
       await execAsync(`git remote set-url origin "${gitAuthUrl}"`, { cwd: workspaceDir });
@@ -141,6 +207,7 @@ export async function processLovableDispatch({ projectId, prompt, github, active
         console.warn(`[LovableBridge] git pull falló (${pullErr.message}), intentando continuar con estado local...`);
       }
     } else {
+      notifyActivity(`Clonando ${owner}/${repo} por primera vez...`);
       console.log(`[LovableBridge] Clonando repositorio ${owner}/${repo} por primera vez...`);
       if (fs.existsSync(workspaceDir)) {
         await fs.promises.rm(workspaceDir, { recursive: true, force: true });
@@ -184,6 +251,7 @@ export async function processLovableDispatch({ projectId, prompt, github, active
   const fileTree = await getWorkspaceFileTree(workspaceDir);
 
   // ── PASO B: Bucle Cognitivo del Agente de FlowPro ──
+  notifyActivity('Analizando solicitud y planificando cambios...');
   console.log(`[LovableBridge] Ejecutando bucle de inferencia para: "${prompt}"...`);
 
   const filesModified = new Set();
@@ -207,7 +275,9 @@ REGLAS DE ORO:
 2. Aplica los cambios usando "propose_change", "replace_file_content" o "create_file". Devuelve código COMPLETO sin placeholders ni omitir líneas existentes.
 3. Respeta el diseño existente: Tailwind CSS v3 (usa tokens semánticos o clases nativas), componentes shadcn/ui en @/components/ui, y lucide-react.
 4. NO uses Tailwind v4 (@import "tailwindcss" o @theme).
-5. Al terminar, llama OBLIGATORIAMENTE a "message_user" con el resumen conciso de los cambios.`;
+5. Al terminar, llama OBLIGATORIAMENTE a "message_user" con:
+   - summary: Un título semántico muy corto (3 a 6 palabras) del cambio realizado (ej: "Eliminación del camino al mundial").
+   - message: Una explicación conversacional limpia, natural y concisa (1 o 2 párrafos) de las modificaciones implementadas.`;
 
   // ── 1. DEFINICIÓN DE HERRAMIENTAS UNIVERSAL (Antigravity, Anthropic, Gemini, OpenAI) ──
   const makeTool = (name, description, schema) => ({
@@ -295,8 +365,8 @@ REGLAS DE ORO:
       {
         type: 'object',
         properties: {
-          summary: { type: 'string', description: 'Título o resumen de los cambios' },
-          message: { type: 'string', description: 'Detalle de los cambios' }
+          summary: { type: 'string', description: 'Título o resumen de los cambios (3 a 6 palabras)' },
+          message: { type: 'string', description: 'Detalle conversacional y limpio de los cambios' }
         },
         required: ['summary']
       }
@@ -314,6 +384,12 @@ REGLAS DE ORO:
     } else {
       toolName = typeof arg1 === 'string' ? arg1 : '';
       toolArgs = (arg2 && typeof arg2 === 'object') ? arg2 : {};
+    }
+
+    // Emitir telemetría de la actividad en vivo
+    const humanDesc = buildHumanActivityDescription(toolName, toolArgs);
+    if (humanDesc) {
+      notifyActivity(humanDesc);
     }
 
     console.log(`[LovableBridge] Ejecutando tool: "${toolName}" con args:`, Object.keys(toolArgs));
@@ -413,7 +489,7 @@ REGLAS DE ORO:
       ok: false,
       error: 'NO_FILES_MODIFIED',
       summary: agentSummary || 'No se modificaron archivos',
-      message: agentMessage || 'El modelo analizó la solicitud pero no aplicó cambios con "replace_file_content". Por favor sé más específico con el componente o archivo a editar.',
+      message: agentMessage || 'El modelo analizó la solicitud pero no aplicó cambios con "propose_change" o "replace_file_content". Por favor sé más específico con el componente o archivo a editar.',
       filesModified: [],
       commitSha: null
     };
@@ -422,6 +498,7 @@ REGLAS DE ORO:
   const finalSummary = agentSummary || 'Actualización de componentes e interfaz';
 
   // ── PASO C: Commit y Push Atómico a GitHub ──
+  notifyActivity(`Preparando commit y sincronizando ${modifiedList.length} archivo(s) con GitHub...`);
   console.log(`[LovableBridge] Guardando cambios y preparando git push (${modifiedList.length} archivos modificados)...`);
 
   let commitSha = null;
@@ -435,6 +512,7 @@ REGLAS DE ORO:
       const commitMsg = `feat(flowpro): ${finalSummary}`;
       await execAsync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { cwd: workspaceDir });
       
+      notifyActivity('Haciendo push a GitHub (rama ' + branch + ')...');
       console.log(`[LovableBridge] Haciendo push a origin/${branch}...`);
       await execAsync(`git push origin "${branch}"`, { cwd: workspaceDir });
       
@@ -449,6 +527,7 @@ REGLAS DE ORO:
     console.warn(`[LovableBridge] git push vía CLI falló (${gitPushErr.message}). Intentando fallback con GitHub API...`);
     if (token) {
       try {
+        notifyActivity('Sincronizando vía GitHub API (fallback)...');
         const filesMap = {};
         for (const relPath of modifiedList) {
           const content = await fs.promises.readFile(path.join(workspaceDir, relPath), 'utf8');
@@ -472,6 +551,8 @@ REGLAS DE ORO:
       throw gitPushErr;
     }
   }
+
+  notifyActivity('¡Cambios sincronizados en GitHub exitosamente!');
 
   return {
     ok: true,

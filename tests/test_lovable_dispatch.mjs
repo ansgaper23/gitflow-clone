@@ -88,6 +88,26 @@ async function runTests() {
     assert.strictEqual(dataAsync.status, 'processing', 'status debe ser processing');
     assert.strictEqual(dataAsync.projectId, '8b08e331-4c92-48ec-904e-28f09d81d2f9', 'projectId debe coincidir');
 
+    // Test 5: Modo SSE Streaming
+    console.log('  -> Test 5: Conexión con cabecera Accept: text/event-stream');
+    const resSSE = await fetch(`${baseUrl}/api/agent/lovable-dispatch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream'
+      },
+      body: JSON.stringify({
+        projectId: 'sse-test-1',
+        prompt: 'test prompt',
+        github: { owner: 'user', repo: 'repo', branch: 'main' },
+        async: true
+      })
+    });
+    assert.ok(resSSE.headers.get('content-type')?.includes('text/event-stream'), 'Content-Type debe ser text/event-stream');
+    const textSSE = await resSSE.text();
+    assert.ok(textSSE.includes('event: activity'), 'Debe incluir eventos de actividad');
+    assert.ok(textSSE.includes('event: done'), 'Debe incluir evento de finalización');
+
     console.log('✅ ¡TODOS LOS TESTS DE LOVABLE DISPATCH PASARON EXITOSAMENTE!');
     if (server.closeAllConnections) server.closeAllConnections();
     server.close(() => {
