@@ -203,13 +203,13 @@ ${packageJsonContent ? `- package.json del proyecto:\n\`\`\`json\n${packageJsonC
 ${fileTree.slice(0, 100).map(f => `- ${f}`).join('\n')}
 
 REGLAS DE ORO:
-1. OBLIGATORIO: Tu objetivo es MODIFICAR EL CÓDIGO en disco. Usa search_files para encontrar dónde está el texto o elemento solicitado, lee el archivo con read_file, y aplica los cambios con replace_file_content. NO respondas solo con texto explicativo sin modificar archivos.
-2. Aplica los cambios usando "replace_file_content" o "create_file". Devuelve código COMPLETO sin placeholders ni omitir líneas existentes.
+1. OBLIGATORIO: Tu objetivo es MODIFICAR EL CÓDIGO en disco. Usa search_files para encontrar dónde está el texto o elemento solicitado, lee el archivo con read_file, y aplica los cambios con propose_change o replace_file_content. NO respondas solo con texto explicativo sin modificar archivos.
+2. Aplica los cambios usando "propose_change", "replace_file_content" o "create_file". Devuelve código COMPLETO sin placeholders ni omitir líneas existentes.
 3. Respeta el diseño existente: Tailwind CSS v3 (usa tokens semánticos o clases nativas), componentes shadcn/ui en @/components/ui, y lucide-react.
 4. NO uses Tailwind v4 (@import "tailwindcss" o @theme).
 5. Al terminar, llama OBLIGATORIAMENTE a "message_user" con el resumen conciso de los cambios.`;
 
-  // ── 1. DEFINICIÓN UNIVERSAL DE HERRAMIENTAS (Compatible con Anthropic, Gemini, OpenAI y Antigravity) ──
+  // ── 1. DEFINICIÓN DE HERRAMIENTAS UNIVERSAL (Antigravity, Anthropic, Gemini, OpenAI) ──
   const makeTool = (name, description, schema) => ({
     name,
     description,
@@ -219,49 +219,29 @@ REGLAS DE ORO:
 
   const tools = [
     makeTool(
-      'list_files',
-      'Lista las rutas de los archivos disponibles en el repositorio.',
-      {
-        type: 'object',
-        properties: {
-          directory: { type: 'string', description: 'Directorio opcional (ej: src/components)' }
-        }
-      }
-    ),
-    makeTool(
-      'search_files',
-      'Busca texto, frases o componentes dentro de los archivos del repositorio (útil para encontrar dónde está un texto específico).',
-      {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'Texto o término a buscar (ej: camino al mundial)' }
-        },
-        required: ['query']
-      }
-    ),
-    makeTool(
-      'read_file',
-      'Lee el contenido completo de un archivo del repositorio.',
+      'propose_change',
+      'Propone o aplica una modificación completa sobre un archivo del repositorio.',
       {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Ruta relativa del archivo (ej: src/pages/Index.tsx)' },
-          filePath: { type: 'string', description: 'Ruta alternativa' }
-        }
+          new_content: { type: 'string', description: 'Contenido completo y actualizado del archivo' },
+          summary: { type: 'string', description: 'Resumen descriptivo del cambio' }
+        },
+        required: ['path']
       }
     ),
     makeTool(
       'replace_file_content',
-      'Modifica o sobreescribe un archivo existente con el código nuevo completo sin omitir partes no relacionadas.',
+      'Modifica o sobreescribe un archivo existente con el código nuevo completo.',
       {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Ruta relativa del archivo a modificar' },
           filePath: { type: 'string', description: 'Ruta alternativa' },
           content: { type: 'string', description: 'Código fuente completo actualizado' },
-          summary: { type: 'string', description: 'Resumen descriptivo del cambio realizado' }
-        },
-        required: ['content']
+          summary: { type: 'string', description: 'Resumen descriptivo del cambio' }
+        }
       }
     ),
     makeTool(
@@ -274,13 +254,44 @@ REGLAS DE ORO:
           filePath: { type: 'string', description: 'Ruta alternativa' },
           content: { type: 'string', description: 'Código fuente completo' },
           summary: { type: 'string', description: 'Resumen descriptivo' }
+        }
+      }
+    ),
+    makeTool(
+      'read_file',
+      'Lee el contenido completo de un archivo del repositorio.',
+      {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Ruta relativa del archivo' },
+          filePath: { type: 'string', description: 'Ruta alternativa' }
+        }
+      }
+    ),
+    makeTool(
+      'list_files',
+      'Lista el árbol de archivos disponibles en el repositorio.',
+      {
+        type: 'object',
+        properties: {
+          directory: { type: 'string', description: 'Directorio opcional' }
+        }
+      }
+    ),
+    makeTool(
+      'search_files',
+      'Busca texto, frases o componentes dentro de los archivos del repositorio.',
+      {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Texto o término a buscar' }
         },
-        required: ['content']
+        required: ['query']
       }
     ),
     makeTool(
       'message_user',
-      'Notifica al usuario el resumen final de lo implementado tras realizar las modificaciones.',
+      'Notifica el resumen final de lo implementado.',
       {
         type: 'object',
         properties: {
@@ -292,39 +303,51 @@ REGLAS DE ORO:
     )
   ];
 
-  // ── 2. EJECUTOR DE HERRAMIENTAS ROBUSTO ──
-  const executeTool = async (toolName, toolArgs) => {
-    const rawPath = toolArgs.path || toolArgs.filePath || '';
-    const cleanPath = rawPath.replace(/^\.?\//, '');
+  // ── 2. EJECUTOR DE HERRAMIENTAS ADAPTATIVO (Soporta { name, input } y (name, args)) ──
+  const executeTool = async (arg1, arg2) => {
+    let toolName = '';
+    let toolArgs = {};
 
-    if (toolName === 'list_files') {
-      const subTree = toolArgs.directory
-        ? fileTree.filter(f => f.startsWith(toolArgs.directory.replace(/^\.?\//, '')))
-        : fileTree;
-      return subTree.slice(0, 150).join('\n') || 'No se encontraron archivos en ese directorio.';
+    if (arg1 && typeof arg1 === 'object' && arg1.name) {
+      toolName = arg1.name;
+      toolArgs = arg1.input || {};
+    } else {
+      toolName = typeof arg1 === 'string' ? arg1 : '';
+      toolArgs = (arg2 && typeof arg2 === 'object') ? arg2 : {};
     }
 
+    console.log(`[LovableBridge] Ejecutando tool: "${toolName}" con args:`, Object.keys(toolArgs));
+
+    // A. list_files: bridgeClient requiere obligatoriamente un Array de strings
+    if (toolName === 'list_files') {
+      const dir = (toolArgs.directory || '').replace(/^\.?\//, '');
+      const list = dir ? fileTree.filter(f => f.startsWith(dir)) : fileTree;
+      return list;
+    }
+
+    // B. search_files: búsqueda en archivos de código
     if (toolName === 'search_files') {
       const q = (toolArgs.query || '').toLowerCase();
       if (!q) return 'Debes especificar un término de búsqueda.';
       const matches = [];
       for (const rel of fileTree) {
-        if (!rel.startsWith('src/')) continue;
+        if (!rel.startsWith('src/') && rel !== 'index.html' && rel !== 'package.json') continue;
         const full = path.join(workspaceDir, rel);
         try {
           const txt = await fs.promises.readFile(full, 'utf8');
-          if (txt.toLowerCase().includes(q)) {
-            matches.push(rel);
-          }
+          if (txt.toLowerCase().includes(q)) matches.push(rel);
         } catch (_) {}
       }
       return matches.length > 0
-        ? `Coincidencias encontradas en los siguientes archivos:\n${matches.join('\n')}`
+        ? `Coincidencias encontradas en:\n${matches.join('\n')}`
         : `No se encontró ninguna coincidencia para "${toolArgs.query}".`;
     }
 
+    // C. read_file: lectura de archivo
     if (toolName === 'read_file') {
-      if (!cleanPath) return 'Error: Debes proporcionar la ruta del archivo (path).';
+      const targetPath = toolArgs.path || toolArgs.filePath || '';
+      const cleanPath = targetPath.replace(/^\.?\//, '');
+      if (!cleanPath) return 'Error: Falta especificar la ruta del archivo.';
       const fullTarget = path.join(workspaceDir, cleanPath);
       if (!fs.existsSync(fullTarget)) {
         return `Error: El archivo "${cleanPath}" no existe en el repositorio.`;
@@ -333,19 +356,28 @@ REGLAS DE ORO:
       return content.slice(0, 100000);
     }
 
-    if (toolName === 'replace_file_content' || toolName === 'create_file') {
-      if (!cleanPath) return 'Error: Debes proporcionar la ruta del archivo (path).';
-      const fileContent = toolArgs.content || toolArgs.code || toolArgs.new_str || '';
-      if (!fileContent) return 'Error: El contenido del archivo no puede estar vacío.';
+    // D. propose_change / replace_file_content / create_file: escritura en disco
+    if (toolName === 'propose_change' || toolName === 'replace_file_content' || toolName === 'create_file') {
+      const targetPath = toolArgs.path || toolArgs.filePath || '';
+      const cleanPath = targetPath.replace(/^\.?\//, '');
+      if (!cleanPath) return 'Error: Falta especificar la ruta del archivo.';
 
+      const fileContent = toolArgs.new_content ?? toolArgs.content ?? toolArgs.code ?? toolArgs.new_str ?? '';
       const fullTarget = path.join(workspaceDir, cleanPath);
       await fs.promises.mkdir(path.dirname(fullTarget), { recursive: true });
       await fs.promises.writeFile(fullTarget, fileContent, 'utf8');
       filesModified.add(cleanPath);
       if (toolArgs.summary) agentSummary = toolArgs.summary;
+      console.log(`[LovableBridge] ✅ Archivo modificado: ${cleanPath} (${fileContent.length} caracteres)`);
       return `Archivo "${cleanPath}" guardado exitosamente.`;
     }
 
+    // E. update_memory: noop para compatibilidad con Antigravity
+    if (toolName === 'update_memory') {
+      return 'Memoria registrada.';
+    }
+
+    // F. message_user: cierre de turno
     if (toolName === 'message_user') {
       agentSummary = toolArgs.summary || agentSummary;
       agentMessage = toolArgs.message || '';
@@ -356,6 +388,7 @@ REGLAS DE ORO:
   };
 
   try {
+    // ── 3. INVOCACIÓN CON `projectId` PARA AISLAMIENTO DEL WORKSPACE ──
     await runAgentWithRotation({
       system: systemPrompt,
       tools: tools,
@@ -363,6 +396,7 @@ REGLAS DE ORO:
       userMessage: prompt,
       executeTool: executeTool,
       signal: null,
+      projectId: safeProjectId,
       toolChoice: 'auto'
     });
   } catch (agentErr) {
@@ -370,7 +404,7 @@ REGLAS DE ORO:
     throw new Error(`Fallo en la inferencia del agente: ${agentErr.message}`);
   }
 
-  // ── 3. VALIDACIÓN ESTRICTA DE CAMBIOS ANTES DE COMMIT ──
+  // ── 4. VALIDACIÓN ESTRICTA DE CAMBIOS ANTES DE COMMIT ──
   const modifiedList = Array.from(filesModified);
 
   if (modifiedList.length === 0) {
