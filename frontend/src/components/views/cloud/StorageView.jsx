@@ -123,8 +123,8 @@ function BucketExplorer({ projectId, bucketId, buckets }) {
         ) : filteredFiles.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full border-2 border-dashed border-[#23252a] rounded-xl bg-[#141518]/50">
             <UploadCloud className="w-10 h-10 text-[#8a8f98] mb-3" />
-            <p className="text-[#ededed] font-medium mb-1">Este bucket est? vac?o</p>
-            <p className="text-[#8a8f98] text-sm">Sube archivos o int?gralos desde tu c?digo.</p>
+            <p className="text-[#ededed] font-medium mb-1">Este bucket está vacío</p>
+            <p className="text-[#8a8f98] text-sm">Sube archivos o intégralos desde tu código.</p>
           </div>
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">

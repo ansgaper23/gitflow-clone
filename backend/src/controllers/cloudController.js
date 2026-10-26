@@ -1,8 +1,57 @@
 import { resolveDbConnection } from '../services/dbConnectionResolver.js';
-import { runCloudQuery } from '../services/repoDb.js';
+import { runCloudQuery, fetchGlobalTableMetadata, fetchTableColumns, runSql } from '../services/repoDb.js';
 import { getOwnedProject } from '../services/projectResolver.js';
 import format from 'pg-format';
 import { supabase } from '../db/supabaseClient.js';
+import { invalidateDbSchemaGraph } from '../services/dbSchemaGraph.js';
+import { extractSqlFromPrompt } from '../services/agent.js';
+
+export async function executeProjectSql(req, res) {
+  const { id } = req.params;
+  const { sql } = req.body || {};
+  const startTime = Date.now();
+
+  if (!sql || typeof sql !== 'string' || !sql.trim()) {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.status(400).json({ ok: false, error: "Se requiere un script SQL válido" });
+  }
+
+  try {
+    const project = await getOwnedProject(req.user.id, id);
+    if (!project) {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      return res.status(404).json({ ok: false, error: "Proyecto no encontrado" });
+    }
+
+    const conn = await resolveDbConnection(req.user, project.repo_full_name);
+    if (!conn) {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      return res.status(400).json({ ok: false, error: "Base de datos no conectada" });
+    }
+
+    const cleanSql = extractSqlFromPrompt(sql) || sql.trim();
+    const result = await runSql(conn, cleanSql);
+    invalidateDbSchemaGraph(id);
+
+    const durationMs = Date.now() - startTime;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.json({
+      ok: true,
+      rowCount: result.rowCount ?? (result.rows ? result.rows.length : 0),
+      rows: result.rows || [],
+      durationMs,
+      warning: result.warning
+    });
+  } catch (err) {
+    const durationMs = Date.now() - startTime;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Error al ejecutar SQL",
+      durationMs
+    });
+  }
+}
 
 export async function getCloudOverview(req, res) {
   const { id } = req.params;
@@ -16,35 +65,12 @@ export async function getCloudOverview(req, res) {
 
     let tables = [];
     try {
-      const detailedRes = await runCloudQuery(conn, `
-        SELECT 
-          c.relname AS table_name,
-          n.nspname AS table_schema,
-          c.rowsecurity AS rls_enabled,
-          COALESCE(c.reltuples::bigint, 0) AS approximate_row_count,
-          (
-            SELECT count(*) 
-            FROM information_schema.columns 
-            WHERE table_schema = n.nspname AND table_name = c.relname
-          ) AS columns_count
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' 
-          AND c.relkind = 'r'
-          AND c.relname != '_flowpro_users'
-        ORDER BY c.relname ASC;
-      `);
-      tables = detailedRes.rows.map(r => ({
-        table_name: r.table_name,
-        rls_enabled: r.rls_enabled,
-        approximate_row_count: parseInt(r.approximate_row_count || 0, 10),
-        columns_count: parseInt(r.columns_count || 0, 10)
-      }));
+      tables = await fetchGlobalTableMetadata(conn);
     } catch (e) {
-      console.error('Detailed query error:', e);
+      console.error('[Cloud] fetchGlobalTableMetadata error in getCloudOverview:', e);
     }
     const tablesCount = tables.length;
-    const topTables = tables.slice(0, 5).map(c => c.table_name);
+    const topTables = tables.slice(0, 5).map(c => c.table_name || c.name);
 
     let viewsCount = 0;
     try {
@@ -100,37 +126,30 @@ export async function getTables(req, res) {
     const conn = await resolveDbConnection(req.user, project.repo_full_name);
     if (!conn) return res.status(400).json({ ok: false, error: "Database not connected" });
 
-    const query = `
-      SELECT 
-        t.table_name,
-        COALESCE(c.reltuples::bigint, 0) AS estimated_rows,
-        COALESCE(pt.rowsecurity, false) AS rls_enabled,
-        (
-          SELECT json_agg(json_build_object(
-            'column_name', col.column_name,
-            'data_type', col.data_type,
-            'is_nullable', col.is_nullable = 'YES',
-            'is_primary', EXISTS (
-              SELECT 1 FROM information_schema.key_column_usage kcu
-              JOIN information_schema.table_constraints tc ON kcu.constraint_name = tc.constraint_name
-              WHERE tc.constraint_type = 'PRIMARY KEY' 
-                AND kcu.table_schema = 'public' 
-                AND kcu.table_name = t.table_name 
-                AND kcu.column_name = col.column_name
-            )
-          ))
-          FROM information_schema.columns col
-          WHERE col.table_schema = 'public' AND col.table_name = t.table_name
-        ) AS columns
-      FROM information_schema.tables t
-      LEFT JOIN pg_class c ON c.relname = t.table_name
-      LEFT JOIN pg_tables pt ON pt.tablename = t.table_name AND pt.schemaname = 'public'
-      WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE' AND t.table_name != '_flowpro_users'
-      ORDER BY t.table_name ASC;
-    `;
-    const result = await runCloudQuery(conn, query);
+    let tables = await fetchGlobalTableMetadata(conn);
+    // Garantía: Cada tabla tiene su arreglo columns poblado y normalizado
+    tables = await Promise.all(tables.map(async (t) => {
+      let cols = t.columns;
+      if (!cols || cols.length === 0) {
+        cols = await fetchTableColumns(conn, t.table_name || t.name);
+      }
+      const normalizedCols = (cols || []).map(c => ({
+        name: c.name || c.column_name,
+        column_name: c.name || c.column_name,
+        type: c.type || c.data_type || 'text',
+        data_type: c.type || c.data_type || 'text',
+        is_primary: Boolean(c.is_primary || c.is_pk || (c.name || c.column_name) === 'id'),
+        is_nullable: c.is_nullable !== false
+      }));
+      return {
+        ...t,
+        column_count: normalizedCols.length || t.column_count || 0,
+        columns: normalizedCols
+      };
+    }));
+
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    return res.json({ ok: true, tables: result.rows });
+    return res.json({ ok: true, tables });
   } catch (error) {
     console.error('Error fetching tables:', error);
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -155,7 +174,24 @@ export async function getTableRowsData(req, res) {
     const totalCount = parseInt(countRes.rows[0].c, 10);
     const totalPages = Math.ceil(totalCount / limit);
 
-    const dataRes = await runCloudQuery(conn, `SELECT * FROM public.${safeTableName} LIMIT ${limit} OFFSET ${offset}`);
+    const [dataRes, columns] = await Promise.all([
+      runCloudQuery(conn, `SELECT * FROM public.${safeTableName} LIMIT ${limit} OFFSET ${offset}`),
+      fetchTableColumns(conn, tableName)
+    ]);
+
+    // Fallback Infalible: Si por cualquier motivo information_schema devolvió vacío pero hay registros,
+    // inferir automáticamente las columnas desde las claves de la primera fila
+    let effectiveColumns = columns;
+    if ((!effectiveColumns || effectiveColumns.length === 0) && dataRes.rows && dataRes.rows.length > 0) {
+      effectiveColumns = Object.keys(dataRes.rows[0]).map(k => ({
+        name: k,
+        column_name: k,
+        type: typeof dataRes.rows[0][k] === 'number' ? 'integer' : typeof dataRes.rows[0][k] === 'boolean' ? 'boolean' : 'text',
+        data_type: typeof dataRes.rows[0][k] === 'number' ? 'integer' : typeof dataRes.rows[0][k] === 'boolean' ? 'boolean' : 'text',
+        is_nullable: true,
+        is_primary: k === 'id'
+      }));
+    }
 
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     return res.json({
@@ -164,7 +200,8 @@ export async function getTableRowsData(req, res) {
       limit,
       totalCount,
       totalPages,
-      rows: dataRes.rows
+      columns: effectiveColumns || [],
+      rows: dataRes.rows || []
     });
   } catch (err) {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -185,6 +222,7 @@ export async function insertTableRow(req, res) {
     // Use pg-format
     const sql = format(`INSERT INTO public.%I (%I) VALUES (%L) RETURNING *`, tableName, keys, values);
     const dataRes = await runCloudQuery(conn, sql);
+    invalidateDbSchemaGraph(id);
     
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     return res.json({ ok: true, row: dataRes.rows[0] });
@@ -206,6 +244,7 @@ export async function updateTableRow(req, res) {
     const sql = format(`UPDATE public.%I SET %s WHERE %I = %L RETURNING *`, tableName, sets, pkColumn, primaryKey);
     
     const dataRes = await runCloudQuery(conn, sql);
+    invalidateDbSchemaGraph(id);
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     return res.json({ ok: true, row: dataRes.rows[0] });
   } catch (err) {
@@ -223,6 +262,7 @@ export async function deleteTableRow(req, res) {
     
     const sql = format(`DELETE FROM public.%I WHERE %I = %L RETURNING *`, tableName, pkColumn, primaryKey);
     const dataRes = await runCloudQuery(conn, sql);
+    invalidateDbSchemaGraph(id);
     
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     return res.json({ ok: true, row: dataRes.rows[0] });
@@ -238,36 +278,65 @@ export async function getUsers(req, res) {
   const { id } = req.params;
   try {
     const project = await getOwnedProject(req.user.id, id);
+    if (!project) return res.status(404).json({ ok: false, error: "Project not found" });
     const conn = await resolveDbConnection(req.user, project.repo_full_name);
+    if (!conn) return res.status(400).json({ ok: false, error: "Database not connected" });
     
-    // Check if auth.users exists
+    // Ensure columns exist on auth.users if applicable
+    await runCloudQuery(conn, `
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'auth' AND tablename = 'users') THEN
+          ALTER TABLE auth.users ADD COLUMN IF NOT EXISTS raw_app_meta_data jsonb DEFAULT '{"provider": "email"}'::jsonb;
+          ALTER TABLE auth.users ADD COLUMN IF NOT EXISTS last_sign_in_at timestamptz;
+          ALTER TABLE auth.users ADD COLUMN IF NOT EXISTS email_confirmed_at timestamptz DEFAULT now();
+        END IF;
+      END $$;
+    `).catch(() => {});
+
     let sql = `
       SELECT 
-        id, 
-        email, 
-        created_at, 
-        last_sign_in_at, 
-        email_confirmed_at,
-        raw_user_meta_data,
-        raw_app_meta_data->>'provider' as provider
-      FROM auth.users
-      ORDER BY created_at DESC;
+        u.id, 
+        u.email, 
+        u.created_at, 
+        COALESCE(u.last_sign_in_at, u.created_at) as last_sign_in_at, 
+        COALESCE(u.email_confirmed_at, u.created_at) as email_confirmed_at,
+        u.raw_user_meta_data,
+        COALESCE(u.raw_app_meta_data->>'provider', 'email') as provider,
+        COALESCE(p.full_name, u.raw_user_meta_data->>'full_name', split_part(u.email, '@', 1)) as full_name,
+        COALESCE(p.avatar_url, u.raw_user_meta_data->>'avatar_url') as avatar_url,
+        COALESCE(p.role, u.raw_user_meta_data->>'role', 'user') as role
+      FROM auth.users u
+      LEFT JOIN public.profiles p ON p.id = u.id
+      ORDER BY u.created_at DESC;
     `;
     
     let usersRes;
     try {
       usersRes = await runCloudQuery(conn, sql);
     } catch (err) {
-      // Fallback
       try {
-         usersRes = await runCloudQuery(conn, `SELECT * FROM public.profiles ORDER BY created_at DESC`);
+        usersRes = await runCloudQuery(conn, `
+          SELECT 
+            id, 
+            email, 
+            created_at, 
+            created_at as last_sign_in_at, 
+            created_at as email_confirmed_at, 
+            '{}'::jsonb as raw_user_meta_data, 
+            'email' as provider,
+            null as full_name,
+            null as avatar_url,
+            'user' as role
+          FROM _flowpro_users 
+          ORDER BY created_at DESC
+        `);
       } catch (err2) {
-         try {
-           usersRes = await runCloudQuery(conn, `SELECT * FROM public.users ORDER BY created_at DESC`);
-         } catch (err3) {
-           // Return empty array instead of throwing to avoid 500 on empty schema
-           usersRes = { rows: [] };
-         }
+        try {
+          usersRes = await runCloudQuery(conn, `SELECT * FROM public.profiles ORDER BY created_at DESC`);
+        } catch (err3) {
+          usersRes = { rows: [] };
+        }
       }
     }
     
@@ -283,10 +352,13 @@ export async function deleteUser(req, res) {
   const { id, userId } = req.params;
   try {
     const project = await getOwnedProject(req.user.id, id);
+    if (!project) return res.status(404).json({ ok: false, error: "Project not found" });
     const conn = await resolveDbConnection(req.user, project.repo_full_name);
+    if (!conn) return res.status(400).json({ ok: false, error: "Database not connected" });
     
-    const sql = format(`DELETE FROM auth.users WHERE id = %L RETURNING *`, userId);
-    await runCloudQuery(conn, sql);
+    await runCloudQuery(conn, format(`DELETE FROM auth.users WHERE id = %L`, userId)).catch(() => {});
+    await runCloudQuery(conn, format(`DELETE FROM _flowpro_users WHERE id = %L`, userId)).catch(() => {});
+    await runCloudQuery(conn, format(`DELETE FROM public.profiles WHERE id = %L`, userId)).catch(() => {});
     
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     return res.json({ ok: true });

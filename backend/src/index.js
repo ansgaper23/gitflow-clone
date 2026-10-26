@@ -68,7 +68,8 @@ app.use((req, res, next) => {
 // Stripe firma el body crudo del webhook — tiene que montarse con express.raw() ANTES del
 // express.json() global de abajo, si no la verificación de firma siempre falla.
 app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }), stripeWebhookRouter)
-app.use(express.json({ limit: '2mb' }))
+app.use(express.json({ limit: '50mb' }))
+app.use(express.urlencoded({ limit: '50mb', extended: true }))
 // Nginx ya proxea todo /api/ al backend (ver /etc/nginx/sites-available/gitflow), así que
 // montar acá adentro es la forma más simple de que estas imágenes resuelvan en producción sin
 // tocar la config de nginx. Nunca van a frontend/dist: ese directorio se borra y reemplaza

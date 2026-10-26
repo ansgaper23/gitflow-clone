@@ -13,6 +13,7 @@ import {
   insertTableRow,
   updateTableRow,
   deleteTableRow,
+  executeProjectSql,
   getUsers,
   deleteUser,
   getStorageBuckets,
@@ -21,7 +22,42 @@ import {
   deleteStorageFile
 } from '../controllers/cloudController.js';
 import fsPromises from 'node:fs/promises';
+import fs from 'node:fs';
 import { runtimeBus } from '../services/runtimeBus.js';
+import { executeQuickEdit } from '../services/quickEditService.js';
+import { commitCheckpoint, restoreLocalGitCheckpoint, findProjectWorkspace } from '../services/gitCheckpoint.js';
+import { invalidateSemanticGraph } from '../services/semanticGraph.js';
+import { invalidateDbSchemaGraph } from '../services/dbSchemaGraph.js';
+
+/**
+ * Validador estricto de rutas de archivos para prevenir ataques de Path Traversal.
+ * Rechaza rutas con '..', rutas absolutas, caracteres nulos y accesos a .git, node_modules o .env
+ * @param {string} relPath
+ * @returns {string}
+ */
+export function sanitizeProjectPath(relPath) {
+  if (!relPath || typeof relPath !== 'string' || !relPath.trim()) {
+    throw new Error('Ruta de archivo inválida o vacía');
+  }
+  const normalized = relPath.replace(/\\/g, '/').trim();
+  
+  // Rechazar intentos de path traversal y rutas absolutas
+  if (normalized.includes('..') || normalized.startsWith('/') || /^[a-zA-Z]:/.test(normalized)) {
+    throw new Error('Ruta no permitida: Path Traversal detectado');
+  }
+  if (normalized.includes('\0')) {
+    throw new Error('Carácter nulo detectado');
+  }
+  // Rechazar rutas sensibles o carpetas de control (.git, node_modules, .env*)
+  const segments = normalized.split('/');
+  if (segments.some(seg => {
+    const s = seg.toLowerCase();
+    return s === '.git' || s === 'node_modules' || s === '.env' || s.startsWith('.env.');
+  })) {
+    throw new Error(`Acceso denegado a ruta restringida: ${normalized}`);
+  }
+  return normalized;
+}
 
 
 function analyzeZipContent(zipFilePath) {
@@ -77,6 +113,8 @@ import { createReadStream } from 'node:fs';
 import pg from 'pg';
 import { restartPreviewForAgent } from '../services/previewOrchestrator.js';
 const { Client } = pg;
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import cloudRoutes from './cloud.routes.js';
 import analyticsRoutes from './analytics.routes.js';
 import seoRoutes from './seo.routes.js';
@@ -91,6 +129,7 @@ import { supabase } from '../db/supabaseClient.js'
 import { createRepo, deleteRepo, sendGithubAwareError } from '../services/github.js'
 import { buildScaffoldFiles } from '../services/scaffold.js'
 import { generateDesignDirections } from '../services/geminiAssist.js'
+import { activeTurns } from '../services/conversationTurn.js'
 import {
   writeProjectFiles,
   readAllProjectFiles,
@@ -101,12 +140,19 @@ import {
 } from '../services/projectStorage.js'
 import {
   slugify,
+  generateHumanProjectName,
   createVirtualProject,
   ensureGithubProject,
   listOwnedProjects,
   getOwnedProject,
   isVirtualRepo,
 } from '../services/projectResolver.js'
+import {
+  generateProjectName,
+  buildCleanFallbackName,
+  ensureUniqueSlug,
+  isGenericOrLiteralName,
+} from '../services/projectNaming.js'
 import { createCheckpoint, listCheckpoints, resolveCheckpointFileState } from '../services/checkpoints.js'
 import { discoverRoutes } from '../services/routeDiscovery.js'
 import { isPreviewConfigured, isVpsPgConfigured, config } from '../config.js'
@@ -322,7 +368,7 @@ projectsRouter.delete('/:id', requireAuth, async (req, res) => {
   if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
 
   if (isPreviewConfigured) {
-    await stopPreview(`user:${req.user.id}`).catch(() => {})
+    await stopPreview(`user:${req.user.id}`, project.repo_full_name).catch(() => {})
   }
 
   if (project.custom_domain) {
@@ -405,7 +451,10 @@ projectsRouter.post('/create', requireAuth, async (req, res) => {
     return res.status(402).json({ error: 'Tu demo gratis o tu plan terminaron. Elige un plan para crear proyectos.' })
   }
 
-  const baseName = slugify(projectName || prompt.split(/\s+/).slice(0, 6).join(' '))
+  const hasExplicitName = Boolean(projectName && projectName.trim())
+  const initialNaming = hasExplicitName ? { name: projectName.trim(), slug: slugify(projectName) } : buildCleanFallbackName(prompt)
+  const humanName = initialNaming.name
+  const baseName = initialNaming.slug
   const hasGithub = Boolean(req.user.github_access_token)
 
   let project
@@ -421,8 +470,11 @@ projectsRouter.post('/create', requireAuth, async (req, res) => {
         return sendGithubAwareError(res, err, 'No se pudo crear el repositorio en GitHub', 502)
       }
       project = await ensureGithubProject(req.user.id, repo.fullName, { branch: repo.defaultBranch })
+      // Guardar también el nombre legible en projects
+      await supabase.from('projects').update({ name: humanName }).eq('id', project.id)
+      project.name = humanName
     } else {
-      project = await createVirtualProject(req.user.id, baseName)
+      project = await createVirtualProject(req.user.id, humanName)
     }
   } catch (err) {
     return res.status(502).json({ error: 'No se pudo crear el proyecto', detail: err.message })
@@ -464,6 +516,26 @@ projectsRouter.post('/create', requireAuth, async (req, res) => {
       detail: err.message,
       repoFullName: project.repo_full_name,
     })
+  }
+
+  // Si el usuario no especificó un nombre explícito, generar nombre semántico estilo Lovable en segundo plano
+  if (!hasExplicitName) {
+    (async () => {
+      try {
+        const urls = prompt.match(/https?:\/\/[^\s"'<>]+/gi) || []
+        const generated = await generateProjectName(prompt, { urls })
+        if (generated && generated.name) {
+          const { data: current } = await supabase.from('projects').select('name').eq('id', project.id).single()
+          if (current && (current.name === humanName || isGenericOrLiteralName(current.name, prompt))) {
+            const uniqueSlug = await ensureUniqueSlug(generated.slug, project.id, supabase)
+            await supabase.from('projects').update({ name: generated.name, slug: uniqueSlug }).eq('id', project.id)
+            console.log(`[projectNaming] Proyecto ${project.id} renombrado semánticamente a "${generated.name}" (${uniqueSlug})`)
+          }
+        }
+      } catch (err) {
+        console.warn('[projectNaming] Error asíncrono en /create:', err.message)
+      }
+    })()
   }
 
   const { data: convo, error: convoErr } = await supabase
@@ -666,38 +738,324 @@ projectsRouter.get('/:id/files', requireAuth, async (req, res) => {
 projectsRouter.get('/:id/file', requireAuth, async (req, res) => {
   const project = await getOwnedProject(req.user.id, req.params.id)
   if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
-  const path = req.query.path
-  if (!path) return res.status(400).json({ error: 'Falta el parámetro path' })
+  let sanitizedPath
+  try {
+    sanitizedPath = sanitizeProjectPath(req.query.path)
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
+  }
   if (!isVirtualRepo(project.repo_full_name) && !req.user.github_access_token) {
     return res.status(403).json({ error: 'Conecta tu cuenta de GitHub para continuar', code: 'github_not_connected' })
   }
   try {
-    const content = await readProjectFile(project, req.user.github_access_token, path)
-    res.json({ path, content })
+    const content = await readProjectFile(project, req.user.github_access_token, sanitizedPath)
+    res.json({ path: sanitizedPath, content })
   } catch (err) {
-    res.status(404).json({ error: `No se pudo leer ${path}`, detail: err.message })
+    res.status(404).json({ error: `No se pudo leer ${sanitizedPath}`, detail: err.message })
   }
 })
 
 projectsRouter.put('/:id/file', requireAuth, async (req, res) => {
   const project = await getOwnedProject(req.user.id, req.params.id)
   if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
-  const { path, content } = req.body
-  if (!path || content === undefined) return res.status(400).json({ error: 'Faltan path y/o content' })
+  let sanitizedPath
+  try {
+    sanitizedPath = sanitizeProjectPath(req.body.path)
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
+  }
+  const { content } = req.body
+  if (content === undefined) return res.status(400).json({ error: 'Falta content' })
   if (!isVirtualRepo(project.repo_full_name) && !req.user.github_access_token) {
     return res.status(403).json({ error: 'Conecta tu cuenta de GitHub para continuar', code: 'github_not_connected' })
   }
   try {
     const { commitUrl, commitSha } = await writeProjectFile(project, req.user.github_access_token, {
-      path,
+      path: sanitizedPath,
       newContent: content,
-      summary: `Editado manualmente: ${path}`,
+      summary: `Editado manualmente: ${sanitizedPath}`,
     })
-    await createCheckpoint(project, null, { changeType: 'code', summary: `Editado manualmente: ${path}`, commitSha })
+    await createCheckpoint(project, null, { changeType: 'code', summary: `Editado manualmente: ${sanitizedPath}`, commitSha })
     if (isPreviewConfigured) refreshPreview(`user:${req.user.id}`, project).catch(() => {})
-    res.json({ path, commitUrl })
+
+    // Sincronización tripartita con Git local en workspace de preview
+    for (let i = 0; i < 5; i++) {
+      const ws = `/opt/gitflow-previews/workspace-${i}`
+      if (fs.existsSync(ws)) {
+        await commitCheckpoint(ws, `manual_${Date.now()}`, `Manual edit: ${sanitizedPath}`).catch(() => null)
+      }
+    }
+
+    // Invalidar grafos semánticos para el Agente IA
+    invalidateSemanticGraph(project.id)
+    if (sanitizedPath.endsWith('.sql')) invalidateDbSchemaGraph(project.id)
+
+    res.json({ path: sanitizedPath, commitUrl, ok: true })
   } catch (err) {
-    res.status(502).json({ error: `No se pudo guardar ${path}`, detail: err.message })
+    res.status(502).json({ error: `No se pudo guardar ${sanitizedPath}`, detail: err.message })
+  }
+})
+
+projectsRouter.post('/:id/file', requireAuth, async (req, res) => {
+  const project = await getOwnedProject(req.user.id, req.params.id)
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
+  let sanitizedPath
+  try {
+    sanitizedPath = sanitizeProjectPath(req.body.path)
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
+  }
+  const content = req.body.content || ''
+  if (!isVirtualRepo(project.repo_full_name) && !req.user.github_access_token) {
+    return res.status(403).json({ error: 'Conecta tu cuenta de GitHub para continuar', code: 'github_not_connected' })
+  }
+  try {
+    if (isVirtualRepo(project.repo_full_name)) {
+      const { data: existing } = await supabase
+        .from('project_files')
+        .select('path')
+        .eq('project_id', project.id)
+        .eq('path', sanitizedPath)
+        .maybeSingle()
+      if (existing) {
+        return res.status(409).json({ error: `El archivo "${sanitizedPath}" ya existe` })
+      }
+    }
+
+    const { commitUrl, commitSha } = await writeProjectFile(project, req.user.github_access_token, {
+      path: sanitizedPath,
+      newContent: content,
+      summary: `Creado manualmente: ${sanitizedPath}`,
+    })
+    await createCheckpoint(project, null, { changeType: 'code', summary: `Creado manualmente: ${sanitizedPath}`, commitSha })
+    if (isPreviewConfigured) refreshPreview(`user:${req.user.id}`, project).catch(() => {})
+
+    for (let i = 0; i < 5; i++) {
+      const ws = `/opt/gitflow-previews/workspace-${i}`
+      if (fs.existsSync(ws)) {
+        await commitCheckpoint(ws, `manual_${Date.now()}`, `Manual create: ${sanitizedPath}`).catch(() => null)
+      }
+    }
+
+    invalidateSemanticGraph(project.id)
+    if (sanitizedPath.endsWith('.sql')) invalidateDbSchemaGraph(project.id)
+
+    res.json({ path: sanitizedPath, commitUrl, ok: true })
+  } catch (err) {
+    res.status(502).json({ error: `No se pudo crear ${sanitizedPath}`, detail: err.message })
+  }
+})
+
+projectsRouter.delete('/:id/file', requireAuth, async (req, res) => {
+  const project = await getOwnedProject(req.user.id, req.params.id)
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
+  let sanitizedPath
+  try {
+    sanitizedPath = sanitizeProjectPath(req.query.path || req.body?.path)
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
+  }
+  if (!isVirtualRepo(project.repo_full_name) && !req.user.github_access_token) {
+    return res.status(403).json({ error: 'Conecta tu cuenta de GitHub para continuar', code: 'github_not_connected' })
+  }
+  try {
+    if (isVirtualRepo(project.repo_full_name)) {
+      const { error } = await supabase
+        .from('project_files')
+        .delete()
+        .eq('project_id', project.id)
+        .eq('path', sanitizedPath)
+      if (error) throw error
+    }
+
+    await createCheckpoint(project, null, { changeType: 'code', summary: `Eliminado manualmente: ${sanitizedPath}` })
+    if (isPreviewConfigured) refreshPreview(`user:${req.user.id}`, project).catch(() => {})
+
+    for (let i = 0; i < 5; i++) {
+      const ws = `/opt/gitflow-previews/workspace-${i}`
+      if (fs.existsSync(ws)) {
+        const filePath = path.join(ws, sanitizedPath)
+        if (fs.existsSync(filePath)) {
+          fs.rmSync(filePath, { force: true })
+        }
+        await commitCheckpoint(ws, `manual_${Date.now()}`, `Manual delete: ${sanitizedPath}`).catch(() => null)
+      }
+    }
+
+    invalidateSemanticGraph(project.id)
+    if (sanitizedPath.endsWith('.sql')) invalidateDbSchemaGraph(project.id)
+
+    res.json({ path: sanitizedPath, ok: true })
+  } catch (err) {
+    res.status(502).json({ error: `No se pudo eliminar ${sanitizedPath}`, detail: err.message })
+  }
+})
+
+// Exportación y descarga en archivo .ZIP
+
+projectsRouter.get('/:id/export-static', requireAuth, async (req, res) => {
+  const project = await getOwnedProject(req.user.id, req.params.id)
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
+
+  try {
+    const safeSlug = (project.slug || project.name || 'proyecto').replace(/[^a-zA-Z0-9-_]/g, '_')
+
+    // 1. Buscar workspace físico en /opt/gitflow-previews/workspace-0..9 o /opt/gitflow-app/workspace/:id
+    let workspaceDir = null
+    for (let i = 0; i < 10; i++) {
+      const ws = `/opt/gitflow-previews/workspace-${i}`
+      if (fs.existsSync(ws)) {
+        try {
+          const cfg = fs.readFileSync(path.join(ws, '.git', 'config'), 'utf-8')
+          if (project.repo_full_name && cfg.includes(project.repo_full_name)) {
+            workspaceDir = ws
+            break
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (!workspaceDir) {
+      const appWs = `/opt/gitflow-app/workspace/${project.id}`
+      if (fs.existsSync(appWs)) workspaceDir = appWs
+    }
+
+    const zip = new AdmZip()
+
+    if (workspaceDir && fs.existsSync(workspaceDir)) {
+      const distDir = path.join(workspaceDir, 'dist')
+      const publicDocAssets = path.join(workspaceDir, 'public', 'doc-assets')
+      const distDocAssets = path.join(distDir, 'doc-assets')
+
+      // Ejecutar compilación Vite estática si es necesario
+      try {
+        console.log(`[export-static] Compilando dist estático en ${workspaceDir}...`)
+        const { execSync } = await import('node:child_process')
+        execSync('npx vite build --base=./ || npm run build', {
+          cwd: workspaceDir,
+          timeout: 60000,
+          stdio: 'pipe',
+          env: { ...process.env, NODE_ENV: 'production' }
+        })
+      } catch (buildErr) {
+        console.warn(`[export-static] Advertencia en build de Vite: ${buildErr.message}. Usando dist existente o fallback.`)
+      }
+
+      // Asegurar que doc-assets esté dentro de dist
+      if (fs.existsSync(publicDocAssets)) {
+        try {
+          if (!fs.existsSync(distDocAssets)) {
+            fs.mkdirSync(distDocAssets, { recursive: true })
+          }
+          const assetFiles = fs.readdirSync(publicDocAssets)
+          for (const af of assetFiles) {
+            const srcFile = path.join(publicDocAssets, af)
+            const destFile = path.join(distDocAssets, af)
+            if (fs.statSync(srcFile).isFile() && !fs.existsSync(destFile)) {
+              fs.copyFileSync(srcFile, destFile)
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (fs.existsSync(distDir) && fs.existsSync(path.join(distDir, 'index.html'))) {
+        zip.addLocalFolder(distDir)
+      } else {
+        // Fallback: empaquetar archivos del proyecto excluyendo node_modules y .git
+        const files = await readAllProjectFiles(project).catch(() => [])
+        for (const f of files) {
+          if (f.path && !f.path.includes('node_modules') && !f.path.includes('.git')) {
+            zip.addFile(f.path, Buffer.from(f.content || '', f.is_base64 ? 'base64' : 'utf-8'))
+          }
+        }
+      }
+    } else {
+      // Entorno virtual o sin workspace local directo
+      const files = await readAllProjectFiles(project).catch(() => [])
+      for (const f of files) {
+        if (f.path && !f.path.includes('node_modules') && !f.path.includes('.git')) {
+          zip.addFile(f.path, Buffer.from(f.content || '', f.is_base64 ? 'base64' : 'utf-8'))
+        }
+      }
+    }
+
+    const zipBuffer = zip.toBuffer()
+    res.setHeader('Content-Type', 'application/zip')
+    res.setHeader('Content-Disposition', `attachment; filename="${safeSlug}-estatico-dist.zip"`)
+    res.setHeader('Content-Length', zipBuffer.length)
+    return res.send(zipBuffer)
+  } catch (err) {
+    console.error('[export-static] Error:', err)
+    res.status(500).json({ error: 'Error al exportar build estático', detail: err.message })
+  }
+})
+
+projectsRouter.get('/:id/export-zip', requireAuth, async (req, res) => {
+  const project = await getOwnedProject(req.user.id, req.params.id)
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
+  try {
+    let files = []
+    if (isVirtualRepo(project.repo_full_name)) {
+      const { data, error } = await supabase
+        .from('project_files')
+        .select('path, content, is_base64')
+        .eq('project_id', project.id)
+      if (error) throw error
+      files = data || []
+    } else {
+      files = await readAllProjectFiles(project).catch(() => [])
+    }
+
+    const zip = new AdmZip()
+    const forbidden = ['.git', 'node_modules', '.env']
+
+    for (const f of files) {
+      if (!f.path) continue
+      try {
+        const cleanPath = sanitizeProjectPath(f.path)
+        const segments = cleanPath.split('/')
+        if (segments.some(s => forbidden.includes(s.toLowerCase()))) continue
+
+        if (f.is_base64) {
+          zip.addFile(cleanPath, Buffer.from(f.content, 'base64'))
+        } else {
+          zip.addFile(cleanPath, Buffer.from(f.content || '', 'utf-8'))
+        }
+      } catch (_) {
+        // Excluir archivos que no superen sanitizeProjectPath
+      }
+    }
+
+    const zipBuffer = zip.toBuffer()
+    const safeSlug = (project.slug || project.name || 'project').replace(/[^a-zA-Z0-9-_]/g, '_')
+
+    res.setHeader('Content-Type', 'application/zip')
+    res.setHeader('Content-Disposition', `attachment; filename="${safeSlug}.zip"`)
+    res.setHeader('Content-Length', zipBuffer.length)
+    return res.send(zipBuffer)
+  } catch (err) {
+    res.status(500).json({ error: 'Error al exportar el proyecto como ZIP', detail: err.message })
+  }
+})
+
+projectsRouter.post('/:id/quick-edit', requireAuth, async (req, res) => {
+  const project = await getOwnedProject(req.user.id, req.params.id)
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
+
+  const { elementContext, action, newText, newClasses, tailwindUpdates } = req.body || {}
+  try {
+    const result = await executeQuickEdit({
+      project,
+      user: req.user,
+      elementContext,
+      action,
+      newText,
+      newClasses,
+      tailwindUpdates
+    })
+    res.json(result)
+  } catch (err) {
+    res.status(500).json({ status: 'FALLBACK_REQUIRED', reason: 'ERROR', message: err.message })
   }
 })
 
@@ -1038,6 +1396,155 @@ projectsRouter.get('/:id/checkpoints', requireAuth, async (req, res) => {
   }
 })
 
+// Rollback atómico de trayectoria (estilo Lovable revert-trajectory)
+projectsRouter.post('/:id/revert-trajectory', requireAuth, async (req, res) => {
+  const project = await getOwnedProject(req.user.id, req.params.id);
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' });
+
+  let { messageId, commitSha } = req.body || {};
+
+  // 1. Si no viene commitSha directo pero viene messageId, buscar en messages
+  if (!commitSha && messageId) {
+    const { data: targetMsg } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('id', messageId)
+      .single();
+    if (targetMsg) {
+      const cpAction = (targetMsg.actions || []).find(a => a.type === 'checkpoint' && (a.commitSha || a.trajectory?.commitSha));
+      commitSha = cpAction?.commitSha || cpAction?.trajectory?.commitSha;
+    }
+  }
+
+  // Si aún no tenemos commitSha, buscar en checkpoints por id o turnId
+  if (!commitSha && messageId) {
+    const { data: cpRows } = await supabase
+      .from('checkpoints')
+      .select('commit_sha')
+      .eq('project_id', project.id)
+      .or(`id.eq.${messageId},turn_id.eq.${messageId}`)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (cpRows && cpRows[0]?.commit_sha) {
+      commitSha = cpRows[0].commit_sha;
+    }
+  }
+
+  if (!commitSha) {
+    return res.status(400).json({ error: 'No se encontró commitSha ni checkpoint válido para revertir' });
+  }
+
+  // 2. Reversión física del workspace Git
+  const wsDir = findProjectWorkspace(project);
+  let filesRestoredCount = 0;
+  if (wsDir && fs.existsSync(wsDir)) {
+    const restoreRes = await restoreLocalGitCheckpoint(wsDir, commitSha);
+    if (!restoreRes.ok) {
+      console.warn(`[revert-trajectory] Warning en restoreLocalGitCheckpoint: ${restoreRes.error}`);
+    }
+
+    // 3. Sincronizar project_files en la base de datos con el workspace restaurado
+    try {
+      const walkDir = (dir, base = '') => {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        let results = [];
+        for (const entry of entries) {
+          const rel = base ? `${base}/${entry.name}` : entry.name;
+          if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === 'dist' || entry.name === '.vite') continue;
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            results = results.concat(walkDir(full, rel));
+          } else if (entry.isFile()) {
+            results.push(rel);
+          }
+        }
+        return results;
+      };
+
+      const diskFiles = walkDir(wsDir);
+      filesRestoredCount = diskFiles.length;
+
+      // Leer archivos de disco y actualizar o insertar en project_files
+      for (const relPath of diskFiles) {
+        try {
+          const fullPath = path.join(wsDir, relPath);
+          const content = fs.readFileSync(fullPath, 'utf-8');
+          try {
+            const { error: upsertErr } = await supabase.from('project_files').upsert({
+              project_id: project.id,
+              path: relPath,
+              content,
+              updated_at: new Date().toISOString()
+            }, { onConflict: 'project_id,path' });
+            if (upsertErr) {
+              console.warn('[SupabaseQueryError] project_files upsert failed:', { error: upsertErr.message, details: upsertErr.details });
+            }
+          } catch (err) {
+            console.warn('[SupabaseQueryError] project_files upsert caught:', { error: err.message });
+          }
+        } catch (_) {}
+      }
+
+      // Eliminar de project_files los que ya no existen en el disco tras el rollback
+      const { data: dbFiles } = await supabase
+        .from('project_files')
+        .select('path')
+        .eq('project_id', project.id);
+      if (dbFiles) {
+        const diskSet = new Set(diskFiles);
+        const toDelete = dbFiles.filter(f => !diskSet.has(f.path)).map(f => f.path);
+        if (toDelete.length > 0) {
+          try {
+            const { error: delErr } = await supabase.from('project_files').delete().eq('project_id', project.id).in('path', toDelete);
+            if (delErr) {
+              console.warn('[SupabaseQueryError] project_files delete failed:', { error: delErr.message, details: delErr.details });
+            }
+          } catch (err) {
+            console.warn('[SupabaseQueryError] project_files delete caught:', { error: err.message });
+          }
+        }
+      }
+    } catch (syncErr) {
+      console.warn(`[revert-trajectory] Error sincronizando project_files: ${syncErr.message}`);
+    }
+  }
+
+  // 4. Truncar/ocultar turnos posteriores en la conversación si viene messageId
+  if (messageId) {
+    try {
+      const { data: targetMsg } = await supabase
+        .from('messages')
+        .select('created_at, conversation_id')
+        .eq('id', messageId)
+        .single();
+      if (targetMsg) {
+        await supabase
+          .from('messages')
+          .update({ hidden: true })
+          .eq('conversation_id', targetMsg.conversation_id)
+          .gt('created_at', targetMsg.created_at);
+      }
+    } catch (hideErr) {
+      console.warn(`[revert-trajectory] Error ocultando mensajes posteriores: ${hideErr.message}`);
+    }
+  }
+
+  // 5. Invalidar grafos semánticos y refrescar Vite preview
+  invalidateSemanticGraph(project.id);
+  invalidateDbSchemaGraph(project.id);
+  if (isPreviewConfigured) {
+    refreshPreview(`user:${req.user.id}`, project).catch(() => {});
+  }
+
+  res.json({
+    ok: true,
+    commitSha,
+    messageId: messageId || null,
+    filesRestoredCount,
+    restoredAt: new Date().toISOString()
+  });
+});
+
 projectsRouter.post('/:id/checkpoints/:checkpointId/restore', requireAuth, async (req, res) => {
   const project = await getOwnedProject(req.user.id, req.params.id)
   if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
@@ -1104,10 +1611,10 @@ projectsRouter.patch('/:id/slug', requireAuth, async (req, res) => {
   // usuario lo pare a mano o expire por inactividad. Lo paramos para que el cambio se sienta
   // inmediato: la próxima vez que inicie el preview, ya sale con el slug nuevo.
   if (isPreviewConfigured) {
-    getPreviewStatus(`user:${req.user.id}`)
+    getPreviewStatus(`user:${req.user.id}`, project.repo_full_name)
       .then((status) => {
         if (status?.status && status.status !== 'idle' && status.repoFullName === project.repo_full_name) {
-          return stopPreview(`user:${req.user.id}`)
+          return stopPreview(`user:${req.user.id}`, project.repo_full_name)
         }
       })
       .catch(() => {})
@@ -1138,6 +1645,39 @@ projectsRouter.patch('/:id/ai-memory', requireAuth, async (req, res) => {
   const { data: updated, error } = await supabase.from('projects').update({ ai_memory: aiMemory }).eq('id', project.id).select('*').single()
   if (error) return res.status(500).json({ error: error.message })
   res.json(serializeProject(updated))
+})
+
+// Endpoint de cancelación explícita por usuario para el proyecto (/api/projects/:id/cancel)
+projectsRouter.post('/:id/cancel', requireAuth, async (req, res) => {
+  const projectId = req.params.id;
+  let cancelled = false;
+
+  if (activeTurns.has(projectId)) {
+    const turnData = activeTurns.get(projectId);
+    if (turnData) {
+      turnData.explicitCancelRequested = true;
+      if (turnData.abortController) {
+        try { turnData.abortController.abort(); } catch (_) {}
+      }
+      cancelled = true;
+    }
+  }
+
+  for (const [key, turnData] of activeTurns.entries()) {
+    if (turnData?.projectId === projectId) {
+      turnData.explicitCancelRequested = true;
+      if (turnData.abortController) {
+        try { turnData.abortController.abort(); } catch (_) {}
+      }
+      cancelled = true;
+    }
+  }
+
+  return res.json({
+    ok: true,
+    cancelled,
+    message: cancelled ? 'Cancelación explícita del turno procesada exitosamente.' : 'No había ningún turno activo para este proyecto.'
+  });
 })
 
 async function saveProjectAsset(req, res, column) {
@@ -1421,6 +1961,7 @@ projectsRouter.get('/:id/cloud/database/tables/:tableName/rows', requireAuth, ge
 projectsRouter.post('/:id/cloud/database/tables/:tableName/rows', requireAuth, insertTableRow);
 projectsRouter.patch('/:id/cloud/database/tables/:tableName/rows/:primaryKey', requireAuth, updateTableRow);
 projectsRouter.delete('/:id/cloud/database/tables/:tableName/rows/:primaryKey', requireAuth, deleteTableRow);
+projectsRouter.post('/:id/cloud/database/sql', requireAuth, executeProjectSql);
 
 projectsRouter.get('/:id/cloud/users', requireAuth, getUsers);
 projectsRouter.delete('/:id/cloud/users/:userId', requireAuth, deleteUser);
@@ -1429,6 +1970,269 @@ projectsRouter.get('/:id/cloud/storage/buckets', requireAuth, getStorageBuckets)
 projectsRouter.post('/:id/cloud/storage/buckets', requireAuth, createStorageBucket);
 projectsRouter.get('/:id/cloud/storage/buckets/:bucketId/files', requireAuth, getStorageFiles);
 projectsRouter.delete('/:id/cloud/storage/buckets/:bucketId/files/:fileName', requireAuth, deleteStorageFile);
+
+// ============================================================================
+// ENDPOINTS DE AUTENTICACIÓN OFICIAL DE PROYECTOS (ESTÁNDAR FLOWPRO / LOVABLE)
+// ============================================================================
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+async function resolveProjectDbConnection(projectId) {
+  if (!projectId) return null;
+  
+  let project = null;
+  try {
+    const { data: p } = await supabase
+      .from('projects')
+      .select('id, name, slug, repo_full_name, user_id')
+      .or(`id.eq.${projectId},slug.eq.${projectId}`)
+      .maybeSingle();
+    project = p;
+  } catch (err) {
+    try {
+      const { data: pSlug } = await supabase
+        .from('projects')
+        .select('id, name, slug, repo_full_name, user_id')
+        .eq('slug', projectId)
+        .maybeSingle();
+      project = pSlug;
+    } catch (_) {}
+  }
+
+  let connRow = null;
+  if (project?.repo_full_name) {
+    const { data: c } = await supabase
+      .from('repo_db_connections')
+      .select('*')
+      .eq('repo_full_name', project.repo_full_name)
+      .maybeSingle();
+    connRow = c;
+  }
+
+  if (!connRow) {
+    const { data: cByToken } = await supabase
+      .from('repo_db_connections')
+      .select('*')
+      .eq('public_token', projectId)
+      .maybeSingle();
+    connRow = cByToken;
+  }
+
+  if (!connRow && typeof projectId === 'string' && projectId.includes('/')) {
+    const { data: cByRepo } = await supabase
+      .from('repo_db_connections')
+      .select('*')
+      .eq('repo_full_name', projectId)
+      .maybeSingle();
+    connRow = cByRepo;
+  }
+
+  if (!connRow || !connRow.connection_string) return null;
+
+  return {
+    connectionString: connRow.connection_string,
+    authSecret: connRow.auth_secret || config.jwtSecret || 'flowpro-default-auth-secret',
+    publicToken: connRow.public_token,
+    repoFullName: connRow.repo_full_name,
+    project
+  };
+}
+
+// 1. Registro de Usuario (POST /api/projects/:id/auth/signup)
+projectsRouter.post('/:id/auth/signup', async (req, res) => {
+  const { id } = req.params;
+  const { email, password, full_name, metadata } = req.body || {};
+  if (!email || !EMAIL_RE.test(email)) {
+    return res.status(400).json({ ok: false, error: 'Email inválido' });
+  }
+  if (!password || password.length < 6) {
+    return res.status(400).json({ ok: false, error: 'La contraseña debe tener al menos 6 caracteres' });
+  }
+
+  const connInfo = await resolveProjectDbConnection(id);
+  if (!connInfo) {
+    return res.status(404).json({ ok: false, error: 'Proyecto o base de datos no encontrada' });
+  }
+
+  const client = new Client({ connectionString: connInfo.connectionString });
+  await client.connect();
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const cleanEmail = email.toLowerCase().trim();
+    const userMeta = { full_name: full_name || cleanEmail.split('@')[0], ...(metadata || {}) };
+
+    let userRow = null;
+    try {
+      const { rows } = await client.query(
+        `INSERT INTO auth.users (email, password_hash, raw_user_meta_data, raw_app_meta_data, email_confirmed_at, last_sign_in_at)
+         VALUES ($1, $2, $3, $4, now(), now())
+         RETURNING id, email, created_at`,
+        [cleanEmail, hash, JSON.stringify(userMeta), JSON.stringify({ provider: 'email' })]
+      );
+      userRow = rows[0];
+    } catch (err) {
+      if (err.code === '23505') {
+        return res.status(409).json({ ok: false, error: 'Ya existe una cuenta con ese email' });
+      }
+      try {
+        const { rows } = await client.query(
+          `INSERT INTO _flowpro_users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at`,
+          [cleanEmail, hash]
+        );
+        userRow = rows[0];
+      } catch (fErr) {
+        if (fErr.code === '23505') return res.status(409).json({ ok: false, error: 'Ya existe una cuenta con ese email' });
+        throw fErr;
+      }
+    }
+
+    const token = jwt.sign(
+      { sub: userRow.id, email: userRow.email },
+      connInfo.authSecret,
+      { expiresIn: '30d' }
+    );
+
+    const user = { id: userRow.id, email: userRow.email, created_at: userRow.created_at };
+    return res.status(201).json({
+      ok: true,
+      user,
+      token,
+      data: { user, token }
+    });
+  } catch (err) {
+    console.error('[Project Auth Signup Error]:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    await client.end().catch(() => {});
+  }
+});
+
+// 2. Inicio de Sesión (POST /api/projects/:id/auth/login)
+projectsRouter.post('/:id/auth/login', async (req, res) => {
+  const { id } = req.params;
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ ok: false, error: 'Email y contraseña requeridos' });
+  }
+
+  const connInfo = await resolveProjectDbConnection(id);
+  if (!connInfo) {
+    return res.status(404).json({ ok: false, error: 'Proyecto o base de datos no encontrada' });
+  }
+
+  const client = new Client({ connectionString: connInfo.connectionString });
+  await client.connect();
+  try {
+    const cleanEmail = email.toLowerCase().trim();
+    let userRow = null;
+
+    try {
+      const { rows } = await client.query(
+        `SELECT id, email, password_hash, created_at FROM auth.users WHERE email = $1`,
+        [cleanEmail]
+      );
+      userRow = rows[0];
+    } catch (e) {}
+
+    if (!userRow) {
+      const { rows } = await client.query(
+        `SELECT id, email, password_hash, created_at FROM _flowpro_users WHERE email = $1`,
+        [cleanEmail]
+      );
+      userRow = rows[0];
+    }
+
+    if (!userRow || !(await bcrypt.compare(password, userRow.password_hash || ''))) {
+      return res.status(401).json({ ok: false, error: 'Email o contraseña incorrectos' });
+    }
+
+    // Actualizar last_sign_in_at
+    await client.query(`UPDATE auth.users SET last_sign_in_at = now() WHERE id = $1`, [userRow.id]).catch(() => {});
+
+    const token = jwt.sign(
+      { sub: userRow.id, email: userRow.email },
+      connInfo.authSecret,
+      { expiresIn: '30d' }
+    );
+
+    const user = { id: userRow.id, email: userRow.email, created_at: userRow.created_at };
+    return res.json({
+      ok: true,
+      user,
+      token,
+      data: { user, token }
+    });
+  } catch (err) {
+    console.error('[Project Auth Login Error]:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    await client.end().catch(() => {});
+  }
+});
+
+// 3. Verificación de Sesión (GET /api/projects/:id/auth/user y /me)
+projectsRouter.get(['/:id/auth/user', '/:id/auth/me'], async (req, res) => {
+  const { id } = req.params;
+  const authHeader = req.get('authorization') || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+  if (!token) {
+    return res.status(401).json({ ok: false, error: 'Token no proporcionado', user: null });
+  }
+
+  const connInfo = await resolveProjectDbConnection(id);
+  if (!connInfo) {
+    return res.status(404).json({ ok: false, error: 'Proyecto no encontrado' });
+  }
+
+  let userId = null;
+  try {
+    const decoded = jwt.verify(token, connInfo.authSecret);
+    userId = decoded.sub;
+  } catch (e) {
+    return res.status(401).json({ ok: false, error: 'Token inválido o expirado', user: null });
+  }
+
+  const client = new Client({ connectionString: connInfo.connectionString });
+  await client.connect();
+  try {
+    let userRow = null;
+    try {
+      const { rows } = await client.query(
+        `SELECT u.id, u.email, u.created_at, u.last_sign_in_at,
+                COALESCE(p.full_name, u.raw_user_meta_data->>'full_name', split_part(u.email, '@', 1)) as full_name,
+                COALESCE(p.avatar_url, u.raw_user_meta_data->>'avatar_url') as avatar_url,
+                COALESCE(p.role, u.raw_user_meta_data->>'role', 'user') as role
+         FROM auth.users u
+         LEFT JOIN public.profiles p ON p.id = u.id
+         WHERE u.id = $1`,
+        [userId]
+      );
+      userRow = rows[0];
+    } catch (e) {}
+
+    if (!userRow) {
+      const { rows } = await client.query(
+        `SELECT id, email, created_at FROM _flowpro_users WHERE id = $1`,
+        [userId]
+      );
+      userRow = rows[0];
+    }
+
+    if (!userRow) {
+      return res.status(404).json({ ok: false, error: 'Usuario no encontrado', user: null });
+    }
+
+    return res.json({
+      ok: true,
+      user: userRow,
+      data: { user: userRow }
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    await client.end().catch(() => {});
+  }
+});
 
 // Telemetría de errores de runtime del preview (canal directo desde el iframe)
 projectsRouter.post('/:id/telemetry/errors', (req, res) => {

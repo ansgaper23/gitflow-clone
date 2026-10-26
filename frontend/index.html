@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="es" translate="no">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FlowPro — Describe tu app, un agente de IA la construye</title>
+    <meta
+      name="description"
+      content="Describí tu app y un agente de IA la construye por vos: sin saber programar, sin necesitar GitHub para empezar. Chateá los cambios y aprobá cada uno antes de que se aplique."
+    />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://flow-pro.online/" />
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="FlowPro" />
+    <meta property="og:url" content="https://flow-pro.online/" />
+    <meta property="og:title" content="FlowPro — Describe tu app, un agente de IA la construye" />
+    <meta
+      property="og:description"
+      content="Describí tu app y un agente de IA la construye por vos: sin saber programar, sin necesitar GitHub para empezar. Chateá los cambios y aprobá cada uno antes de que se aplique."
+    />
+    <meta property="og:image" content="https://flow-pro.online/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="FlowPro — un agente de IA que construye tu app por chat" />
+    <meta property="og:locale" content="es_ES" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="FlowPro — Describe tu app, un agente de IA la construye" />
+    <meta
+      name="twitter:description"
+      content="Describí tu app y un agente de IA la construye por vos: sin saber programar, sin necesitar GitHub para empezar."
+    />
+    <meta name="twitter:image" content="https://flow-pro.online/og-image.png" />
+    <meta name="twitter:image:alt" content="FlowPro — un agente de IA que construye tu app por chat" />
+
+    <!-- El lang mal puesto (antes "en" con contenido en español) hacía más probable que Chrome
+         ofreciera/auto-tradujera la página; el traductor reescribe el DOM por debajo de React
+         y eso puede tumbar toda la app con un "removeChild" — de ahí también notranslate. -->
+    <meta name="google" content="notranslate" />
+
+    <!-- JSON-LD: la app es un SPA (todo el contenido real lo pinta React), así que esto va
+         estático en el HTML — es lo único que un crawler que no ejecuta JS va a poder leer
+         además de los meta tags de arriba. -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "FlowPro",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Web",
+        "url": "https://flow-pro.online/",
+        "description": "Agente de IA que construye apps a partir de una descripción en lenguaje natural, sin necesitar saber programar ni tener GitHub para empezar.",
+        "offers": {
+          "@type": "AggregateOffer",
+          "priceCurrency": "USD",
+          "lowPrice": "9.99",
+          "highPrice": "115.99",
+          "offerCount": "5"
+        }
+      }
+    </script>
+
+    <!-- Organization: ayuda a que Google identifique la marca (knowledge panel, resultados con
+         nombre + logo en vez de solo la URL). -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "Organization",
+        "name": "FlowPro",
+        "url": "https://flow-pro.online/",
+        "logo": "https://flow-pro.online/favicon.svg"
+      }
+    </script>
+
+    <!-- FAQPage: tiene que reflejar EXACTO el texto visible en el componente FAQ.jsx de la
+         landing — si difiere, Google puede rechazar el rich snippet. -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "¿Necesito saber programar para usar FlowPro?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "No. Describís lo que querés en lenguaje natural y la IA escribe el código. Vos revisás y aprobás cada cambio antes de que se aplique — no hace falta tocar una línea de código."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "¿Qué pasa cuando se terminan los 30 minutos gratis?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Podés seguir viendo tu proyecto, pero para seguir chateando con la IA y publicar cambios nuevos necesitás activar un plan. No se te cobra nada automáticamente — no pedimos tarjeta para la prueba gratis."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "¿El código de mi app es mío?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Sí. Cada proyecto vive en un repositorio real de GitHub a tu nombre. Podés exportarlo, clonarlo o seguir editándolo vos mismo en cualquier momento, con o sin FlowPro."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "¿Necesito conectar GitHub para empezar?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "No para arrancar — podés describir tu app y empezar a chatear con la IA de una. Conectás GitHub cuando quieras guardar el código en un repositorio propio."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "¿Puedo publicar mi sitio con un dominio propio?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Sí. Publicar tu app funciona con cualquier plan activo (o durante tu prueba gratis). Conectar un dominio propio en vez del que te da FlowPro requiere el plan de 30 días o superior."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "¿Puedo cancelar cuando quiera?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Sí, no hay contratos ni renovación forzada — elegís el plan por la duración que necesitás y listo."
+            }
+          }
+        ]
+      }
+    </script>
+  </head>
+  <body>
+    <!-- Corre antes de que cargue nada más, para setear el tema guardado (o el del sistema)
+         desde el primer frame — si esto se hiciera solo desde React (con un useEffect), se
+         vería un flash del tema por defecto antes de cambiar al elegido por el usuario. -->
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('flowpro_theme')
+          var theme = saved === 'light' || saved === 'dark' ? saved : (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+          document.documentElement.setAttribute('data-theme', theme)
+        } catch (e) {}
+      })()
+    </script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

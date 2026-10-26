@@ -1,0 +1,16 @@
+[Unit]
+Description=GitFlow Preview Orchestrator
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gitflow-previews/orchestrator
+EnvironmentFile=/opt/gitflow-previews/orchestrator/.env
+ExecStart=/usr/bin/node /opt/gitflow-previews/orchestrator/server.mjs
+Restart=always
+RestartSec=3
+StandardOutput=append:/opt/gitflow-previews/orchestrator.log
+StandardError=append:/opt/gitflow-previews/orchestrator.log
+
+[Install]
+WantedBy=multi-user.target

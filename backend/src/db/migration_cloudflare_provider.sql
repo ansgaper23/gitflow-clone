@@ -1,0 +1,2 @@
+alter table ai_accounts drop constraint if exists ai_accounts_provider_check;
+alter table ai_accounts add constraint ai_accounts_provider_check check (provider in ('gemini', 'anthropic', 'deepseek', 'orcarouter', 'cloudflare'));

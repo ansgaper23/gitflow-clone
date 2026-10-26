@@ -1,0 +1,64 @@
+server {
+    server_name flow-pro.online www.flow-pro.online 130.51.22.140;
+
+    client_max_body_size 50M;
+
+    root /opt/gitflow-app/frontend/dist;
+    index index.html;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+
+        # Anti-Timeout & SSE Inmediate Flush (Cero Buffering)
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+
+        proxy_read_timeout 900s;
+        proxy_send_timeout 900s;
+        proxy_connect_timeout 60s;
+    }
+
+    # Los archivos bajo /assets/ llevan hash de contenido en el nombre (Vite), así que
+    # cambian de URL cuando cambian de contenido: se pueden cachear "para siempre".
+    location /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files $uri =404;
+    }
+
+    # index.html referencia los assets con hash, así que NUNCA debe cachearse — si no,
+    # el navegador puede quedarse sirviendo una versión vieja que apunta a un JS que
+    # ya no existe tras el próximo deploy, dejando la app en pantalla en blanco.
+    location / {
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        try_files $uri /index.html;
+    }
+
+    listen [::]:443 ssl ipv6only=on; # managed by Certbot
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/flow-pro.online/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/flow-pro.online/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+}
+
+server {
+    if ($host = www.flow-pro.online) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+    if ($host = flow-pro.online) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+    listen 80;
+    listen [::]:80;
+    server_name flow-pro.online www.flow-pro.online 130.51.22.140;
+    return 404; # managed by Certbot
+}

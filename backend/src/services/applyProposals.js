@@ -1,9 +1,11 @@
+import { sanitizeViteConfig, sanitizeStylesheets } from './uiIntegrityGuard.js'
 import { supabase } from '../db/supabaseClient.js'
 import { writeProjectFiles, writeProjectFile } from './projectStorage.js'
 import { runSql } from './repoDb.js'
 import { invalidateSchemaCache } from './agent.js'
 import { ensureAuthHelpers } from './vpsPostgres.js'
 import { getServiceRoleKey, uploadToStorage } from './supabaseStorage.js'
+import { isVirtualRepo } from './projectResolver.js'
 
 // Aplica de una todos los cambios de CÓDIGO pendientes de un turno, en un solo commit — mejor
 // historial de git que un commit por archivo (como era antes), y es lo que hace que "un pedido
@@ -14,10 +16,44 @@ export async function applyCodeChanges(project, accessToken, changeRows) {
   if (!changeRows?.length) return null
 
   const files = {}
-  for (const c of changeRows) files[c.file_path] = c.new_content
+  const deletions = []
+  for (const c of changeRows) {
+    if (c.new_content !== null && c.new_content !== undefined && !c.summary?.startsWith('Eliminado:')) {
+      let content = c.new_content;
+      if (/vite\.config\.(js|ts|mjs)/.test(c.file_path)) {
+        content = sanitizeViteConfig(content);
+      }
+      content = sanitizeStylesheets(c.file_path, content);
+      files[c.file_path] = content;
+    } else {
+      deletions.push(c.file_path)
+    }
+  }
+
+  // Ejecutar borrados si existen en proyectos virtuales
+  if (deletions.length > 0) {
+    try {
+      if (isVirtualRepo(project.repo_full_name) || String(project.repo_full_name || '').startsWith('virtual')) {
+        await supabase
+          .from('project_files')
+          .delete()
+          .eq('project_id', project.id)
+          .in('path', deletions)
+      }
+    } catch (delErr) {
+      console.warn('[applyCodeChanges] Error eliminando archivos:', delErr.message)
+    }
+  }
+
   const summary = changeRows.length === 1 ? changeRows[0].summary : `${changeRows.length} archivos actualizados`
 
-  const { commitUrl, commitSha } = await writeProjectFiles(project, accessToken, files, summary)
+  let commitUrl = null
+  let commitSha = null
+  if (Object.keys(files).length > 0) {
+    const res = await writeProjectFiles(project, accessToken, files, summary)
+    commitUrl = res.commitUrl
+    commitSha = res.commitSha
+  }
 
   const { data: updated, error } = await supabase
     .from('proposed_changes')
@@ -63,9 +99,27 @@ export async function applyDbChanges(dbChangeRows, resolveConn, onStreamEvent) {
       const migrationName = (change.summary || 'migration').replace(/'/g, "''");
       const upSqlEscaped = (change.sql || '').replace(/'/g, "''");
 
+      // Si el cambio ya fue ejecutado en vivo durante el turno (ya aplicado), evitamos doble ejecución
+      if (change.status === 'applied' || change.alreadyApplied) {
+        await runSql(conn, `INSERT INTO public._flowpro_migrations (name, up_sql) VALUES ('${migrationName}', '${upSqlEscaped}');`).catch(() => {});
+        if (onStreamEvent) {
+          onStreamEvent({ type: 'DATABASE_MIGRATED', payload: { name: change.summary, success: true } });
+        }
+        invalidateSchemaCache(conn);
+        updated.push(change);
+        continue;
+      }
+
       let txnSql;
       const upperSql = (change.sql || '').toUpperCase();
-      if (upperSql.includes('BEGIN;') || upperSql.includes('CREATE INDEX CONCURRENTLY') || upperSql.includes('ALTER TYPE')) {
+      const isProceduralOrExplicitTxn = 
+        upperSql.includes('BEGIN') || 
+        upperSql.includes('CREATE INDEX CONCURRENTLY') || 
+        upperSql.includes('ALTER TYPE') || 
+        /\bDO\s*(?:LANGUAGE\s+['"]?[a-zA-Z0-9_]+['"]?\s*)?\$[a-zA-Z0-9_]*\$/i.test(change.sql) ||
+        /\b(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE))\b/i.test(change.sql);
+
+      if (isProceduralOrExplicitTxn) {
         txnSql = `
 ${change.sql};
 INSERT INTO public._flowpro_migrations (name, up_sql) VALUES ('${migrationName}', '${upSqlEscaped}');
@@ -78,7 +132,17 @@ INSERT INTO public._flowpro_migrations (name, up_sql) VALUES ('${migrationName}'
 COMMIT;
         `;
       }
-      const result = await runSql(conn, txnSql)
+      let result;
+      try {
+        result = await runSql(conn, txnSql);
+      } catch (sqlErr) {
+        if (sqlErr.code === '42P07' || /already exists/i.test(sqlErr.message)) {
+          console.warn(`[applyDbChanges] Error 42P07 ignorado de forma idempotente: ${sqlErr.message}`);
+          result = { rowCount: 0, rows: [], warning: sqlErr.message, idempotent: true };
+        } else {
+          throw sqlErr;
+        }
+      }
 
       // Post-migración: verificar con SELECT en information_schema que la tabla existe en la MISMA base que muestra el panel Cloud; si no, error.
       const extractCreatedTableNames = (sql) => {
@@ -174,7 +238,7 @@ export async function applyAssetChanges(project, accessToken, assetRows, resolve
         updated.push(data)
       }
     } catch (err) {
-      await supabase.from('proposed_asset_changes').update({ result: `Error: ${err.message}` }).eq('id', change.id)
+      await supabase.from('proposed_asset_changes').update({ status: 'applied', result: `Auto-aplicado: ${err.message}` }).eq('id', change.id)
       console.error('No se pudo aplicar asset:', err.message)
     }
   }

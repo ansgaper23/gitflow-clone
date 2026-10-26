@@ -1,0 +1,156 @@
+# Cada preview activa vive en <slug>.flow-pro.online (el slug sale del nombre del repo).
+# El mapeo slug -> puerto interno lo escribe el orquestador en /etc/nginx/conf.d/preview-map.conf
+# y recarga nginx cada vez que una preview arranca/se detiene. "flow-pro.online" y
+# "www.flow-pro.online" tienen su propio server_name exacto en otro archivo, así que nginx
+# los prioriza sobre este bloque (los server_name exactos siempre ganan sobre los regex).
+#
+# Este mismo subdominio ahora sirve DOS cosas distintas según haya o no un build publicado:
+# 1) Si el proyecto ya se publicó al menos una vez (POST /api/projects/:id/publish), acá abajo
+#    hay un build estático real en /opt/gitflow-published/<slug>/ — eso es lo que se sirve
+#    siempre que exista, público para cualquiera, sin depender de que el dueño tenga el editor
+#    abierto.
+# 2) Si todavía no se publicó nunca, cae al preview de desarrollo (Vite) — pero ESE no es
+#    público: solo lo puede ver el dueño desde el editor (con el token firmado que manda
+#    /api/preview/status), cualquier otro visitante recibe 404. Antes de esto, cualquiera que
+#    adivinara el subdominio podía ver el proyecto a medio hacer sin que el dueño lo hubiera
+#    publicado nunca.
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    # Restringido a los caracteres que puede tener un slug real (slugify() en el backend solo
+    # genera [a-z0-9-]) — evita que un Host arbitrario termine armando una ruta de archivo rara
+    # en el "root" de abajo.
+    server_name ~^(?<slug>[a-z0-9-]+)\.flow-pro\.online$;
+
+    ssl_certificate /etc/letsencrypt/live/flow-pro.online/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/flow-pro.online/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        root /opt/gitflow-published;
+
+        # Si el proyecto YA se publicó alguna vez, "try_files" de abajo encuentra el build
+        # estático para CUALQUIER ruta que no exista como archivo — incluidas las rutas propias
+        # del dev server (/src/App.jsx, /@vite/client, etc.) — y nunca llega a considerar
+        # @preview, aunque el pedido traiga el token válido del dueño. Resultado: una vez
+        # publicado, el editor queda ciego para siempre a los cambios nuevos (sigue mostrando
+        # el build viejo) aunque la vista previa en vivo sí los tenga. Si el pedido trae el
+        # token (query ?_pt= o la cookie que deja /_preview_auth), lo mandamos derecho a
+        # @preview sin pasar por el build publicado — el auth_request de @preview igual valida
+        # que el token sea real antes de dejarlo pasar, así que esto no abre nada nuevo a un
+        # visitante que solo esté adivinando el subdominio.
+        set $has_preview_token "";
+        if ($arg__pt) { set $has_preview_token "1"; }
+        if ($cookie_fp_pt) { set $has_preview_token "1"; }
+        # "try_files" no se puede llamar dentro de un "if" — por eso salta a una location interna
+        # aparte que sí puede.
+        if ($has_preview_token = "1") {
+            rewrite ^ /_preview_direct last;
+        }
+
+        # /$slug/index.html funciona como fallback de SPA (rutas del router del cliente) SOLO
+        # si el proyecto ya se publicó (esa carpeta existe) — si nunca se publicó, ninguna de
+        # las dos rutas existe y cae a @preview.
+        try_files /$slug$uri /$slug/index.html @preview;
+
+        # Beacon de analíticas (visitas al sitio publicado) — acá sí tiene sentido: esto es lo
+        # que ve un visitante real, no el dueño probando cambios en el editor.
+        sub_filter '</body>' '<script>try{fetch("https://flow-pro.online/api/track",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slug:location.hostname.split(".")[0],path:location.pathname}),keepalive:true}).catch(function(){});}catch(e){}</script></body>';
+        sub_filter_once off;
+    }
+
+    # Punto de salto interno para el "if" de arriba (un "if" no puede llamar try_files
+    # directamente). No cambia nada más — @preview usa $request_uri para el proxy_pass, así que
+    # da igual que $uri acá adentro ya no sea el original.
+    location = /_preview_direct {
+        internal;
+        try_files /_never_matches @preview;
+    }
+
+    # Subrequest interna que nginx dispara sola antes de dejar pasar a @preview — nunca la pide
+    # un cliente real. Manda el slug + la URI original completa (con el ?_pt=... adentro) por
+    # headers al backend, que es el único que conoce el secreto para validar el token — usar
+    # "$arg__pt" acá directo no anduvo confiable dentro de la subrequest de auth_request en
+    # esta versión de nginx, X-Original-URI es el patrón estándar y probado para esto.
+    location = /_preview_auth {
+        internal;
+        proxy_pass http://127.0.0.1:8787/api/preview/verify-token?slug=$slug;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-URI $request_uri;
+    }
+
+    location @preview {
+        # Sin esto, cualquiera que adivinara el subdominio de un proyecto sin publicar podía
+        # verlo — ahora hace falta el token firmado que solo el editor conoce (lo manda
+        # /api/preview/status al dueño autenticado). Un 401/403 acá se normaliza a 404 más
+        # abajo: no hace falta que un visitante externo sepa que esto es un control de acceso,
+        # simplemente "no existe" hasta que se publique.
+        # NO usar "if" acá adentro: mezclado con auth_request en el mismo location es un caso
+        # conocido y roto de nginx (el "if" pisa el resultado de auth_request de forma
+        # impredecible) — por eso el caso "no hay preview corriendo" (preview_upstream vacío)
+        # se cubre dejando que el proxy_pass falle (502) y cae al mismo error_page de abajo.
+        auth_request /_preview_auth;
+        # El backend deja una cookie de sesión (fp_pt) cuando el token de la URL/Referer valida
+        # bien — necesaria para que Vite pueda cargar sus imports transitivos (react.js,
+        # App.jsx, los deps pre-bundleados), que ni llevan el token en su propia URL ni tienen
+        # un Referer que lo tenga (apuntan al archivo que los importó, no a la página original).
+        # Sin esto la vista previa cargaba el HTML pero se quedaba en blanco: nginx no reenvía
+        # solo los headers de una subrequest de auth_request al cliente, hay que capturarlo con
+        # auth_request_set y reemitirlo a mano.
+        auth_request_set $preview_auth_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $preview_auth_cookie always;
+        # 401/403 (sin token válido, o directamente no hay slot para este slug) es un visitante
+        # sin acceso — "no publicado" es honesto ahí. Pero un 502 acá SOLO puede pasar con un
+        # token válido (si no, auth_request ya cortó antes de llegar al proxy_pass de abajo) —
+        # osea que es SIEMPRE el dueño, con la vista previa reiniciándose o caída de verdad
+        # (ej. reinstalando dependencias nuevas, o el pool la desalojó). Antes esto cascadeaba
+        # al mismo "todavía no fue publicado" que ve un visitante random — mensaje directamente
+        # falso para el dueño en medio de una sesión de edición real, que además no da ninguna
+        # pista de que reintentar en unos segundos alcanza.
+        error_page 401 403 =404 /_not_published;
+        error_page 502 503 504 =200 /_preview_starting;
+
+        # $request_uri (no $uri): esta location se puede llegar directo (proyecto sin publicar)
+        # o vía un "rewrite" interno desde el "if" de location / (proyecto publicado con token) —
+        # en ese segundo caso $uri ya no es la ruta original, pero $request_uri sí lo es siempre.
+        proxy_pass http://$preview_upstream$request_uri;
+        proxy_http_version 1.1;
+        # Vite 6 rechaza peticiones cuyo Host no está en server.allowedHosts.
+        proxy_set_header Host localhost;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+
+        # Sin esto, Vite dev server puede mandar la respuesta comprimida y sub_filter (que solo
+        # opera sobre texto plano) no encontraría el </body> para inyectar el selector de abajo.
+        proxy_set_header Accept-Encoding "";
+
+        # Inyecta el selector de elementos (clic en el preview -> la IA sabe qué archivo/línea
+        # tocar) SOLO en la vista previa de edición en vivo, no en el sitio publicado (ahí no
+        # tiene sentido: lo ve un visitante real, no el dueño editando).
+        # Nota: cargarlo apenas se parsea el HTML competía con el arranque del cliente de HMR
+        # de Vite (que a veces fuerza un reload temprano) y la carga se cancelaba a mitad de
+        # camino — por eso se espera al evento "load" de la página antes de inyectarlo.
+        sub_filter '</body>' '<script>window.addEventListener("load",function(){var s=document.createElement("script");s.src="https://flow-pro.online/gitflow-selector.js";document.body.appendChild(s);});</script></body>';
+        sub_filter_once off;
+    }
+
+    location = /_not_published {
+        internal;
+        default_type text/html;
+        return 404 '<!doctype html><html><head><meta charset="utf-8"><title>404</title></head><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0a0a0c;color:#9a9aa2"><p>Este sitio todavía no fue publicado.</p></body></html>';
+    }
+
+    # Splash Screen Anti-502 Intermedia (Fase 4): Estado HTTP 200 con polling de 1.5s
+    # Evita que Cloudflare u otros intermediarios muestren una pantalla de error 502/503
+    location = /_preview_starting {
+        internal;
+        default_type text/html;
+        return 200 '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Despertando vista previa | FlowPro</title><style>*{box-sizing:border-box;margin:0;padding:0}body{background:#090d16;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:1.5rem;text-align:center}.card{background:rgba(18,24,38,0.85);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,0.1);border-radius:1.25rem;padding:2.5rem 2rem;max-width:440px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,0.6);display:flex;flex-direction:column;align-items:center;gap:1.25rem}.spinner-box{position:relative;width:64px;height:64px;display:flex;align-items:center;justify-content:center}.spinner{position:absolute;width:100%;height:100%;border-radius:50%;border:3px solid rgba(59,130,246,0.15);border-top-color:#3b82f6;animation:spin 1s cubic-bezier(0.55,0.25,0.25,0.9) infinite}.logo-badge{width:34px;height:34px;border-radius:0.6rem;background:linear-gradient(135deg,#3b82f6,#6366f1);display:flex;align-items:center;justify-content:center;font-weight:700;color:white;font-size:15px}h2{font-size:1.2rem;font-weight:600;color:#f8fafc}p{font-size:0.875rem;color:#94a3b8;line-height:1.5}.status-pill{display:inline-flex;align-items:center;gap:0.5rem;background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.2);padding:0.35rem 0.85rem;border-radius:9999px;font-size:0.75rem;color:#60a5fa;font-weight:500}.status-dot{width:6px;height:6px;border-radius:50%;background:#3b82f6;box-shadow:0 0 8px #3b82f6;animation:pulse 1.5s infinite}@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}</style><script>setTimeout(function poll(){fetch(window.location.href,{method:"HEAD",cache:"no-store"}).then(function(res){if(res.ok||(res.status>=200&&res.status<400)){window.location.reload()}else{setTimeout(poll,1500)}}).catch(function(){setTimeout(poll,1500)})},1500);</script></head><body><div class="card"><div class="spinner-box"><div class="spinner"></div><div class="logo-badge">FP</div></div><div><h2>Despertando la vista previa</h2><p style="margin-top:0.4rem">Iniciando el servidor de desarrollo y preparando dependencias en segundo plano...</p></div><div class="status-pill"><span class="status-dot"></span><span>Conectando con el entorno (Anti-502)</span></div></div></body></html>';
+    }
+}

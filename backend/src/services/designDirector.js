@@ -1,3 +1,4 @@
+import { classifyIndustryArchetype, extractBrandTokens, INDUSTRY_ARCHETYPES, getBrandAndArchetypeDirectives } from './brandExtractor.js'
 // backend/src/services/designDirector.js
 // MOTOR DE DIRECCIÓN DE ARTE UI/UX SENIOR (FLOWPRO — ESTÁNDAR LOVABLE / LINEAR / STRIPE / VERCEL / APPLE)
 // VERSIÓN 2: Anti-Saturación, Contraste Editorial, Contraste de Secciones y Cero Alucinación de Imágenes.
@@ -47,6 +48,174 @@ export function getCuratedImageUrl(industry, section, context) {
   }
 }
 
+/**
+ * LOS 4 ARQUETIPOS DE DISEÑO PROFESIONAL DE AGENCIA (ESTÁNDAR LOVABLE)
+ * Con tokens CSS semánticos listos para :root en src/index.css
+ */
+export const DESIGN_ARCHETYPES = {
+  OBSIDIAN_DARK: {
+    id: 'obsidian_dark',
+    name: 'Obsidian Dark',
+    description: 'Dark mode de alta gama inspirado en Linear, Raycast y Vercel. Superficies profundas, bordes sutiles 1px border-white/10, glassmorphism con backdrop-blur-md y acentos vibrantes neón o cian.',
+    palette: {
+      primaryHex: '#06b6d4',
+      primaryHsl: '189 94% 43%',
+      accentHex: '#8b5cf6',
+      accentHsl: '262 83% 58%',
+      surfaceTone: 'dark',
+      surfaceBg: 'bg-zinc-950',
+      cardBg: 'bg-zinc-900/60 backdrop-blur-md border border-white/10',
+    },
+    cssTokens: `:root {
+  --background: 240 10% 4%;
+  --foreground: 0 0% 98%;
+  --card: 240 10% 7%;
+  --card-foreground: 0 0% 98%;
+  --popover: 240 10% 7%;
+  --popover-foreground: 0 0% 98%;
+  --primary: 189 94% 43%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 240 5% 15%;
+  --secondary-foreground: 0 0% 98%;
+  --muted: 240 5% 15%;
+  --muted-foreground: 240 5% 65%;
+  --accent: 262 83% 58%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 62% 30%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 240 6% 18%;
+  --input: 240 6% 18%;
+  --ring: 189 94% 43%;
+  --radius: 0.75rem;
+}`
+  },
+  WARM_EDITORIAL: {
+    id: 'warm_editorial',
+    name: 'Warm Editorial',
+    description: 'Diseño editorial cálido y sofisticado tipo Kinfolk/Stripe Press. Fondos crema/arena (#F8F7F4, #FDFBF7), tipografía serif display y acentos verde bosque o terracota.',
+    palette: {
+      primaryHex: '#1b4332',
+      primaryHsl: '153 43% 19%',
+      accentHex: '#c85a32',
+      accentHsl: '16 60% 49%',
+      surfaceTone: 'light',
+      surfaceBg: 'bg-[#F8F7F4]',
+      cardBg: 'bg-white border border-stone-200/80 shadow-sm',
+    },
+    cssTokens: `:root {
+  --background: 40 33% 98%;
+  --foreground: 24 10% 10%;
+  --card: 0 0% 100%;
+  --card-foreground: 24 10% 10%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 24 10% 10%;
+  --primary: 153 43% 19%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 35 25% 93%;
+  --secondary-foreground: 24 10% 10%;
+  --muted: 35 25% 93%;
+  --muted-foreground: 24 5% 45%;
+  --accent: 16 60% 49%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 30 15% 88%;
+  --input: 30 15% 88%;
+  --ring: 153 43% 19%;
+  --radius: 0.5rem;
+}`
+  },
+  MINIMALIST_CLEAN: {
+    id: 'minimalist_clean',
+    name: 'Minimalist Clean',
+    description: 'Estilo suizo de precisión matemática extrema tipo Stripe/Apple. Fondos inmaculados, rejillas exactas, tipografía sans limpia y acento cobalto o klein.',
+    palette: {
+      primaryHex: '#2563eb',
+      primaryHsl: '221 83% 53%',
+      accentHex: '#002fa7',
+      accentHsl: '223 100% 33%',
+      surfaceTone: 'light',
+      surfaceBg: 'bg-white',
+      cardBg: 'bg-white border border-zinc-200/90 shadow-sm',
+    },
+    cssTokens: `:root {
+  --background: 0 0% 100%;
+  --foreground: 222 47% 11%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 47% 11%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222 47% 11%;
+  --primary: 221 83% 53%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 40% 96%;
+  --secondary-foreground: 222 47% 11%;
+  --muted: 210 40% 96%;
+  --muted-foreground: 215 16% 47%;
+  --accent: 223 100% 33%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 214 32% 91%;
+  --input: 214 32% 91%;
+  --ring: 221 83% 53%;
+  --radius: 0.5rem;
+}`
+  },
+  INDUSTRIAL_BRUTALIST: {
+    id: 'industrial_brutalist',
+    name: 'Industrial Brutalist',
+    description: 'Estética de ingeniería técnica, electricidad, minería y logística pesada. Fondos pizarra técnica (#121316), códigos monospace (SE-01, ISO-9001), acentos naranja de seguridad (#ff5400) o amarillo industrial (#facc15).',
+    palette: {
+      primaryHex: '#ff5400',
+      primaryHsl: '20 100% 50%',
+      accentHex: '#facc15',
+      accentHsl: '48 96% 53%',
+      surfaceTone: 'dark',
+      surfaceBg: 'bg-[#121316]',
+      cardBg: 'bg-[#181a1f] border border-zinc-800 text-zinc-100',
+    },
+    cssTokens: `:root {
+  --background: 220 13% 8%;
+  --foreground: 210 40% 98%;
+  --card: 220 13% 11%;
+  --card-foreground: 210 40% 98%;
+  --popover: 220 13% 11%;
+  --popover-foreground: 210 40% 98%;
+  --primary: 20 100% 50%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 220 10% 18%;
+  --secondary-foreground: 210 40% 98%;
+  --muted: 220 10% 18%;
+  --muted-foreground: 220 10% 65%;
+  --accent: 48 96% 53%;
+  --accent-foreground: 0 0% 0%;
+  --destructive: 0 62% 30%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 220 13% 22%;
+  --input: 220 13% 22%;
+  --ring: 20 100% 50%;
+  --radius: 0.375rem;
+}`
+  }
+}
+
+/**
+ * Detecta automáticamente el arquetipo de diseño más idóneo según la industria o solicitud
+ */
+export function detectDesignArchetype(industry = 'generic', userPrompt = '', brandPalette = null) {
+  const norm = (industry + ' ' + userPrompt).toLowerCase()
+  if (norm.match(/ingenier[ií]a|el[eé]ctric|mina|miner[ií]a|industrial|seguridad|extintor|soldadura|mec[aá]nic|fuerza|taller/)) {
+    return DESIGN_ARCHETYPES.INDUSTRIAL_BRUTALIST
+  }
+  if (norm.match(/editorial|abogad|legal|boutique|arquitect|lujo|joya|cl[ií]nica|salud|moda/)) {
+    return DESIGN_ARCHETYPES.WARM_EDITORIAL
+  }
+  if (norm.match(/dark|developer|software|ia\b|ai\b|saas|tech|cyber|ciberseguridad|crypto|consola/)) {
+    return DESIGN_ARCHETYPES.OBSIDIAN_DARK
+  }
+  return DESIGN_ARCHETYPES.MINIMALIST_CLEAN
+}
+
 export const MASTER_UI_UX_DESIGN_DIRECTIVE = `
 # DIRECTIVA MAESTRA DE DISEÑO FRONTEND, UI/UX Y ARQUITECTURA VISUAL
 
@@ -55,15 +224,18 @@ Actúas como un Lead Product Designer y Frontend Engineer de élite. Tu estánda
 ---
 
 ### 1. ANTI-PATRONES PROHIBIDOS (CERO ESTÉTICA DE IA BÁSICA)
-- PROHIBIDO usar fondos planos monótonos con 3 tarjetas idénticas alineadas sin jerarquía.
-- PROHIBIDO el texto de relleno ("Lorem ipsum", "Servicio 1", "Título de ejemplo", descripciones genéricas de una línea).
+- PROHIBIDO usar cuadrículas simétricas de 3 tarjetas monótonas idénticas con iconos centrados.
+- PROHIBIDO el texto publicitario genérico de relleno ("Transforma tu empresa", "Soluciones innovadoras para el futuro", "Servicio 1").
 - PROHIBIDO el uso de degradados cliché morado/azul genéricos sobre fondos blancos deslavados.
+- PROHIBIDO páginas de un solo color continuo sin ritmo de contraste editorial (Hero oscuro → Sección clara #F8F7F4 → Proyectos oscuro).
 - PROHIBIDO crear tablas o formularios crudos sin contenedor estilizado, sin estados hover ni micro-interacciones.
-- PROHIBIDO el espaciado comprimido o inconsistente. Los diseños premium respiran (\`gap-6\`, \`gap-8\`, \`py-16\`, \`py-24\`).
+- PROHIBIDO el espaciado comprimido o inconsistente. Los diseños premium respiran (\`gap-6\`,\`gap-8\`,\`py-16\`,\`py-24\`).
 
 ---
 
 ### 2. SISTEMA DE DISEÑO Y TOKENS VISUALES (TAILWIND + SHADCN)
+- **Caja de Herramientas UI Preinstalada (@/components/ui):**
+  Reutiliza obligatoriamente los componentes de "@/components/ui" (Button, Card, Badge, Input, Textarea, Label, Select, Dialog, Sheet, Tabs, Table, Accordion, Separator, Skeleton, Switch). NUNCA inventes modales con fixed inset-0 en línea ni botones crudos cuando ya tienes Dialog, Sheet y Button preinstalados.
 - **Paleta y Superficies:**
   - Si es Dark Mode: Usa fondos profundos (\`bg-slate-950\` o \`bg-zinc-950\`), nunca negro puro plano \`#000000\`. Define capas de elevación con bordes sutiles: tarjetas en \`bg-slate-900/60\`, bordes con \`border-slate-800/80\` y efectos de cristal (\`backdrop-blur-md\`).
   - Si es Light Mode: Fondos cálidos/neutros (\`bg-slate-50\` o \`bg-zinc-50\`), tarjetas en blanco puro con sombras de elevación suaves (\`shadow-sm\`, \`shadow-md\`, \`border border-slate-200/60\`).
@@ -148,6 +320,7 @@ export function getSeniorArtDirectionDirectives({ isWebOrLanding = true, theme =
    2. HERO SECTION INMERSIVO DE FOCO ÚNICO (MÁXIMO UN PUNTO FOCAL):
       - IMAGEN DE FONDO: usar imagen HD de alta resolución de la industria (ver imagen recomendada abajo).
       - Overlay oscuro graduado: \`absolute inset-0 bg-gradient-to-r from-zinc-950/95 via-zinc-950/80 to-zinc-950/40\`
+      - VISIBILIDAD LUMINOSA DEL HERO: La opacidad de la imagen de fondo NUNCA debe ser inferior a \opacity-50\ / \opacity-65\ si tiene overlay oscuro encima. Si la imagen usa \opacity-100\, el overlay oscuro debe ser graduado y translúcido (\rom-zinc-950/80 via-zinc-950/60 to-zinc-950/35\) para que la fotografía industrial/corporativa siempre se aprecie con total nitidez y fuerza visual, evitando fondos negros o imágenes invisibles.
       - Badge superior con borde fino (\`rounded-full px-3 py-1 text-xs font-medium border border-white/20 bg-white/5\`).
       - H1 POTENTE: máximo 6-8 palabras, 2 palabras en color de acento (\`bg-gradient-to-r from-white to-zinc-300 bg-clip-text text-transparent\`). Ej: "INGENIERÍA ELÉCTRICA DE PRECISIÓN"
       - Párrafo breve de 2-3 líneas (\`text-lg text-zinc-300 max-w-xl\`).
@@ -306,3 +479,6 @@ ${MASTER_UI_UX_DESIGN_DIRECTIVE}
 </senior_ui_ux_art_direction_standards>
 `.trim()
 }
+
+
+export { classifyIndustryArchetype, extractBrandTokens, INDUSTRY_ARCHETYPES, getBrandAndArchetypeDirectives }

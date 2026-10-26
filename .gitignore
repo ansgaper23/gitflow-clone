@@ -1,0 +1,70 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Production builds & archives
+dist/
+dist-ssr/
+build/
+*.tar.gz
+
+# Environment files & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+
+# Logs & debug dumps
+*.log
+*.txt
+logs/
+npm-debug.log*
+yarn-debug.log*
+
+# Scratch & temporary investigation files
+scratch/
+scratch*
+vps_*
+users.log
+users2.log
+
+# Ad-hoc Python scripts (maintenance/deploy)
+*.py
+*.pyc
+__pycache__/
+
+# Ad-hoc root & backend scratch scripts
+/*.js
+/*.mjs
+/*.cjs
+/*.sh
+backend/*.cjs
+backend/*.mjs
+backend/*.js
+backend/deploy_*.cjs
+frontend/*.cjs
+frontend/*.py
+dashboard_remote.jsx
+orchestrator_server.mjs
+
+# Keep core directories
+!backend/src/
+!backend/tests/
+!frontend/src/
+!frontend/public/
+!tests/
+!infra/
+
+# Old duplicate src folder in root only
+/src/
+*.bak
+*.pre-axis1
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/

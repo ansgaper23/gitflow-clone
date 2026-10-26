@@ -1,3 +1,4 @@
+import CodeBlock from '../components/CodeBlock';
 import { SupabaseConnectCard } from '../components/chat/SupabaseConnectCard.jsx'
 
 import {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react'
@@ -142,8 +143,6 @@ import SecretRequestCard from '../components/SecretRequestCard.jsx'
 
 import DbChoiceCard from '../components/DbChoiceCard.jsx'
 
-import AssetChangeCard from '../components/AssetChangeCard.jsx'
-
 import PreviewPanel, { VIEWPORTS } from '../components/PreviewPanel.jsx'
 
 import PathBar from '../components/PathBar.jsx'
@@ -159,10 +158,13 @@ import HistoryPanel from '../components/HistoryPanel.jsx'
 import ProjectSettingsPanel from '../components/ProjectSettingsPanel.jsx'
 
 import MorePanel from '../components/MorePanel.jsx'
+import { PublishPopover } from '../components/chat/PublishPopover.jsx'
+import { getProjectDisplayName } from '../lib/projectUtils.js'
 
 import TurnApprovalBar from '../components/TurnApprovalBar.jsx'
 
-import {api} from '../lib/api.js'
+import {api, isUnloading} from '../lib/api.js'
+import { getPendingAttachments, clearPendingAttachments } from '../lib/attachmentStore.js'
 
 import {useAuth} from '../context/AuthContext.jsx'
 
@@ -180,25 +182,42 @@ const SQL_EXT_RE = /\.(sql|backup|dump)$/i
 
 
 
-// Word/Excel viejos (.doc/.xls de Office 97-2003) se dejan pasar acá para que el backend
-
-// devuelva su propio mensaje claro ("guardalo como .docx/.xlsx") en vez de bloquearlos ya en el
-
-// cliente con el mensaje genérico de "tipo no soportado".
-
 const DOCUMENT_TYPES = new Set([
-
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // .docx
-
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
-
   'application/msword', // .doc
-
   'application/vnd.ms-excel', // .xls
-
+  'application/pdf',
+  'text/csv',
+  'text/plain',
+  'application/json',
 ])
 
-const MAX_ATTACHMENTS = 5
+const ALLOWED_CHAT_EXTENSIONS = new Set([
+  '.docx', '.doc', '.xlsx', '.xls', '.csv', '.tsv', '.pdf',
+  '.txt', '.md', '.json', '.sql', '.xml', '.yaml', '.yml',
+  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg'
+])
+
+function isAllowedChatAttachment(f) {
+  if (!f) return false
+  if (f.type && (
+    f.type.startsWith('image/') ||
+    DOCUMENT_TYPES.has(f.type) ||
+    f.type.includes('word') ||
+    f.type.includes('excel') ||
+    f.type.includes('spreadsheet') ||
+    f.type.includes('csv') ||
+    f.type.startsWith('text/')
+  )) return true
+
+  const name = (f.name || '').toLowerCase()
+  const dotIdx = name.lastIndexOf('.')
+  const ext = dotIdx !== -1 ? name.slice(dotIdx) : ''
+  return ALLOWED_CHAT_EXTENSIONS.has(ext)
+}
+
+const MAX_ATTACHMENTS = 10
 
 
 
@@ -541,6 +560,7 @@ export default function Chat() {
   const trialRemainingMs = useTrialCountdown(user?.trialActive ? user.trialExpiresAt : null)
 
   const autoSentRef = useRef(false)
+  const initialSendTriggeredRef = useRef(false)
 
 
 
@@ -567,6 +587,7 @@ export default function Chat() {
   const [stagedFiles, setStagedFiles] = useState([]) // [{ file, previewUrl }]
 
   const [selectedElement, setSelectedElement] = useState(null)
+  const activeViewContextRef = useRef(null)
 
   const [input, setInput] = useState('')
 
@@ -579,6 +600,7 @@ export default function Chat() {
   const [loading, setLoading] = useState(true)
 
   const [sending, setSending] = useState(false)
+  const [messageQueue, setMessageQueue] = useState([])
 
 
 
@@ -623,6 +645,7 @@ export default function Chat() {
   const [error, setError] = useState(null)
 
   const [activity, setActivity] = useState([])
+  const [activityDescription, setActivityDescription] = useState(null)
 
   // Turno del agente que arrancó SOLO en el servidor (ej. "conectar el código" después de
 
@@ -643,6 +666,7 @@ export default function Chat() {
   const [showPreview, setShowPreview] = useState(true)
 
   const [rightView, setRightView] = useState('preview')
+  const [codeRevisionKey, setCodeRevisionKey] = useState(0)
 
 
 
@@ -699,6 +723,7 @@ export default function Chat() {
   const [showHistory, setShowHistory] = useState(false)
 
   const [showSettings, setShowSettings] = useState(false)
+  const [showPublishPopover, setShowPublishPopover] = useState(false)
 
   const [showMore, setShowMore] = useState(false)
 
@@ -782,6 +807,24 @@ export default function Chat() {
   const [previewViewport, setPreviewViewport] = useState('desktop')
 
   const [autoFixing, setAutoFixing] = useState(false)
+  const [runtimeCrash, setRuntimeCrash] = useState(null)
+  const autoFixTimeoutRef = useRef(null)
+  const autoFixCountRef = useRef(0)
+  const MAX_AUTO_FIX_PER_USER_MSG = 2
+
+  // Fail-Safe: Nunca permitir que autoFixing quede atascado en true por más de 45 segundos
+  useEffect(() => {
+    if (autoFixing) {
+      clearTimeout(autoFixTimeoutRef.current)
+      autoFixTimeoutRef.current = setTimeout(() => {
+        console.warn('[AutoFix] Safety timeout alcanzado (45s). Reseteando autoFixing...')
+        setAutoFixing(false)
+      }, 45000)
+    } else {
+      clearTimeout(autoFixTimeoutRef.current)
+    }
+    return () => clearTimeout(autoFixTimeoutRef.current)
+  }, [autoFixing])
 
   const [previewCurrentPath, setPreviewCurrentPath] = useState('/')
 
@@ -881,6 +924,9 @@ export default function Chat() {
 
         if (cancelled) return
 
+        if (data.project) {
+          setProject(prev => prev ? ({ ...prev, ...data.project }) : data.project)
+        }
         setMessages(data.messages)
 
         setChanges(data.changes)
@@ -896,9 +942,7 @@ export default function Chat() {
         oldestCursorRef.current = data.oldestCursor
 
       } catch (err) {
-
-        if (!cancelled) setError(err.message)
-
+        if (!cancelled && !isUnloading() && err?.name !== 'AbortError') setError(err.message)
       } finally {
 
         if (!cancelled) setLoading(false)
@@ -967,7 +1011,7 @@ export default function Chat() {
 
     try {
 
-      const s = await api.previewStatus()
+      const s = await api.previewStatus(projectId)
 
       setPreviewStatus(s)
 
@@ -981,7 +1025,7 @@ export default function Chat() {
 
     }
 
-  }, [])
+  }, [projectId])
 
 
 
@@ -1009,6 +1053,23 @@ export default function Chat() {
 
     }
 
+  }, [projectId, previewPoll])
+
+  const [restartingContainer, setRestartingContainer] = useState(false)
+
+  const handleRestartContainer = useCallback(async () => {
+    if (!projectId) return
+    setRestartingContainer(true)
+    setPreviewError(null)
+    try {
+      const s = await api.restartPreview(projectId)
+      setPreviewStatus(s)
+      previewPollRef.current = setTimeout(previewPoll, 2000)
+    } catch (err) {
+      setPreviewError(err.detail ? `${err.message}: ${err.detail}` : err.message)
+    } finally {
+      setRestartingContainer(false)
+    }
   }, [projectId, previewPoll])
 
 
@@ -1090,11 +1151,10 @@ export default function Chat() {
 
 
   useEffect(() => {
-
     if (previewStatus?.status === 'running') {
-
       wakeAttemptRef.current = 0
-
+      setPreviewError(null)
+      setAutoFixing(false)
     }
 
     if (previewStatus?.status === 'idle' && !previewStarting && wakeAttemptRef.current < 2) {
@@ -1120,36 +1180,105 @@ export default function Chat() {
 
 
     // Auto-healing silencioso: si falla, intentar arreglar sin preguntar
+    // NO disparar auto-fix en errores de timeout, puertos, o fallas de infraestructura del VPS,
+    // a menos que en los logs de arranque (lastBootErrorLog) haya un error real de compilación o importación de Vite/Rollup.
+    const errStr = String(previewStatus?.error || '').toLowerCase()
+    const bootLog = String(previewStatus?.lastBootErrorLog || '')
+
+    const hasViteBootError =
+      bootLog.includes('[vite]') ||
+      bootLog.includes('Failed to resolve import') ||
+      bootLog.includes('SyntaxError') ||
+      bootLog.includes('ERR_MODULE_NOT_FOUND') ||
+      bootLog.includes('RollupError') ||
+      bootLog.includes('Transform failed') ||
+      bootLog.includes('parse5 error') ||
+      bootLog.includes('Internal server error')
+
+    const isInfraOrTimeout =
+      !hasViteBootError && (
+        errStr.includes('tiempo de espera') ||
+        errStr.includes('timeout') ||
+        errStr.includes('502') ||
+        errStr.includes('504') ||
+        errStr.includes('econrefused') ||
+        errStr.includes('orquestador')
+      )
 
     if (
-
       previewStatus?.status === 'error' &&
-
       previewStatus?.repoFullName === project?.repoFullName &&
-
+      !isInfraOrTimeout &&
       !autoFixing &&
-
       mode !== 'plan'
-
     ) {
-
-      setAutoFixing(true)
-
-      api.autoFixPreview(conversationId, previewStatus.error, previewStatus.logsTail)// .catch(() => {})
+      if (autoFixCountRef.current >= MAX_AUTO_FIX_PER_USER_MSG) {
+        console.warn(`[AutoFix] Circuit Breaker: Límite de ${MAX_AUTO_FIX_PER_USER_MSG} auto-correcciones consecutivas alcanzado.`);
+        return;
+      }
+      autoFixCountRef.current += 1;
+      setAutoFixing(true);
+      const effectiveError = hasViteBootError
+        ? (previewStatus.error + ' (Error de compilación Vite detectado)')
+        : previewStatus.error
+      const effectiveLogs = previewStatus.lastBootErrorLog || previewStatus.logsTail || ''
+      api.autoFixPreview(conversationId, effectiveError, effectiveLogs)
+        .catch((err) => {
+          console.error('[autoFixPreview] Error triggering auto fix:', err)
+          setAutoFixing(false)
+        })
 
       // Hacemos poll igual para ir viendo cuando se levante o cambie de estado
-
       clearTimeout(previewPollRef.current)
-
       previewPollRef.current = setTimeout(previewPoll, 3000)
-
     } else if (previewStatus?.status !== 'error') {
-
       setAutoFixing(false)
-
+      autoFixCountRef.current = 0
     }
-
   }, [previewStatus, project, conversationId, mode, autoFixing, previewPoll])
+
+  // Escuchar eventos PREVIEW_RUNTIME_ERROR y FLOWPRO_RUNTIME_ERROR desde el iframe del preview
+  useEffect(() => {
+    const handleMessage = (event) => {
+      const origin = event.origin || '';
+      const isAllowedOrigin = !origin || origin === 'null' || origin.endsWith('.flow-pro.online') || origin.includes('localhost') || origin.includes('127.0.0.1') || origin.includes('130.51.22.140');
+      if (!isAllowedOrigin) return;
+
+      if (event.data?.type === 'PREVIEW_RUNTIME_ERROR' || event.data?.type === 'FLOWPRO_RUNTIME_ERROR') {
+        const payload = event.data.payload || event.data || {};
+        const errMsg = payload.message || 'Error en tiempo de ejecución de React/Vite';
+        const filename = payload.filename || '';
+        const lineno = payload.lineno || 0;
+        const stack = payload.stack || '';
+
+        console.warn('[PREVIEW_RUNTIME_ERROR] Runtime error en preview iframe:', { errMsg, filename, lineno, stack });
+
+        if (!autoTurnActive && !sending && !autoFixing && conversationId && mode !== 'plan') {
+          if (autoFixCountRef.current < MAX_AUTO_FIX_PER_USER_MSG) {
+            autoFixCountRef.current += 1;
+            setAutoFixing(true);
+            setRuntimeCrash(null);
+            const errDetail = stack ? `${errMsg}\nStack: ${stack}` : errMsg;
+            api.autoFixPreview(conversationId, errMsg, errDetail, { filename, lineno, stack }).catch(() => {});
+            clearTimeout(previewPollRef.current);
+            previewPollRef.current = setTimeout(previewPoll, 3000);
+          } else {
+            console.warn(`[AutoFix] Circuit Breaker: Límite de ${MAX_AUTO_FIX_PER_USER_MSG} auto-correcciones alcanzado. Mostrando modal/overlay de error.`);
+            setAutoFixing(false);
+            setRuntimeCrash({
+              message: errMsg,
+              filename,
+              lineno,
+              stack
+            });
+          }
+        }
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [conversationId, autoTurnActive, sending, autoFixing, mode, previewPoll]);
 
 
 
@@ -1178,56 +1307,74 @@ export default function Chat() {
   // usuario hace clic en un elemento — acá lo recibimos.
 
   const previewToggleSelectMode = () => {
-
     const next = !previewSelectMode
-
     setPreviewSelectMode(next)
-
-    previewIframeRef.current?.contentWindow?.postMessage({ type: 'gitflow:select-mode', enabled: next }, previewStatus?.url || '*')
-
+    try {
+      previewIframeRef.current?.contentWindow?.postMessage({ type: 'gitflow:select-mode', enabled: next }, '*')
+      previewIframeRef.current?.contentWindow?.postMessage({ type: 'FLOWPRO_TOGGLE_SELECTOR', active: next }, '*')
+    } catch (_) {}
   }
 
-
-
   useEffect(() => {
-
     setPreviewSelectMode(false)
-
   }, [previewReloadKey])
 
-
-
   useEffect(() => {
-
-    if (!previewStatus?.url) return
-
-    const previewOrigin = new URL(previewStatus.url).origin
-
     const onMessage = (e) => {
+      if (previewStatus?.url) {
+        try {
+          const previewOrigin = new URL(previewStatus.url).origin
+          if (e.origin !== previewOrigin && !e.origin.includes('flow-pro.online') && !e.origin.includes('localhost') && !e.origin.includes('127.0.0.1')) {
+            return
+          }
+        } catch (_) {}
+      }
 
-      if (e.origin !== previewOrigin) return
-
-      if (e.data?.type === 'gitflow:selected') {
-
+      if (e.data?.type === 'gitflow:selected' || e.data?.type === 'FLOWPRO_SELECTED_ELEMENT') {
         setPreviewSelectMode(false)
-
         setSelectedElement(e.data.payload)
+      }
 
+      if (e.data?.type === 'gitflow:select-mode') {
+        setPreviewSelectMode(Boolean(e.data.enabled))
+      }
+
+      if (e.data?.type === 'FLOWPRO_TOGGLE_SELECTOR') {
+        setPreviewSelectMode(Boolean(e.data.active))
+      }
+
+      if (e.data?.type === 'FLOWPRO_ACTIVE_VIEW_CONTEXT' && e.data.context) {
+        activeViewContextRef.current = e.data.context
       }
 
       if (e.data?.type === 'gitflow:navigated' && typeof e.data.path === 'string') {
-
         setPreviewDisplayPath(e.data.path)
-
       }
-
     }
 
     window.addEventListener('message', onMessage)
-
     return () => window.removeEventListener('message', onMessage)
-
   }, [previewStatus?.url])
+
+  // Atajos globales: Alt + S para activar/desactivar inspector, Escape para cancelar
+  useEffect(() => {
+    const handleGlobalKeys = (e) => {
+      if (e.altKey && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault()
+        previewToggleSelectMode()
+      } else if (e.key === 'Escape') {
+        if (previewSelectMode) {
+          e.preventDefault()
+          previewToggleSelectMode()
+        } else if (selectedElement) {
+          e.preventDefault()
+          setSelectedElement(null)
+        }
+      }
+    }
+    window.addEventListener('keydown', handleGlobalKeys)
+    return () => window.removeEventListener('keydown', handleGlobalKeys)
+  }, [previewSelectMode, selectedElement])
 
 
 
@@ -1249,7 +1396,7 @@ export default function Chat() {
 
   const previewIframeSrc = previewStatus?.url
 
-    ? `${previewStatus.url}${previewCurrentPath}${previewCurrentPath.includes('?') ? '&' : '?'}t=${Date.now()}${
+    ? `${previewStatus.url}${previewCurrentPath}${previewCurrentPath.includes('?') ? '&' : '?'}t=${previewReloadKey}${
 
         previewStatus.previewToken ? `&_pt=${encodeURIComponent(previewStatus.previewToken)}` : ''
 
@@ -1394,22 +1541,19 @@ export default function Chat() {
 
 
   useEffect(() => {
-
     const initialPrompt = location.state?.initialPrompt
+    const initialAttachments = location.state?.initialAttachments || getPendingAttachments(projectId)
 
-    const initialAttachments = location.state?.initialAttachments
-
-    if (!loading && !autoSentRef.current && initialPrompt && messages.length === 0 && conversationId) {
-
+    if (!loading && !initialSendTriggeredRef.current && !autoSentRef.current && initialPrompt && messages.length === 0 && conversationId) {
+      initialSendTriggeredRef.current = true
       autoSentRef.current = true
-
+      clearPendingAttachments(projectId)
+      // Limpiar el estado para que un F5 no vuelva a enviar el mismo mensaje
+      window.history.replaceState({}, document.title)
       send(undefined, initialPrompt, initialAttachments?.length ? initialAttachments : undefined)
-
     }
-
     // eslint-disable-next-line react-hooks/exhaustive-deps
-
-  }, [loading, messages.length, conversationId])
+  }, [loading, messages.length, conversationId, projectId])
 
 
 
@@ -1429,17 +1573,47 @@ export default function Chat() {
 
 
 
-  const send = async (e, overrideContent, overrideFiles, dummyMode, agentId) => {
+  const send = async (e, overrideContent, overrideFiles, dummyMode, agentId, overrideElementContext) => {
     e?.preventDefault()
     let content = overrideContent ?? input.trim()
-    const files = overrideFiles ?? stagedFiles.map((s) => s.file)
-    const elementContext = selectedElement
+    const rawFiles = overrideFiles ?? stagedFiles
+    const files = (rawFiles || []).map(f => (f instanceof File || f instanceof Blob) ? f : (f?.file || f)).filter(Boolean)
+    const rawElementContext = overrideElementContext !== undefined ? overrideElementContext : selectedElement
+    const elementContext = rawElementContext ? {
+      ...rawElementContext,
+      currentClasses: rawElementContext.currentClasses || rawElementContext.className || ''
+    } : null
+    const activeViewContext = activeViewContextRef.current
 
-    if ((!content && files.length === 0) || sending || autoTurnActive || !conversationId) return
+    if ((!content && files.length === 0) || !conversationId) return
+
+    const stableId = "userMessage:" + (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID().replaceAll("-", "").slice(0, 8) : Math.random().toString(36).slice(2, 10));
+
+    if (sending || autoTurnActive) {
+      const queuedItem = {
+        id: stableId,
+        text: content,
+        content,
+        files,
+        mode: mode || 'build',
+        agentId: agentId || null,
+        elementContext,
+        activeViewContext,
+        createdAt: new Date().toISOString(),
+      };
+      setMessageQueue(prev => [...prev, queuedItem]);
+      api.enqueueMessage(conversationId, queuedItem).catch(() => {});
+      setInput('');
+      setStagedFiles([]);
+      return;
+    }
 
     // Save previous state for rollback
     const previousInput = input;
     const previousStagedFiles = [...stagedFiles];
+
+    autoFixCountRef.current = 0
+    setRuntimeCrash(null)
 
     setInput('')
     setStagedFiles([])
@@ -1449,7 +1623,7 @@ export default function Chat() {
 
     setMessages((prev) => [
       ...prev,
-      { id: `tmp-${Date.now()}`, role: 'user', content: content || files.map((f) => `?? ${f.name}`).join(' ') },
+      { id: stableId, role: 'user', content: content || files.map((f) => '📎 ' + f.name).join(' ') },
     ])
 
     const controller = new AbortController()
@@ -1458,12 +1632,25 @@ export default function Chat() {
     try {
 
       const onEvent = (event, data) => {
+        if (data && data.type === 'project_updated' && data.project) {
+          setProject(prev => prev ? ({ ...prev, ...data.project }) : data.project)
+        }
+        if (data && data.type === 'build_applied') {
+          setPreviewError(null)
+          setAutoFixing(false)
+          setPreviewReloadKey(k => k + 1)
+          previewPoll()
+        }
+        if (data && data.type === 'activity_description') {
+          setActivityDescription(data.description ?? null)
+        }
         setActivity(prev => [...prev, data])
       }
       setActivity([])
+      setActivityDescription('Analizando la estructura del proyecto...')
       const result = files.length > 0
-        ? await api.sendMessageWithAttachments(conversationId, content, files, controller.signal, mode, elementContext, agentId, onEvent)
-        : await api.sendMessage(conversationId, content, controller.signal, mode, elementContext, agentId, onEvent)
+        ? await api.sendMessageWithAttachments(conversationId, content, files, controller.signal, mode, elementContext, agentId, onEvent, activeViewContext)
+        : await api.sendMessage(conversationId, content, controller.signal, mode, elementContext, agentId, onEvent, activeViewContext)
       
       // If the backend returns a DATABASE_BACKUP JSON directly (because it's a migration zip)
       if (result && result.type === 'DATABASE_BACKUP') {
@@ -1492,14 +1679,50 @@ export default function Chat() {
         return;
       }
 
-      setMessages((prev) => [...prev.filter((m) => !m.id.startsWith('tmp-')), result?.userMessage, result?.assistantMessage].filter(Boolean))
+      if (result && result.project) {
+        setProject(prev => prev ? ({ ...prev, ...result.project }) : result.project)
+      }
+      setMessages((prev) => {
+        const withoutTmp = prev.filter((m) => m.id !== stableId && !m.id.startsWith('tmp-'));
+        const toAdd = [];
+        if (result?.userMessage && !withoutTmp.some((m) => m.id === result.userMessage.id)) {
+          toAdd.push(result.userMessage);
+        }
+        if (result?.assistantMessage && !withoutTmp.some((m) => m.id === result.assistantMessage.id)) {
+          toAdd.push(result.assistantMessage);
+        }
+        return [...withoutTmp, ...toAdd];
+      })
       if (result.dbChanges?.length) setDbChanges((prev) => [...prev, ...result.dbChanges])
         if (result.changes?.length) setChanges((prev) => [...prev, ...result.changes])
         if (result.assetChanges?.length) setAssetChanges((prev) => [...prev, ...result.assetChanges])
         if (result.edgeFunctionChanges?.length) setEdgeFunctionChanges((prev) => [...prev, ...result.edgeFunctionChanges])
       if (result.autoTurn) setAutoTurnActive(true)
+      setCodeRevisionKey((k) => k + 1)
     } catch (err) {
-      if (err.name === 'AbortError') return
+      const isExplicitCancel = Boolean(controller.signal?.aborted);
+      if (isExplicitCancel || isUnloading()) return;
+
+      // Si el error contiene "Request was aborted" o "AbortError" pero NO fue cancelación explícita del usuario,
+      // intentamos recuperar el turno por polling en vez de reventar la UI con cartel rojo
+      if (/aborted|timeout|cancelado/i.test(err?.message || '') && conversationId) {
+        console.warn('[Chat.jsx] AbortError/Timeout no explícito capturado en send(). Intentando auto-recuperar turno...');
+        try {
+          const recovered = await api.recoverTurn(conversationId);
+          if (recovered?.assistantMessage) {
+            setMessages((prev) => [...prev.filter((m) => !m.id.startsWith('tmp-')), recovered.userMessage, recovered.assistantMessage].filter(Boolean));
+            if (recovered.dbChanges?.length) setDbChanges((prev) => [...prev, ...recovered.dbChanges]);
+            if (recovered.changes?.length) setChanges((prev) => [...prev, ...recovered.changes]);
+            if (recovered.assetChanges?.length) setAssetChanges((prev) => [...prev, ...recovered.assetChanges]);
+            if (recovered.edgeFunctionChanges?.length) setEdgeFunctionChanges((prev) => [...prev, ...recovered.edgeFunctionChanges]);
+            setCodeRevisionKey((k) => k + 1);
+            return;
+          }
+        } catch (recoverErr) {
+          console.warn('[Chat.jsx] No se pudo recuperar turno tras aborto no explícito:', recoverErr.message);
+        }
+      }
+
       setError(err.message || 'Error al enviar mensaje')
       setMessages((prev) => prev.filter((m) => !m.id.startsWith('tmp-')))
       
@@ -1509,12 +1732,121 @@ export default function Chat() {
       throw err;
     } finally {
       setSending(false)
+      setActivityDescription(null)
       abortRef.current = null
       setTimeout(() => {
         window.dispatchEvent(new CustomEvent('chat-action', { detail: { action: 'snapshot' } }))
       }, 300)
+      // Drenar siguiente mensaje en cola si existe
+      setMessageQueue(prev => {
+        if (prev.length > 0) {
+          const nextItem = prev[0];
+          const remaining = prev.slice(1);
+          if (conversationId && nextItem.id) {
+            api.deleteQueuedMessage(conversationId, nextItem.id).catch(() => {});
+          }
+          setTimeout(() => {
+            send(null, nextItem.text || nextItem.content, nextItem.files, nextItem.mode, nextItem.agentId, nextItem.elementContext);
+          }, 350);
+          return remaining;
+        }
+        return prev;
+      });
     }
   }
+
+  const handleStopGeneration = useCallback(async () => {
+    setActivityDescription(null);
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+    if (conversationId) {
+      try {
+        await api.stopConversation(conversationId);
+      } catch (err) {
+        console.warn('Error deteniendo turno en backend:', err.message);
+      }
+    }
+    setSending(false);
+    setAutoTurnActive(false);
+  }, [conversationId]);
+
+  
+  const handleRestoreTrajectory = async (messageId, commitSha) => {
+    try {
+      const res = await api.revertTrajectory(projectId, { messageId, commitSha });
+      if (res?.ok) {
+        const data = await api.conversationMessages(conversationId, { limit: MESSAGE_PAGE_SIZE });
+        if (data?.messages) {
+          setMessages(data.messages);
+        }
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('flowpro:preview-refresh'));
+        }
+      }
+    } catch (err) {
+      console.error('Error al revertir trayectoria:', err);
+    }
+  };
+
+  const handleApprovePlan = async (messageId, plan) => {
+    try {
+      await api.respondTool(conversationId, { approval_status: 'approved' });
+      setMessages(prev => prev.map(m => {
+        if (m.id === messageId) {
+          const actions = (m.actions || []).map(a => a.type === 'plan' ? { ...a, status: 'approved' } : a);
+          return { ...m, actions };
+        }
+        return m;
+      }));
+      setAutoTurnActive(true);
+    } catch (err) {
+      console.error('Error aprobando plan:', err);
+    }
+  };
+
+  const handleAdjustPlan = async (messageId, plan, feedback) => {
+    try {
+      await api.respondTool(conversationId, { approval_status: 'rejected', feedback });
+      setMessages(prev => prev.map(m => {
+        if (m.id === messageId) {
+          const actions = (m.actions || []).map(a => a.type === 'plan' ? { ...a, status: 'rejected', feedback } : a);
+          return { ...m, actions };
+        }
+        return m;
+      }));
+      setAutoTurnActive(true);
+    } catch (err) {
+      console.error('Error ajustando plan:', err);
+    }
+  };
+
+  const handleExecuteQueueItemNow = async (item, idx) => {
+    setMessageQueue(prev => prev.filter((_, i) => i !== idx));
+    if (conversationId && item.id) {
+      api.deleteQueuedMessage(conversationId, item.id).catch(() => {});
+    }
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+    if (conversationId) {
+      try {
+        await api.abortTurn(conversationId);
+      } catch (_) {}
+    }
+    setSending(false);
+    setAutoTurnActive(false);
+    setTimeout(() => {
+      send(null, item.text || item.content, item.files, item.mode, item.agentId, item.elementContext);
+    }, 350);
+  };
+
+  const handleDeleteQueueItem = async (queueId, idx) => {
+    setMessageQueue(prev => prev.filter((item, i) => item.id !== queueId && i !== idx));
+    if (conversationId && queueId) {
+      api.deleteQueuedMessage(conversationId, queueId).catch(() => {});
+    }
+  };
 
   const handleIncomingFiles = async (fileList) => {
 
@@ -1585,9 +1917,9 @@ export default function Chat() {
           }
 
         } catch (e) {
-
-          setError(e.message)
-
+          if (!isUnloading() && e?.name !== 'AbortError') {
+            setError(e.message)
+          }
         } finally {
 
           setUploading(false)
@@ -1644,9 +1976,9 @@ export default function Chat() {
           setRightView('more')
 
         } else {
-
-          setError(err.detail ? `${err.message}: ${err.detail}` : err.message)
-
+          if (!isUnloading() && err?.name !== 'AbortError') {
+            setError(err.detail ? `${err.message}: ${err.detail}` : err.message)
+          }
         }
 
       } finally {
@@ -1661,11 +1993,11 @@ export default function Chat() {
 
 
 
-    const invalid = files.some((f) => !f.type.startsWith('image/') && f.type !== 'application/pdf' && !DOCUMENT_TYPES.has(f.type))
+    const invalid = files.some((f) => !isAllowedChatAttachment(f))
 
     if (invalid) {
 
-      setError('Solo se pueden adjuntar imágenes, PDF, Word o Excel (para importar una base de datos, soltá un único .sql o .zip)')
+      setError('Solo se admiten imágenes, documentos (.docx, .pdf), planillas (.xlsx, .csv), código o texto plano (.txt, .json, .sql)')
 
       return
 
@@ -1814,6 +2146,8 @@ export default function Chat() {
 
     closeInspectOverlay('code', id)
 
+    setCodeRevisionKey((k) => k + 1)
+
   }
 
   const reject = async (id) => {
@@ -1849,6 +2183,8 @@ export default function Chat() {
     }
 
     appendFollowUp(result.followUpMessage)
+
+    setCodeRevisionKey((k) => k + 1)
 
   }
 
@@ -1934,6 +2270,31 @@ export default function Chat() {
 
     if (opts?.autoTurn) setAutoTurnActive(true)
 
+  }
+
+  const handleQuickEdit = async (payload) => {
+    if (!project?.id) return
+    try {
+      const res = await api.quickEditProject(project.id, payload)
+      if (res?.status === 'APPLIED_DIRECTLY') {
+        setPreviewReloadKey((k) => k + 1)
+        setSelectedElement(null)
+        setCodeRevisionKey((k) => k + 1)
+      } else if (res?.status === 'FALLBACK_REQUIRED') {
+        const instruction = payload.action === 'edit_text'
+          ? `Cambia el texto del elemento seleccionado a: "${payload.newText}"`
+          : `Modifica los estilos del elemento seleccionado con las siguientes clases Tailwind: "${payload.newClasses}"`
+        send(null, instruction, undefined, undefined, undefined, payload.elementContext)
+        setSelectedElement(null)
+      }
+    } catch (err) {
+      console.error('[quickEdit] Error al aplicar edición rápida:', err)
+      const instruction = payload.action === 'edit_text'
+        ? `Cambia el texto del elemento seleccionado a: "${payload.newText}"`
+        : `Modifica los estilos del elemento seleccionado con las siguientes clases Tailwind: "${payload.newClasses}"`
+      send(null, instruction, undefined, undefined, undefined, payload.elementContext)
+      setSelectedElement(null)
+    }
   }
 
 
@@ -2158,7 +2519,7 @@ export default function Chat() {
 
             <span className="max-w-[16rem] truncate text-[15px] font-semibold text-white/90">
 
-              {project?.name || 'Cargando...'}
+              {getProjectDisplayName(project)}
 
             </span>
 
@@ -2186,28 +2547,66 @@ export default function Chat() {
 
 
 
-        {/* CENTER GROUP */}
+        {/* CENTER GROUP: Compact Pill Estilo Lovable (Sin recortes ni 'ista previa') */}
 
-        <div className="flex-1 flex justify-center overflow-x-auto [&::-webkit-scrollbar]:hidden">
+        <div className="flex-1 flex justify-center overflow-x-auto [&::-webkit-scrollbar]:hidden px-2">
 
-          <div className="flex bg-[#222] border border-white/5 p-1 rounded-full items-center shadow-inner shrink-0">
+          <div className="flex bg-[#222] border border-white/10 p-1 rounded-full items-center shadow-inner shrink-0 gap-1">
 
-            <button onClick={() => { setRightView('preview'); setShowPreview(true); }} className={`flex items-center gap-2 px-4 py-1.5 rounded-full text-[13px] font-medium transition-all ${rightView === 'preview' && showPreview ? 'bg-[#3b59b8] text-white shadow-md' : 'text-white/60 hover:text-white hover:bg-white/5'}`}>
-
-              <Globe className="size-4" /> <span>Vista previa</span>
-
+            {/* Vista previa */}
+            <button
+              onClick={() => { setRightView('preview'); setShowPreview(true); }}
+              title="Vista previa"
+              className={`flex items-center gap-1.5 rounded-full text-xs font-medium transition-all ${
+                rightView === 'preview' && showPreview
+                  ? 'bg-blue-600 text-white px-3 py-1 shadow-sm'
+                  : 'p-1.5 text-white/60 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Globe className="size-3.5" />
+              {rightView === 'preview' && showPreview && <span>Vista previa</span>}
             </button>
 
-            <button onClick={() => { setRightView('code'); setShowPreview(true); }} className={`flex items-center justify-center px-4 py-1.5 rounded-full text-[13px] font-medium transition-all ${rightView === 'code' && showPreview ? 'bg-white/10 text-white shadow-md' : 'text-white/60 hover:text-white hover:bg-white/5'}`}>
-
-              <FileCode2 className="size-4" />
-
+            {/* Código */}
+            <button
+              onClick={() => { setRightView('code'); setShowPreview(true); }}
+              title="Código"
+              className={`flex items-center gap-1.5 rounded-full text-xs font-medium transition-all ${
+                rightView === 'code' && showPreview
+                  ? 'bg-blue-600 text-white px-3 py-1 shadow-sm'
+                  : 'p-1.5 text-white/60 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <FileCode2 className="size-3.5" />
+              {rightView === 'code' && showPreview && <span>Código</span>}
             </button>
 
-            <button onClick={() => { setMoreInitialTab('functions'); setRightView('more'); }} className={`flex items-center justify-center px-4 py-1.5 rounded-full text-[13px] font-medium transition-all ${rightView === 'more' ? 'bg-white/10 text-white shadow-md' : 'text-white/60 hover:text-white hover:bg-white/5'}`}>
+            {/* Base de datos */}
+            <button
+              onClick={() => { setRightView('database'); setShowPreview(true); }}
+              title="Base de datos"
+              className={`flex items-center gap-1.5 rounded-full text-xs font-medium transition-all ${
+                rightView === 'database' && showPreview
+                  ? 'bg-blue-600 text-white px-3 py-1 shadow-sm'
+                  : 'p-1.5 text-white/60 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Database className="size-3.5" />
+              {rightView === 'database' && showPreview && <span>Base de datos</span>}
+            </button>
 
-              <Layers className="size-4" />
-
+            {/* Más */}
+            <button
+              onClick={() => { setMoreInitialTab('functions'); setRightView('more'); setShowPreview(true); }}
+              title="Más"
+              className={`flex items-center gap-1.5 rounded-full text-xs font-medium transition-all ${
+                rightView === 'more' && showPreview
+                  ? 'bg-blue-600 text-white px-3 py-1 shadow-sm'
+                  : 'p-1.5 text-white/60 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Layers className="size-3.5" />
+              {rightView === 'more' && showPreview && <span>Más</span>}
             </button>
 
           </div>
@@ -2223,11 +2622,22 @@ export default function Chat() {
           {rightView === 'preview' && showPreview && project && (
 
             <>
+              {/* Selector de Elementos Visual (Click-to-Edit) */}
+              <button
+                type="button"
+                onClick={previewToggleSelectMode}
+                className={`flex size-8 shrink-0 items-center justify-center rounded-md transition-all ${
+                  previewSelectMode
+                    ? 'bg-primary text-slate-900 shadow-[0_0_15px_rgba(139,92,246,0.6)] font-bold ring-2 ring-primary/50'
+                    : 'text-white/50 hover:bg-white/10 hover:text-white'
+                }`}
+                title={previewSelectMode ? 'Desactivar selector visual' : 'Seleccionar elemento visual para editar (Click-to-Edit)'}
+              >
+                <MousePointerClick className="size-4" />
+              </button>
 
               <button onClick={() => setPreviewViewport(previewViewport === 'desktop' ? 'mobile' : 'desktop')} className="flex size-8 shrink-0 items-center justify-center rounded-md text-white/50 hover:bg-white/10 hover:text-white transition-colors" title="Cambiar vista">
-
                 {previewViewport === 'desktop' ? <Monitor className="size-4" /> : <Smartphone className="size-4" />}
-
               </button>
 
               <div className="flex relative shrink min-w-[200px]">
@@ -2378,11 +2788,27 @@ export default function Chat() {
 
 
 
-          <button onClick={() => setShowSettings(true)} className="hidden lg:flex items-center gap-1.5 px-4 py-1.5 rounded-full bg-white/10 text-[13px] font-medium text-white hover:bg-white/20 transition-colors ml-1">
-
-            Publicar
-
+          <button 
+            onClick={() => setShowPublishPopover(v => !v)} 
+            className="hidden lg:flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-sm transition-colors ml-1"
+          >
+            <span className="size-1.5 rounded-full bg-white animate-pulse"></span>
+            <span>Publicar</span>
           </button>
+
+          {showPublishPopover && (
+            <PublishPopover
+              project={project}
+              onClose={() => setShowPublishPopover(false)}
+              onOpenDomains={() => {
+                setShowPublishPopover(false);
+                setMoreInitialTab('settings');
+                setRightView('more');
+                setShowPreview(true);
+              }}
+              onProjectUpdated={(up) => setProject(p => ({ ...p, ...up }))}
+            />
+          )}
 
         </div>
 
@@ -2570,6 +2996,12 @@ export default function Chat() {
 
             </button>
 
+            <button onClick={() => { setRightView('database') }} className={`flex items-center justify-center size-9 rounded-full transition-colors shrink-0 ${rightView === 'database' ? 'bg-[#3b59b8] text-white' : 'bg-white/5 text-white/70 hover:text-white'}`}>
+
+              <Database className="size-4" />
+
+            </button>
+
           </div>
 
         </div>
@@ -2602,7 +3034,10 @@ export default function Chat() {
 
           onClose={() => setShowHistory(false)}
 
-          onRestored={() => setHistoryKey(k => k + 1)}
+          onRestored={() => {
+            setHistoryKey(k => k + 1)
+            setCodeRevisionKey(k => k + 1)
+          }}
 
         />
 
@@ -2720,7 +3155,26 @@ export default function Chat() {
 
                   <div className="max-w-[85%] sm:max-w-[70%] w-fit min-w-[3rem] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-zinc-800 text-zinc-100 text-[14px] leading-relaxed break-words whitespace-pre-wrap select-text shadow-sm prose prose-invert prose-p:my-0 prose-img:rounded-xl prose-img:max-h-64 prose-img:object-cover">
 
-                    <ReactMarkdown>{msg.content || ''}</ReactMarkdown>
+                    <ReactMarkdown
+                      components={{
+                        pre: ({ children }) => <>{children}</>,
+                        code: ({ node, inline, className, children, ...props }) => {
+                          const match = /language-(\w+)/.exec(className || '');
+                          const lang = match ? match[1] : '';
+                          const codeString = String(children || '').replace(/\n$/, '');
+                          if (inline || (!match && !codeString.includes('\n'))) {
+                            return (
+                              <code className="px-1.5 py-0.5 rounded bg-zinc-800/80 text-zinc-200 font-mono text-[12.5px] border border-white/5" {...props}>
+                                {children}
+                              </code>
+                            );
+                          }
+                          return <CodeBlock language={lang || 'text'} code={codeString} />;
+                        }
+                      }}
+                    >
+                      {msg.content || ''}
+                    </ReactMarkdown>
 
                   </div>
 
@@ -2744,9 +3198,23 @@ export default function Chat() {
 
                 telemetry={msg.actions?.filter(a => a.type === 'telemetry')}
 
-                modifiedFiles={Array.from(new Set(changes.filter(c => c.message_id === msg.id).map(c => c.path)))}
+                modifiedFiles={[
+                  ...Array.from(new Set(changes.filter(c => c.message_id === msg.id).map(c => c.path))),
+                  ...Array.from(new Set(assetChanges.filter(c => c.message_id === msg.id).map(c => c.path)))
+                ]}
+
+                dbChanges={dbChanges.filter(c => c.message_id === msg.id)}
 
                 currentProjectPreviewUrl={previewStatus?.url}
+                onRestoreVersion={handleRestoreTrajectory}
+                onApprovePlan={handleApprovePlan}
+                onAdjustPlan={handleAdjustPlan}
+
+                onViewDiff={(targetPath) => {
+                  const p = typeof targetPath === 'string' ? targetPath : targetPath?.path;
+                  const change = changes.find(c => c.path === p) || { path: p, new_content: '' };
+                  setInspectOverlay({ kind: 'code', change });
+                }}
 
               >
 
@@ -2835,7 +3303,10 @@ export default function Chat() {
                   )}
 
                   {(() => {
-
+                    // En modo Build NUNCA se muestran tarjetas sueltas de aprobación (Paridad Estricta Lovable)
+                    if (mode === 'build') {
+                      return null;
+                    }
                     const msgChanges = changes.filter((c) => c.message_id === msg.id)
 
                     const msgDbChanges = dbChanges.filter((c) => c.message_id === msg.id)
@@ -2852,25 +3323,18 @@ export default function Chat() {
 
                       msgDbChanges.filter((c) => c.status === 'pending').length
 
+                    const hasVersionCard = msgChanges.length > 0 || msgDbChanges.length > 0
+                    // Si ya se muestra la VersionCard y no hay cambios pendientes de aprobación por el usuario,
+                    // no mostramos las tarjetas sueltas de DbChangeCard para mantener el chat limpio estilo Lovable.
+                    const shouldShowLooseDbCards = pendingCount > 0 || !hasVersionCard
+
                     return (
 
                       <>
 
-                        {msgChanges.length > 0 && (
+                        {/* Tarjeta de cambios de código removida a petición del usuario */}
 
-                            <GroupedChangesCard
-
-                              changes={msgChanges}
-
-                              onShowFull={showFullDiff}
-
-                              isShowingFullId={inspectOverlay?.kind === 'code' ? inspectOverlay.change.id : null}
-
-                            />
-
-                          )}
-
-                        {msgDbChanges.map((c) => (
+                        {shouldShowLooseDbCards && msgDbChanges.map((c) => (
 
                           <DbChangeCard
 
@@ -2914,21 +3378,9 @@ export default function Chat() {
 
                   })()}
 
-                  {assetChanges
+                  {/* Tarjetas de assets sueltas eliminadas (Estándar Lovable: todos los recursos viven en Detalles de la VersionCard) */}
 
-                    .filter((c) => c.message_id === msg.id)
-
-                    .map((c) => (
-
-                      <AssetChangeCard key={c.id} change={c} onApprove={approveAsset} onReject={rejectAsset} />
-
-                    ))}
-
-                  {edgeFunctionChanges
-
-                    .filter((c) => c.message_id === msg.id)
-
-                    .map((c) => (
+                  {mode !== 'build' && edgeFunctionChanges.filter((c) => c.message_id === msg.id).map((c) => (
 
                       <EdgeFunctionChangeCard
 
@@ -2970,9 +3422,10 @@ export default function Chat() {
               HEALING: "Refinando detalles...",
             };
             const latestStep = activity[activity.length - 1];
-            let activeStage = "Generando código y estructurando la web...";
-            if (latestStep) {
-              if (latestStep.type === 'read') activeStage = `Leyendo ${latestStep.path || 'archivo'}...`;
+            let activeStage = activityDescription || "Generando código y estructurando la web...";
+            if (!activityDescription && latestStep) {
+              if (latestStep.type === 'activity_description' && latestStep.description) activeStage = latestStep.description;
+              else if (latestStep.type === 'read') activeStage = `Leyendo ${latestStep.path || 'archivo'}...`;
               else if (latestStep.type === 'list') activeStage = "Explorando archivos...";
               else if (latestStep.type === 'edit') activeStage = `Modificando ${latestStep.path || 'código'}...`;
               else if (latestStep.type === 'db') activeStage = "Evaluando base de datos...";
@@ -3053,21 +3506,34 @@ export default function Chat() {
 
         
 
-        {/* FILA DE SUGERENCIAS FLOTANTES */}
+        {/* FILA DE SUGERENCIAS FLOTANTES (ESTÁNDAR LOVABLE) */}
 
         {(() => {
 
           const lastMsg = visibleMessages[visibleMessages.length - 1];
 
-          const activeSuggestions = (!sending && !autoTurnActive && lastMsg?.role === 'assistant' && lastMsg?.suggestions?.length > 0) ? lastMsg.suggestions : [];
+          let activeSuggestions = (!sending && !autoTurnActive && lastMsg?.role === 'assistant' && Array.isArray(lastMsg?.suggestions) && lastMsg.suggestions.length > 0)
+            ? lastMsg.suggestions
+            : [];
+
+          if (activeSuggestions.length === 0 && !sending && !autoTurnActive && lastMsg?.role === 'assistant' && lastMsg?.content) {
+            const match = lastMsg.content.match(/<suggestions>\s*(\[[\s\S]*?\])\s*<\/suggestions>/i) ||
+                          lastMsg.content.match(/<!--\s*suggestions\s*:\s*(\[[\s\S]*?\])\s*-->/i);
+            if (match) {
+              try {
+                const parsed = JSON.parse(match[1]);
+                if (Array.isArray(parsed)) activeSuggestions = parsed;
+              } catch (_) {}
+            }
+          }
 
           if (activeSuggestions.length === 0) return null;
 
           return (
 
-            <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-3 w-full px-4">
+            <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-3 w-full px-4 select-none">
 
-              {activeSuggestions.map((text, i) => (
+              {activeSuggestions.slice(0, 3).map((text, i) => (
 
                 <button
 
@@ -3077,11 +3543,13 @@ export default function Chat() {
 
                   onClick={() => send(null, text)}
 
-                  className="whitespace-nowrap px-3.5 py-1.5 rounded-full border border-white/10 bg-white/[0.04] hover:bg-white/[0.08] text-xs text-zinc-300 hover:text-white transition-all duration-150 shrink-0"
+                  className="whitespace-nowrap px-3.5 py-1.5 rounded-full border border-white/10 bg-zinc-800/80 hover:bg-zinc-700/80 hover:border-white/20 text-xs font-medium text-zinc-200 hover:text-white flex items-center gap-2 shadow-sm transition-all duration-150 shrink-0 cursor-pointer"
 
                 >
 
-                  {text}
+                  <span className="size-1.5 rounded-full bg-blue-400"></span>
+
+                  <span>{text}</span>
 
                 </button>
 
@@ -3111,19 +3579,74 @@ export default function Chat() {
 
 
 
-          <ChatInput projectId={project?.id || projectId} defaultAgentId={project?.default_agent_id} onSendMessage={(text, files, agentId) => {
-            return send(null, text, files.map(f => f.file), null, agentId);
-          }}
+          
+          {/* Bandeja de Cola de Seguimiento estilo Lovable */}
+          {messageQueue.length > 0 && (
+            <div className="mb-2 rounded-xl border border-white/10 bg-zinc-900/95 backdrop-blur-md p-2.5 shadow-xl select-text text-zinc-100">
+              <div className="flex items-center justify-between pb-1.5 border-b border-white/10 text-xs">
+                <span className="font-semibold text-zinc-300 flex items-center gap-1.5">
+                  <span className="size-2 rounded-full bg-blue-500 animate-ping" />
+                  Cola de seguimiento ({messageQueue.length} pendiente{messageQueue.length > 1 ? 's' : ''})
+                </span>
+                <span className="text-[11px] text-zinc-500">Se ejecutarán secuencialmente</span>
+              </div>
+              <div className="mt-2 space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                {messageQueue.map((item, idx) => (
+                  <div
+                    key={item.id || idx}
+                    className="flex items-center justify-between gap-2 p-2 rounded-lg bg-zinc-800/60 border border-white/5 text-xs group"
+                  >
+                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                      <span className="text-[10px] font-mono font-bold text-zinc-400 bg-zinc-900 px-1.5 py-0.5 rounded shrink-0">
+                        #{idx + 1}
+                      </span>
+                      <span className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 shrink-0">
+                        {item.mode || 'build'}
+                      </span>
+                      <p className="truncate text-zinc-200 text-xs font-normal">
+                        {item.text || item.content || (item.files?.length ? `📎 ${item.files.length} archivo(s)` : 'Seguimiento')}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleExecuteQueueItemNow(item, idx)}
+                        title="Ejecutar ahora (interrumpe turno actual)"
+                        className="px-2 py-0.5 rounded text-[11px] bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors cursor-pointer"
+                      >
+                        Ejecutar ahora
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteQueueItem(item.id, idx)}
+                        title="Eliminar de la cola"
+                        className="p-1 rounded text-zinc-400 hover:text-red-400 hover:bg-zinc-700/50 transition-colors cursor-pointer"
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
-          onStopGeneration={stop}
-
-          isGenerating={sending || autoTurnActive}
-
-          mode={mode}
-
-          setMode={setMode}
-
-        />
+          <ChatInput
+            projectId={project?.id || projectId}
+            defaultAgentId={project?.default_agent_id}
+            onSendMessage={(text, files, agentId) => {
+              return send(null, text, files, null, agentId);
+            }}
+            onStopGeneration={handleStopGeneration}
+            isGenerating={sending || autoTurnActive}
+            mode={mode}
+            setMode={setMode}
+            selectedElement={selectedElement}
+            onClearSelectedElement={() => {
+              setSelectedElement(null)
+              setPreviewSelectMode(false)
+            }}
+          />
 
 
 
@@ -3195,7 +3718,25 @@ export default function Chat() {
 
             {resizing && <div className="absolute inset-0 z-40 cursor-col-resize" />}
 
-            {project && rightView === 'code' && <CodeViewPanel key={projectId} projectId={projectId} />}
+            {project && rightView === 'code' && (
+              <CodeViewPanel
+                key={projectId}
+                projectId={projectId}
+                project={project}
+                revisionKey={codeRevisionKey}
+                onMigrateToGithub={migrateToGithub}
+                migrating={migrating}
+              />
+            )}
+
+            {project && rightView === 'database' && (
+              <DatabaseViewPanel
+                key={`db-${projectId}`}
+                projectId={projectId}
+                repoFullName={project?.repoFullName || project?.repo_full_name}
+                onSendPrompt={(p) => send(null, p, undefined, 'build')}
+              />
+            )}
 
             
 
@@ -3207,6 +3748,8 @@ export default function Chat() {
 
                 projectId={projectId}
 
+                project={project}
+
                 repoFullName={project?.repoFullName}
 
                 onMatchResult={setDbMismatch}
@@ -3214,6 +3757,8 @@ export default function Chat() {
                 initialTab={moreInitialTab}
 
                 onClose={() => setRightView('preview')}
+
+                onProjectUpdated={(up) => setProject(p => ({ ...p, ...up }))}
 
               />
 
@@ -3241,6 +3786,16 @@ export default function Chat() {
 
                 onClearSelection={() => setSelectedElement(null)}
 
+                selectMode={previewSelectMode}
+
+                onToggleSelectMode={previewToggleSelectMode}
+
+                onViewportChange={setPreviewViewport}
+
+                onReload={() => setPreviewReloadKey((k) => k + 1)}
+
+                onQuickEdit={handleQuickEdit}
+
                 onTryFix={() =>
 
                   send(null, 'La vista previa no arranca por un error de compilación. Revisá el error con "check_preview_errors" y arreglalo.')
@@ -3248,7 +3803,27 @@ export default function Chat() {
                 }
 
                 fixing={sending}
-
+                restarting={restartingContainer}
+                autoFixing={autoFixing}
+                runtimeCrash={runtimeCrash}
+                onManualFix={() => {
+                  autoFixCountRef.current = 0
+                  setAutoFixing(true)
+                  const targetCrash = runtimeCrash || {}
+                  setRuntimeCrash(null)
+                  const errDetail = targetCrash.stack ? `${targetCrash.message}\nStack: ${targetCrash.stack}` : (targetCrash.message || 'Error en tiempo de ejecución')
+                  api.autoFixPreview(conversationId, targetCrash.message || 'Error en tiempo de ejecución', errDetail, targetCrash).catch(() => {})
+                  clearTimeout(previewPollRef.current)
+                  previewPollRef.current = setTimeout(previewPoll, 3000)
+                }}
+                onRestartContainer={handleRestartContainer}
+                onIframeLoad={() => {
+                  if (previewStatus?.status === 'running') {
+                    setPreviewError(null)
+                    setAutoFixing(false)
+                    setRuntimeCrash(null)
+                  }
+                }}
               />
 
             )}

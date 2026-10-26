@@ -76,7 +76,7 @@ export const LUCIDE_HALLUCINATIONS_MAP = {
   ServerAlert: 'Server',
 }
 
-let KNOWN_LUCIDE_ICONS = new Set()
+export const KNOWN_LUCIDE_ICONS = new Set()
 try {
   const jsonPath = path.join(__dirname, 'lucideIconNames.json')
   if (fs.existsSync(jsonPath)) {

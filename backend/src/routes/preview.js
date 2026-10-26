@@ -2,13 +2,15 @@ import { runtimeBus } from '../services/runtimeBus.js'
 import { Router } from 'express'
 import { requireAuth } from '../middleware/auth.js'
 import { isPreviewConfigured } from '../config.js'
-import { startPreview, getPreviewStatus, stopPreview } from '../services/previewOrchestrator.js'
+import { startPreview, getPreviewStatus, stopPreview, ensurePreviewRunning } from '../services/previewOrchestrator.js'
+import { supabase } from '../db/supabaseClient.js'
 import { resolveDbConnection } from '../services/dbConnectionResolver.js'
 import { buildPreviewEnvVars } from '../services/previewEnv.js'
 import { getProjectSecretsMap } from '../services/projectSecrets.js'
 import { getOwnedProject, getOwnedProjectByRepo, isVirtualRepo } from '../services/projectResolver.js'
 import { captureProjectThumbnailAsync } from '../services/projectThumbnail.js'
 import { signPreviewToken, verifyPreviewToken } from '../services/previewAccess.js'
+import { getValidGithubToken } from '../services/github.js'
 
 export const previewRouter = Router()
 
@@ -37,6 +39,57 @@ function parseCookies(header) {
     out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim())
   }
   return out
+}
+
+const wakingSlugs = new Map()
+
+function triggerAutoWakeIfNeeded(slug, originalUri) {
+  if (!isPreviewConfigured || !slug) return
+  const pathOnly = (originalUri || '').split('?')[0]
+  const isPageNav = pathOnly === '/' || pathOnly === '' || pathOnly.endsWith('.html')
+  if (!isPageNav) return
+
+  const now = Date.now()
+  const lastAttempt = wakingSlugs.get(slug) || 0
+  if (now - lastAttempt < 30_000) return // Cooldown: already waking or woke recently
+
+  wakingSlugs.set(slug, now)
+
+  // Fire-and-forget: despertar asíncronamente el contenedor si está frío o drenado
+  ;(async () => {
+    try {
+      const { data: project } = await supabase
+        .from('projects')
+        .select('*')
+        .eq('slug', slug)
+        .maybeSingle()
+      if (!project) return
+
+      const ownerKey = `user:${project.user_id}`
+      let status
+      try {
+        status = await getPreviewStatus(ownerKey, project.repo_full_name)
+      } catch {
+        status = null
+      }
+
+      if (status?.status === 'running' || status?.status === 'starting') {
+        return
+      }
+
+      const { data: user } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', project.user_id)
+        .maybeSingle()
+      if (!user) return
+
+      console.log(`[AutoWake] Disparando auto-wake para slug "${slug}" (${project.repo_full_name})...`)
+      await ensurePreviewRunning(user, project)
+    } catch (err) {
+      console.warn(`[AutoWake] Error auto-despertando slug ${slug}:`, err.message)
+    }
+  })()
 }
 
 previewRouter.get('/verify-token', (req, res) => {
@@ -73,6 +126,7 @@ previewRouter.get('/verify-token', (req, res) => {
     // Set-Cookie de una subrequest de auth_request no llega sola al cliente — nginx tiene que
     // capturarla explícitamente con auth_request_set + add_header (ver gitflow-preview-subdomains).
     res.set('Set-Cookie', `fp_pt=${encodeURIComponent(token)}; Path=/; Max-Age=1800; HttpOnly; Secure; SameSite=Lax`)
+    triggerAutoWakeIfNeeded(slug, originalUri)
   }
   res.sendStatus(ok ? 204 : 403)
 })
@@ -80,7 +134,13 @@ previewRouter.get('/verify-token', (req, res) => {
 previewRouter.get('/status', requireAuth, async (req, res) => {
   if (!isPreviewConfigured) return res.json({ status: 'unavailable' })
   try {
-    const status = withPreviewToken(await getPreviewStatus(`user:${req.user.id}`))
+    const { projectId } = req.query
+    let repoFullName = null
+    if (projectId) {
+      const project = await getOwnedProject(req.user.id, projectId).catch(() => null)
+      if (project) repoFullName = project.repo_full_name
+    }
+    const status = withPreviewToken(await getPreviewStatus(`user:${req.user.id}`, repoFullName))
     res.json(status)
 
     // Fire-and-forget: no bloquea la respuesta de arriba, y cualquier error queda contenido
@@ -132,10 +192,14 @@ previewRouter.post('/start', requireAuth, async (req, res) => {
       // Best-effort: si falla leer los secrets, el preview arranca igual sin ellos en vez de
       // no arrancar por algo que ni siquiera pidió el usuario en este turno.
     }
+    let accessToken = req.user.github_access_token
+    if (!isVirtualRepo(project.repo_full_name)) {
+      accessToken = (await getValidGithubToken(req.user)) || req.user.github_access_token
+    }
     const result = await startPreview({
       ownerKey: `user:${req.user.id}`,
       project,
-      accessToken: req.user.github_access_token,
+      accessToken,
       envVars,
     })
     res.json(withPreviewToken(result))
@@ -144,10 +208,64 @@ previewRouter.post('/start', requireAuth, async (req, res) => {
   }
 })
 
+previewRouter.post('/restart', requireAuth, async (req, res) => {
+  const { projectId } = req.body
+  if (!projectId) return res.status(400).json({ error: 'Falta projectId' })
+  if (!isPreviewConfigured) {
+    return res.status(503).json({ error: 'El servicio de preview no está configurado en el backend' })
+  }
+
+  let project
+  try {
+    project = await getOwnedProject(req.user.id, projectId)
+  } catch (err) {
+    return res.status(500).json({ error: err.message })
+  }
+  if (!project) return res.status(404).json({ error: 'Proyecto no encontrado' })
+
+  if (!isVirtualRepo(project.repo_full_name) && !req.user.github_access_token) {
+    return res.status(403).json({ error: 'Conecta tu cuenta de GitHub para continuar', code: 'github_not_connected' })
+  }
+
+  try {
+    let envVars
+    try {
+      const dbConnection = await resolveDbConnection(req.user, project.repo_full_name)
+      envVars = await buildPreviewEnvVars(dbConnection)
+    } catch {
+      envVars = await buildPreviewEnvVars(null)
+    }
+    try {
+      const secrets = await getProjectSecretsMap(project.id)
+      envVars = { ...envVars, ...secrets }
+    } catch {}
+
+    let accessToken = req.user.github_access_token
+    if (!isVirtualRepo(project.repo_full_name)) {
+      accessToken = (await getValidGithubToken(req.user)) || req.user.github_access_token
+    }
+    const result = await startPreview({
+      ownerKey: `user:${req.user.id}`,
+      project,
+      accessToken,
+      envVars,
+    })
+    res.json(withPreviewToken(result))
+  } catch (err) {
+    res.status(502).json({ error: 'No se pudo reiniciar el preview', detail: err.message })
+  }
+})
+
 previewRouter.post('/stop', requireAuth, async (req, res) => {
   if (!isPreviewConfigured) return res.json({ status: 'idle' })
   try {
-    const result = await stopPreview(`user:${req.user.id}`)
+    const { projectId } = req.body || {}
+    let repoFullName = null
+    if (projectId) {
+      const project = await getOwnedProject(req.user.id, projectId).catch(() => null)
+      if (project) repoFullName = project.repo_full_name
+    }
+    const result = await stopPreview(`user:${req.user.id}`, repoFullName)
     res.json(result)
   } catch (err) {
     res.status(502).json({ error: 'No se pudo detener el preview', detail: err.message })

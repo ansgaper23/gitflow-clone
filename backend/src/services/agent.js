@@ -1,3 +1,7 @@
+import { classifyIndustryArchetype, extractBrandTokens, getBrandAndArchetypeDirectives } from './brandExtractor.js'
+import sharp from 'sharp'
+import path from 'node:path'
+import fs from 'node:fs'
 import { listProjectFiles, readProjectFile } from './projectStorage.js'
 
 import { getSchemaSummary, getTableRowCounts, getTableRows, runSql } from './repoDb.js'
@@ -31,11 +35,13 @@ import { getProjectSemanticGraph, findMatchingFileForElement, invalidateSemantic
 import { runImportGuard } from './importGuard.js'
 import { getDbSchemaGraph, invalidateDbSchemaGraph } from './dbSchemaGraph.js'
 import { amplifyPrompt } from './promptAmplifier.js'
-import { validateUiIntegrity, isEntrypointStillScaffold } from './uiIntegrityGuard.js'
-import { executeHardProjectReset } from './projectReset.js'
+import { validateUiIntegrity, isEntrypointStillScaffold, sanitizeViteConfig, sanitizeStylesheets, validateImportsAgainstPackageJson, validatePreWriteComponent } from './uiIntegrityGuard.js'
+import { executeHardProjectReset, CLEAN_APP_SCAFFOLD } from './projectReset.js'
+import { isVirtualRepo } from './projectResolver.js'
 import { isWebOrLandingRequest, getSeniorArtDirectionDirectives } from './designDirector.js'
 import { isSeoTarget, getTechnicalSeoDirectives } from './seoArchitect.js'
 import { scanForExposedSecrets } from './secretGuard.js'
+import { matchColloquialSkillsAndComponents } from './colloquialSkillMatcher.js'
 
 export { compressHistory } from './geminiAssist.js'
 export { executeHardProjectReset } from './projectReset.js'
@@ -98,7 +104,9 @@ const CASUAL_PATTERNS = [
  *   category: 'PURE_QUESTION' | 'ACTION_ORDER' | 'HYBRID_QUESTION_AND_ACTION' | 'CASUAL'
  * }}
  */
-export function analyzePromptIntent(prompt) {
+export function analyzePromptIntent(prompt, context = {}) {
+  const mode = (typeof context === 'string' ? context : (context?.mode || 'build')).toLowerCase().trim();
+  const isBuildMode = ['build', 'agent', 'edit'].includes(mode);
   if (!prompt || typeof prompt !== 'string') {
     return {
       isPureQuestion: false,
@@ -183,21 +191,26 @@ export function analyzePromptIntent(prompt) {
   }
 
   // 1. Verbos imperativos y órdenes de mutación / cambio de código o base de datos
-  const actionVerbsPattern = /\b(?:agrega|agregame|agregale|agregalo|agregala|agregalos|agregalas|agregar|anade|añade|anademe|añademe|anadir|añadir|crea|creame|crealo|creala|crear|genera|generame|generalo|generar|elimina|eliminalo|eliminar|borra|borralo|borrar|quita|quitalo|quitar|cambia|cambiame|cambialo|cambiala|cambiar|modifica|modificalo|modificar|corrige|corrigelo|corregir|arregla|arreglalo|arreglar|repara|reparalo|reparar|soluciona|solucionalo|solucionar|optimiza|optimizalo|optimizar|actualiza|actualizalo|actualizar|refactoriza|refactorizalo|refactorizar|implementa|implementalo|implementar|programa|programalo|programar|construye|construyelo|construir|pon|ponle|ponme|ponlo|poner|inserta|insertalo|insertar|conecta|conectalo|conectar|integra|integralo|integrar|migra|migralo|migrar|haz|hazlo|hazle|hazme|hacer|sube|subir|instala|instalar)\b/i;
+  const actionVerbsPattern = /\b(?:sea|sean|quede|queden|luzca|parezca|iguala|replica|clona|reemplaza|cambia|ponle|corrige|arregla|ajusta|aplica|agrega|agregame|agregale|agregalo|agregala|agregalos|agregalas|agregar|anade|añade|anademe|añademe|anadir|añadir|crea|creame|crealo|creala|crear|genera|generame|generalo|generar|elimina|eliminalo|eliminar|borra|borralo|borrar|quita|quitalo|quitar|cambia|cambiame|cambialo|cambiala|cambiar|modifica|modificalo|modificar|corrige|corrigelo|corregir|arregla|arreglalo|arreglar|repara|reparalo|reparar|soluciona|solucionalo|solucionar|optimiza|optimizalo|optimizar|actualiza|actualizalo|actualizar|refactoriza|refactorizalo|refactorizar|implementa|implementalo|implementar|programa|programalo|programar|construye|construyelo|construir|pon|ponle|ponme|ponlo|poner|inserta|insertalo|insertar|conecta|conectalo|conectar|integra|integralo|integrar|migra|migralo|migrar|haz|hazlo|hazle|hazme|hacer|sube|subir|instala|instalar)\b/i;
 
   // Quejas de bug o fallo que implican una orden explícita o implícita de reparación
   const bugReportActionPattern = /\b(?:no (?:funciona|anda|sirve|carga|compila|muestra|guarda|actualiza)|est[aá] rot[oa]|da error|tira error|falla el|fallan los|hay un error|est[aá] ca[ií]d[oa]|se rompi[oó])\b/i;
 
+  // Reportes de defectos visuales o discordancias de contenido (ej: imágenes que no corresponden, logo se ve mal, datos incorrectos)
+  const defectReportPattern = /\b(?:no\s+(?:corresponde[n]?|coincide[n]?|concuerda[n]?|cuadra[n]?|encaja[n]?|pertenece[n]?|es\s+el|es\s+la|son\s+el|son\s+la|son\s+los|son\s+las|tiene\s+sentido)|(?:im[aá]genes?|fotos?|logos?|textos?|productos?|secci[oó]n|tarjetas?|botones?|colores?|iconos?|íconos?)\s+(?:que\s+no\s+(?:corresponde[n]?|coincide[n]?|van|sirve[n]?)|incorrect[oa]s?|equivocad[oa]s?|fals[oa]s?|err[oó]ne[oa]s?|distint[oa]s?)|aparece[n]?\s+(?:im[aá]genes?|fotos?|cosas?)\s+que\s+no|est[aá][n]?\s+(?:mal|incorrect[oa]s?|equivocad[oa]s?|desalinead[oa]s?|chuec[oa]s?|invertid[oa]s?|al\s+rev[eé]s|cambiad[oa]s?)|se\s+ve[n]?\s+(?:mal|feo|raro|cortad[oa]s?|borros[oa]s?|pixelad[oa]s?|deformad[oa]s?|desproporcionad[oa]s?|chiquit[oa]s?|gigante[s]?|incomplet[oa]s?)|(?:logo|imagen|foto|icono|ícono)\s+(?:se\s+ve\s+|est[aá]\s+)?(?:mal|raro|pixelado|borroso|estirado|gigante|chico|feo)|no\s+se\s+ve\s+bien|se\s+ve\s+p[eé]sim[oa]|(?:colores?|fondo|textos?|im[aá]genes?)\s+(?:es\s+otr[oa]|no\s+es\s+el\s+que|distint[oa]s?|incorrect[oa]s?)|es\s+otro\s+no\s+el|otro\s+no\s+el\s+que|falta\s+(?:la\s+imagen|el\s+logo|la\s+foto|el\s+icono|el\s+producto)|sobra\s+(?:la\s+imagen|el\s+logo|la\s+foto)|est[aá]\s+mostrando\s+(?:im[aá]genes?|fotos?)\s+que\s+no|muestra\s+(?:im[aá]genes?|fotos?)\s+(?:que\s+no|incorrectas|equivocadas))\b/i;
+
   const hasActionVerb = actionVerbsPattern.test(normalized) || actionVerbsPattern.test(deaccented);
   const hasBugReportAction = bugReportActionPattern.test(normalized) || bugReportActionPattern.test(deaccented);
-  const hasActionOrder = hasActionVerb || hasBugReportAction;
+  const isDefectReport = defectReportPattern.test(normalized) || defectReportPattern.test(deaccented);
+  const hasActionOrder = hasActionVerb || hasBugReportAction || isDefectReport;
 
   // 2. Indicadores de Pregunta / Consulta / Diagnóstico / Auditoría
   const hasQuestionMark = normalized.includes('?') || normalized.includes('¿');
 
   // Palabras interrogativas (con y sin acentos)
-  const questionWordsPattern = /\b(?:que|qué|como|cómo|donde|dónde|cuando|cuándo|cual|cuál|cuales|cuáles|por que|por qué|porque|cuanto|cuánto|cuantos|cuántos|cuanta|cuánta|cuantas|cuántas|quien|quién|quienes|quiénes)\b/i;
-  const hasQuestionWord = questionWordsPattern.test(normalized) || questionWordsPattern.test(deaccented);
+  // Palabras interrogativas estrictas (ELIMINADOS 'que', 'como', 'donde' sin tilde que son conjunciones/relativos)
+  const questionWordsPattern = /\b(?:qué|cómo|dónde|cuando|cuándo|cual|cuál|cuales|cuáles|por qué|cuanto|cuánto|cuantos|cuántos|cuanta|cuánta|cuantas|cuántas|quien|quién|quienes|quiénes)\b/i;
+  const hasQuestionWord = questionWordsPattern.test(normalized);
 
   // Verbos y frases de diagnóstico / auditoría / inspección
   const diagnosticPhrasesPattern = /\b(?:analiza|analizar|audita|auditar|evalua|evaluar|revisa|revisar|inspecciona|inspeccionar|diagnostica|diagnosticar|como esta|cómo está|como se encuentra|cómo se encuentra|como funciona|cómo funciona|como se calcula|cómo se calcula|que opinas|qué opinas|dime como|dime cómo|dime que|dime qué|explica|explicame|explícame|muestrame|muéstrame|cual es el estado|cuál es el estado|que tablas|qué tablas|que componentes|qué componentes|que paquetes|qué paquetes|hay algun|hay algún|se puede|es seguro|es posible)\b/i;
@@ -228,8 +241,26 @@ export function analyzePromptIntent(prompt) {
 
   const hasQuery = hasQuestionMark || hasQuestionWord || isDiagnostic || hasExplicitNoChange;
 
-  // CASO A: Pregunta Pura de Diagnóstico / Consulta (Sin verbo de acción ni queja de bug)
-  if ((hasQuery && !hasActionOrder) || (hasQuery && hasExplicitNoChange)) {
+  // En modo BUILD, cualquier frase imperativa, queja de bug o reporte de defecto visual es 100% orden de mutación
+  if (isBuildMode && (hasActionOrder || isDefectReport || hasBugReportAction || hasActionVerb)) {
+    return {
+      isPureQuestion: false,
+      hasActionOrder: true,
+      isProjectResetOrder: false,
+      isDualResponseRequired: false,
+      isDiagnostic: isDiagnostic,
+      isBlackScreenReport: false,
+      category: 'ACTION_ORDER'
+    };
+  }
+
+  // CASO A: Pregunta Pura de Diagnóstico / Consulta
+  // En modo Build, SOLO califica como PURE_QUESTION si contiene signos de interrogación (? o ¿) y NO reporta defectos ni da órdenes
+  const qualifiesAsPureQuestion = isBuildMode
+    ? (hasQuestionMark && !hasActionOrder && !isDefectReport)
+    : (((hasQuery && !hasActionOrder) || (hasQuery && hasExplicitNoChange)) && !isDefectReport);
+
+  if (qualifiesAsPureQuestion) {
     return {
       isPureQuestion: true,
       hasActionOrder: false,
@@ -311,44 +342,65 @@ function isCasualMessage(text) {
  * Calibración: NUNCA si hay SQL, JSON, errores, elementContext o si el usuario nombró entidades concretas.
  * SOLO si la instrucción es genuinamente ambigua o genérica (ej. "mejora el código", "modifica la app").
  */
-export function shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext } = {}) {
+export function shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext, activeViewContext, attachments = [], history = [], isInitialKickoff = false } = {}) {
   if (!userMessage || typeof userMessage !== 'string') return false;
 
-  // 1. Veto Absoluto: SQL Execution Order o presencia de sentencias SQL
-  if (promptIntent?.isSqlExecutionOrder) return false;
+  // 1. VETO ABSOLUTO: Si hay archivos adjuntos (PDFs, imágenes, logos, documentos)
+  if (Array.isArray(attachments) && attachments.length > 0) {
+    return false;
+  }
+
+  // 2. VETO ABSOLUTO: Si el mensaje contiene URLs externas
+  const urlPattern = /https?:\/\/[^\s]+/i;
+  if (urlPattern.test(userMessage)) {
+    return false;
+  }
+
+  // 3. VETO ABSOLUTO: Turnos subsiguientes de corrección o edición (history > 0)
+  if (Array.isArray(history) && history.length > 0) {
+    return false;
+  }
+
+  // 4. Veto: SQL Execution Order o sentencias SQL explícitas
+  if (promptIntent?.isSqlExecutionOrder || promptIntent?.isDefectReport) return false;
   const sqlPattern = /(?:\bDO\s+(?:LANGUAGE\s+['"]?[a-zA-Z0-9_]+['"]?\s+)?\$[a-zA-Z0-9_]*\$|\b(?:INSERT\s+INTO|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE|UPDATE\s+[a-zA-Z0-9_".]+\s+SET|DELETE\s+FROM|BEGIN;?|SELECT\s+[\s\S]*?\s+FROM|TRUNCATE\s+TABLE)\b)/i;
   if (sqlPattern.test(userMessage)) return false;
 
-  // 2. Veto: JSON, Logs de error, stacktraces
+  // 5. Veto: JSON, Logs de error, stacktraces
   const trimmed = userMessage.trim();
   if (/^[\{\[][\s\S]*[\}\]]$/.test(trimmed)) return false;
   if (/\b(?:Error:|TypeError:|ReferenceError:|SyntaxError:|at\s+[\w/\\.-]+:\d+:\d+|\bat\s+async\s+|\bnode:internal\/|Stack trace:)\b/i.test(userMessage)) return false;
 
-  // 3. Veto: Selección visual de elemento (elementContext / Click-to-Edit)
+  // 6. Veto: Selección visual de elemento (elementContext / Click-to-Edit) o vista activa concreta
   if (elementContext && (elementContext.selector || elementContext.tag || elementContext.text)) {
     return false;
   }
+  if (activeViewContext && (activeViewContext.activeModal || activeViewContext.focusedFile) && !isInitialKickoff) {
+    return false;
+  }
 
-  // 4. Veto: El mensaje ya especifica entidades concretas de UI o arquitectura
-  const namesSpecificTarget = /\b(?:tabla|table|columna|column|bot[oó]n|button|modal|dialog|vista|view|p[aá]gina|page|componente|component|formulario|form|navbar|header|footer|sidebar|pestana|pestaña|tab|input|card|tarjeta|icono|icon|endpoint|ruta|route|api|hook|css|tailwind|color|fondo|texto|fuente|padding|margin|receta|recetas|producto|productos|cliente|clientes|usuario|usuarios|pedido|pedidos|venta|ventas|inventario)\b|\.(?:jsx?|tsx?|css|html|sql|json)\b/i.test(userMessage);
-  if (namesSpecificTarget) return false;
-
-  // 5. Veto: Confirmaciones o respuestas cortas
+  // 7. Veto: Confirmaciones o respuestas cortas
   if (/^(?:s[ií]+|yes|dale|ok|adelante|procede|hazlo|de acuerdo|por favor|claro)\b/i.test(trimmed)) return false;
 
-  // 6. SOLO permitir si el pedido es genuinamente ambiguo y genérico
-  const isGenericAmbiguous = /\b(?:mejora|modifica|cambia|actualiza|corrige|haz|crea)\s+(?:el\s+c[oó]digo|la\s+app|la\s+aplicaci[oó]n|el\s+proyecto|el\s+sistema|algo|un\s+cambio)\b/i.test(userMessage)
-    || /^(?:mejora(?:lo)?|modifica(?:lo)?|cambia(?:lo)?|actualiza(?:lo)?|haz un cambio|qu[eé] hacemos|qu[eé] sigue)[\s.?!]*$/i.test(trimmed);
+  // 8. Veto: Mención de archivos de código o extensiones explícitas (ej. src/App.jsx, schema.sql)
+  if (/\b[a-zA-Z0-9_\-\.\/]+\.(?:jsx?|tsx?|css|html|sql|json)\b/i.test(userMessage)) {
+    return false;
+  }
 
-  return isGenericAmbiguous;
+  // 9. Veto: Si el usuario dio órdenes directas con restricciones negativas ("no toques X", "no cambies Y")
+  const constraints = extractNegativeConstraints(userMessage);
+  if (constraints.hasConstraints) return false;
+
+  // 10. Para Turno 1 / Kickoff: permitir preguntas interactivas si es un prompt de creación de sistema / app / web / proyecto
+  const isCreationOrGenericRequest =
+    /\b(?:crea|haz|diseña|construye|desarrolla|monta|arma|hacer|crear|sistema|app|aplicaci[oó]n|web|sitio|portal|plataforma|landing|tienda|ecommerce|saas|software|dashboard)\b/i.test(userMessage) ||
+    /\b(?:para\s+(?:una?|el|la)\s+[\w\s]+)\b/i.test(userMessage);
+
+  return isCreationOrGenericRequest;
 }
 
 /**
- * Extrae restricciones prohibitivas explícitas ("No toques X", "No modifiques código", "Solo explícame")
- * para implementar el Arnés 3: Bloqueo determinista de mutaciones no autorizadas.
- *
- * @param {string} userMessage
- * @returns {{ hasConstraints: boolean, prohibitAllCodeChanges: boolean, prohibitAllDbChanges: boolean, forbiddenFiles: string[], forbiddenTables: string[] }}
+ * Extrae restricciones prohibitivas explícitas
  */
 export function extractNegativeConstraints(userMessage) {
   if (!userMessage || typeof userMessage !== 'string') {
@@ -410,6 +462,230 @@ export function extractNegativeConstraints(userMessage) {
     forbiddenFiles,
     forbiddenTables
   }
+}
+
+/**
+ * Normaliza rutas de archivos de origen extraídas por el selector visual (Click-to-Edit)
+ * limpiando prefijos de workspace, rutas absolutas de Vite y unificando separadores a Posix.
+ * @param {string} rawPath
+ * @returns {string} Ruta relativa limpia (ej. 'src/pages/Login.jsx')
+ */
+export function normalizeSourcePath(rawPath) {
+  if (!rawPath || typeof rawPath !== 'string') return '';
+  let p = rawPath.replace(/\\/g, '/').trim();
+  const srcIdx = p.indexOf('src/');
+  if (srcIdx !== -1) {
+    return p.slice(srcIdx);
+  }
+  p = p.replace(/^\.?\//, '');
+  p = p.replace(/^(?:opt\/[^\/]+\/workspace-[^\/]+\/|workspace\/|app\/)/, '');
+  return p;
+}
+
+/**
+ * Traduce una ruta de archivo a un nombre semántico y comprensible para el usuario.
+ */
+export function getHumanComponentName(filePath) {
+  if (!filePath || typeof filePath !== 'string') return 'el archivo';
+  const clean = filePath.replace(/\\/g, '/').trim();
+  const fileName = clean.split('/').pop() || '';
+  const baseName = fileName.replace(/\.[^.]+$/, '');
+
+  // Mapeo semántico de componentes conocidos
+  if (/^(?:Navbar|Header|Navigation)\b/i.test(baseName)) return 'la barra de navegación';
+  if (/^(?:Hero|HeroSection|Banner)\b/i.test(baseName)) return 'la portada principal (Hero)';
+  if (/^(?:Footer)\b/i.test(baseName)) return 'el pie de página';
+  if (/^(?:index\.css|globals\.css|main\.css|tailwind\.config\.[a-z0-9]+)$/i.test(fileName)) {
+    return 'el sistema de diseño y paleta de colores';
+  }
+  if (/^App\b/i.test(baseName)) return 'la estructura principal de la aplicación';
+  if (/^(?:Login|Auth|SignIn|SignUp|AuthForms)\b/i.test(baseName)) return 'el módulo de acceso e inicio de sesión';
+  if (/^Services/i.test(baseName)) return 'la sección de servicios';
+  if (/^Projects/i.test(baseName)) return 'el portafolio de proyectos';
+  if (/^(?:Contact|Quote|ContactForm|QuoteModal)\b/i.test(baseName)) return 'el formulario de contacto y cotización';
+
+  // Fallback: separar CamelCase en palabras legibles
+  const readable = baseName
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .trim();
+
+  if (readable && readable.length > 1) {
+    return `el módulo ${readable}`;
+  }
+
+  return 'el archivo del proyecto';
+}
+
+/**
+ * Traduce cada acción del bucle de herramientas en una frase humana corta y entendible en español.
+ * Emite null cuando la acción corresponde al cierre del turno (message_user).
+ */
+export function buildHumanActivityDescription(toolName, toolArgs = {}) {
+  if (!toolName) return null;
+  const name = String(toolName).toLowerCase();
+  const filePath = toolArgs?.file_path || toolArgs?.path || toolArgs?.filepath || '';
+  const humanName = filePath ? getHumanComponentName(filePath) : 'el proyecto';
+
+  // 1. Triaje pre-LLM / estructura
+  if (name === 'triagerelevantfiles' || name === 'triage_files' || name === 'triage') {
+    return 'Analizando la estructura del proyecto...';
+  }
+
+  // 2. Inspección de URL externa
+  if (name === 'urlinspector' || name === 'read_website_url' || name === 'inspect_website_url') {
+    return 'Inspeccionando diseño y activos de la web de referencia...';
+  }
+
+  // 3. Procesamiento de attachments / documentos
+  if (name === 'attachmentprocessor' || name === 'extract_document' || name === 'process_pdf') {
+    return 'Extrayendo colores, logotipo y catálogo del documento...';
+  }
+
+  // 4. Lecturas de archivos
+  if (name === 'read_file' || name === 'read_project_file' || name === 'read_multiple_files' || name === 'search_files') {
+    return `Revisando ${humanName}...`;
+  }
+  if (name === 'list_files') {
+    return 'Explorando archivos del proyecto...';
+  }
+
+  // 5. Imágenes y assets
+  if (name === 'inspect_project_image' || name === 'crop_image_region') {
+    return 'Analizando imagen de referencia...';
+  }
+  if (name === 'curate_images' || name === 'generate_image' || name === 'propose_asset_upload' || name === 'propose_storage_upload') {
+    return 'Preparando recursos visuales e imágenes...';
+  }
+
+  // 6. Tareas / Roadmap / Preguntas interactivas
+  if (name === 'propose_tasks' || name === 'roadmap--propose_tasks') {
+    return 'Estructurando el plan de implementación...';
+  }
+  if (name === 'ask_questions' || name === 'questions--ask_questions' || name === 'ask_question') {
+    return 'Preparando opciones de diseño...';
+  }
+
+  // 7. Mutaciones de código
+  if (name === 'propose_change') {
+    return `Creando ${humanName}...`;
+  }
+  if (name === 'replace_file_content' || name === 'propose_patch' || name === 'patch') {
+    return `Actualizando ${humanName}...`;
+  }
+  if (name === 'delete_file') {
+    return `Limpiando ${humanName}...`;
+  }
+
+  // 8. Base de datos
+  if (name === 'propose_migration' || name === 'execute_ddl' || name === 'propose_db_change') {
+    return 'Actualizando la estructura de la base de datos...';
+  }
+  if (name === 'check_db_data' || name === 'read_table_rows') {
+    return 'Consultando datos en la base de datos...';
+  }
+
+  // 9. Vista previa / build
+  if (name === 'check_preview_errors' || name === 'test_preview') {
+    return 'Verificando vista previa...';
+  }
+  if (name === 'restart_preview') {
+    return 'Reiniciando servidor de vista previa...';
+  }
+
+  // 10. Compilación / Post-LLM
+  if (name === 'compiling' || name === 'build_preview' || name === 'validate_build') {
+    return 'Compilando cambios en la vista previa...';
+  }
+
+  // 11. Cierre de turno / message_user
+  if (name === 'message_user' || name === 'user_messaging--message_user' || name === 'done' || name === 'finish') {
+    return null;
+  }
+
+  return 'Procesando cambios en el proyecto...';
+}
+
+/**
+ * Sanitiza y compacta el texto final del turno interactivo (Modo Plan o Selección de Opciones).
+ * Garantiza que cuando hay una tarjeta interactiva (PlanCard o QuestionCard), el texto del
+ * asistente sea una introducción concisa (1-2 oraciones, <= 220 caracteres), sin repetir
+ * árboles ASCII de directorios, listas numeradas/viñetas ni preguntas redundantes de cierre.
+ */
+export function compactInteractiveTurnText(cleanText, proposedPlan, askedQuestion) {
+  if (proposedPlan) {
+    if (!cleanText || typeof cleanText !== 'string') {
+      return `He preparado el plan para **${proposedPlan.title || 'tu proyecto'}**. Revisa los pasos en la tarjeta y aprueba cuando quieras que empiece.`
+    }
+
+    let sanitized = cleanText
+      // Eliminar bloques de código markdown (``` ... ```)
+      .replace(/```[\s\S]*?```/g, '')
+      // Eliminar encabezados markdown (#, ##, ###)
+      .replace(/^#{1,6}\s+.*$/gm, '')
+      // Eliminar viñetas y listas numeradas (1., 2., -, *, +)
+      .replace(/^\s*(?:\d+\.|\*|-|\+)\s+.*$/gm, '')
+      // Eliminar preguntas de cierre redundantes
+      .replace(/¿(?:Deseas|Prefieres|Te gustaría|Quieres|Comenzamos|Desea)[^?\n]*\??/gi, '')
+      .replace(/(?:Deseas que comencemos|Prefieres ajustar|Te gustaría que empecemos)[^.\n]*\.?/gi, '')
+      .trim()
+
+    // Tomar el primer párrafo no vacío
+    const paragraphs = sanitized.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean)
+    let candidate = paragraphs[0] || ''
+    candidate = candidate.replace(/\s+/g, ' ').trim()
+
+    if (candidate.length > 220) {
+      const sentenceEnd = candidate.slice(0, 220).lastIndexOf('.')
+      if (sentenceEnd > 40) {
+        candidate = candidate.slice(0, sentenceEnd + 1).trim()
+      } else {
+        candidate = candidate.slice(0, 217).trim() + '...'
+      }
+    }
+
+    if (!candidate || candidate.length < 15 || /^(?:src\/|calculadora|paso \d|tarea \d)/i.test(candidate)) {
+      return `He preparado el plan para **${proposedPlan.title || 'tu proyecto'}**. Revisa los pasos en la tarjeta y aprueba cuando quieras que empiece.`
+    }
+
+    return candidate
+  }
+
+  if (askedQuestion) {
+    if (askedQuestion.introText) {
+      return askedQuestion.introText
+    }
+    if (!cleanText || typeof cleanText !== 'string') {
+      return 'Para definir la mejor solución para tu proyecto, por favor responde a las siguientes preguntas en la tarjeta:'
+    }
+
+    let sanitized = cleanText
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/^#{1,6}\s+.*$/gm, '')
+      .replace(/^\s*(?:\d+\.|\*|-|\+)\s+.*$/gm, '')
+      .trim()
+
+    const paragraphs = sanitized.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean)
+    let candidate = paragraphs[0] || ''
+    candidate = candidate.replace(/\s+/g, ' ').trim()
+
+    if (candidate.length > 200) {
+      const sentenceEnd = candidate.slice(0, 200).lastIndexOf('.')
+      if (sentenceEnd > 40) {
+        candidate = candidate.slice(0, sentenceEnd + 1).trim()
+      } else {
+        candidate = candidate.slice(0, 197).trim() + '...'
+      }
+    }
+
+    if (!candidate || candidate.length < 15) {
+      return 'Para definir la mejor solución para tu proyecto, por favor responde a las siguientes preguntas en la tarjeta:'
+    }
+
+    return candidate
+  }
+
+  return cleanText
 }
 
 /**
@@ -684,9 +960,9 @@ function describeStep(name, input) {
 
       return { type: 'function', path: input.slug }
 
+    case 'ask_questions':
     case 'ask_question':
-
-      return { type: 'question' }
+      return { type: 'question', label: 'Formulando opciones de diseño y arquitectura...' }
 
     case 'update_memory':
 
@@ -723,6 +999,12 @@ function describeStep(name, input) {
     case 'restart_preview':
 
       return { type: 'restart' }
+
+    case 'inspect_project_image':
+      return { type: 'inspect_image', paths: input.paths }
+
+    case 'crop_image_region':
+      return { type: 'crop_image', outputFileName: input.outputFileName }
 
     default:
 
@@ -773,8 +1055,12 @@ function buildSystemPrompt(
   semanticGraphSection = '',
   dbSchemaGraphSection = '',
   promptIntent = null,
-  currentAppContent = ''
+  currentAppContent = '',
+  activeViewContext = null
 ) {
+
+  const normalizedMode = String(mode || 'build').toLowerCase().trim();
+  const isExplicitBuildMode = ['build', 'agent', 'edit'].includes(normalizedMode);
 
   const truncated = treePaths.length > MAX_TREE_ENTRIES
 
@@ -784,7 +1070,7 @@ function buildSystemPrompt(
 
   
 
-  const canAskInKickoff = isInitialKickoff && shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext });
+  const canAskInKickoff = isInitialKickoff && shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext, attachments, isInitialKickoff });
 
   const kickoffSection = isInitialKickoff ? `
 
@@ -807,29 +1093,43 @@ REGLAS CRÍTICAS DE KICKOFF:
 4. Emite todos los archivos necesarios en una sola pasada a través de propose_change.
 5. PROHIBIDO CREAR MOCKS O COMPONENTES COSMÉTICOS FALSOS: Si el usuario pide una conexión real, integración externa (WhatsApp, APIs, Stripe) o persistencia, NUNCA inventes interfaces estáticas que simulan funcionar. Debes crear la estructura real de datos (propose_migration), endpoints (propose_edge_function) o clarificar los requerimientos.
 
-${canAskInKickoff ? `CUÁNDO USAR 'ask_question':
-Si el usuario solicita un proyecto nuevo desde cero, un sistema complejo o una integración con múltiples opciones (ej. 'creame un sistema MCP para WhatsApp', 'crea un SaaS de reservas', 'agrega pasarela de pagos'), NO asumas los requerimientos ni crees código de inmediato.
-DEBES invocar obligatoriamente la herramienta 'ask_question' ofreciendo entre 2 y 4 opciones claras y bien fundamentadas (marcando una como 'Recomendada') para definir:
-1. El objetivo/arquitectura principal (ej. Servidor MCP vs Bot vs App web).
-2. El proveedor de conexión o método de autenticación.
-3. Los roles o usuarios del sistema.
-Una vez invocada 'ask_question', finaliza tu turno inmediatamente sin emitir código adicional hasta que el usuario responda.` : `PROHIBICIÓN ESTRICTA DE PREGUNTAS DE CLARIFICACIÓN:
+${canAskInKickoff ? `REGLA DE ORO DE TOMA DE DECISIONES INTERACTIVAS ('ask_questions'):
+Estás en el Turno 1 (Kickoff inicial) de un proyecto nuevo sin archivos adjuntos ni URL de referencia.
+Si el requerimiento del usuario admite varias direcciones de producto o estilos visuales (ej. 'hazme un sistema para clínica dental', 'crea una app de delivery', 'hazme un SaaS de reservas'):
+TIENES PERMITIDO invocar la herramienta interactiva 'ask_questions' para presentar entre 1 y 3 preguntas clave (máximo 3):
+1. Alcance / Arquitectura / Flujo Principal (tipo 'single_choice', ej. '¿Qué modalidad de atención deseas priorizar?').
+2. Dirección Visual y Paleta de Colores (tipo 'visual_choice' con swatches de 4 códigos HEX reales en cada opción, ej. Paleta Médica Azul ['#0f2b48', '#38bdf8', '#f8fafc', '#1e293b'], Paleta Bienestar Menta ['#064e3b', '#10b981', '#f0fdf4', '#0f172a']).
+3. Opcional: Modalidad o Integración clave.
+SIEMPRE marca una de las opciones como recommended: true en cada pregunta para permitir avance con un solo clic.
+Una vez invocada 'ask_questions', tu turno termina de inmediato para que el usuario elija interactivamente en la interfaz.
+
+CUÁNDO ESTÁ ESTRICTAMENTE PROHIBIDO PREGUNTAR (DECISIÓN 100% AUTÓNOMA):
+- Si el usuario adjuntó un PDF, imagen o URL: PROHIBIDO preguntar. Extrae los colores y estilos directamente del material y construye de inmediato.
+- NUNCA hagas preguntas técnicas de bajo nivel (ej. nombres de tablas SQL, puertos, librerías npm, estructura de carpetas). Esas decisiones técnicas las tomas tú como Arquitecto.
+- Si el pedido ya define claramente lo que quiere, construye directamente sin preguntar.` : `PROHIBICIÓN ESTRICTA DE PREGUNTAS DE CLARIFICACIÓN:
 El usuario ha proporcionado instrucciones directas, específicas o contenido técnico concreto (código, script SQL, o entidades identificadas).
 Queda ESTRICTAMENTE PROHIBIDO invocar la herramienta 'ask_question' o solicitar clarificación sobre qué módulo modificar. Procede de inmediato con la ejecución o implementación directa.`}
 ` : '';
 
 
 
+  
+  const archDirectiveSection = `
+[DIRECTIVA DE PRESENTACIÓN DE ARQUITECTURA Y CÓDIGO - ESTÁNDAR LOVABLE]
+Cuando presentes la arquitectura del proyecto, un plan técnico o la organización de archivos (especialmente en modo Plan o consultas de estructura), incluye siempre una sección:
+### Estructura del Sistema
+con un bloque \`\`\`text dibujando el árbol limpio de directorios y archivos con ├──, │, └── y comentarios explicativos # Descripción alineados a la derecha. Todo bloque de código debe tener su identificador de lenguaje (\`\`\`tsx, \`\`\`jsx, \`\`\`sql, \`\`\`text, \`\`\`bash).
+`;
+
+
   const planModeSection =
-
     mode === 'plan'
-
       ? `
-
-
-
-MODO PLAN ACTIVO: en este modo NO tienes herramientas para proponer cambios (ni de código, ni de base de datos, ni de archivos) — literalmente no están disponibles. Tu trabajo aquí es explorar el repositorio (con "list_files"/"read_file"), entender el pedido del usuario, discutir el enfoque, señalar archivos relevantes, riesgos o alternativas, y proponer un plan en TEXTO. No digas "voy a proponer el cambio", porque no puedes: explica qué harías cuando el usuario cambie a modo Build.`
-
+[MODO PLAN ACTIVO - ESTÁNDAR LOVABLE]
+En este modo NO tienes herramientas de modificación directa de archivos ni bases de datos (están deliberadamente deshabilitadas).
+Tu misión es planificar y estructurar la solución técnica.
+DEBES invocar la herramienta interactiva 'propose_tasks' para proponer un plan ordenado y detallado con título, resumen ejecutivo y las tareas específicas (incluyendo los archivos que se modificarán o crearán en 'filesToTouch').
+Al llamar a 'propose_tasks', el usuario verá una tarjeta interactiva en el chat con opciones para [✓ Aprobar y construir plan] o [Ajustar plan].`
       : ''
 
 
@@ -1072,7 +1372,8 @@ AGENTE DE IA CON HERRAMIENTAS (real, distinto del chat simple de "IA DENTRO DE L
     Boolean(a.extractedText && a.filename?.toLowerCase().includes('brochure'))
   )
   const hasPdfAttachment = pdfAttachments.length > 0
-  const isUrlAndPdfConsulting = Boolean(detectedUrl && hasPdfAttachment)
+  // En modo BUILD (o si el usuario pide construir/mejorar/hacer), isUrlAndPdfConsulting DEBE ser false para no bloquear herramientas de edición
+  const isUrlAndPdfConsulting = !isExplicitBuildMode && Boolean(detectedUrl && hasPdfAttachment && !promptIntent?.hasActionOrder)
 
   const strategicConsultingGuidance = isUrlAndPdfConsulting
     ? `
@@ -1102,6 +1403,52 @@ Este es un requerimiento de CONSULTORÍA ESTRATÉGICA, AUDITORÍA CRO/SEO Y/O RE
      * Construye la aplicación aplicando las directivas de Dirección de Arte UI/UX Senior.`
     : ''
 
+  // DIRECTIVA OBLIGATORIA DE FUSIÓN DE FUENTES (URL EXTERNA + BROCHURE PDF)
+  const dualSourceFusionDirective = (detectedUrl && hasPdfAttachment)
+    ? `
+═══════════════════════════════════════════════════════════════════════
+🎯 DIRECTIVA DE FUSIÓN DE DOBLE FUENTE (URL EXTERNA + BROCHURE PDF)
+═══════════════════════════════════════════════════════════════════════
+Has recibido simultáneamente una URL externa (${detectedUrl}) y un documento/brochure PDF (${pdfAttachments.map(p => p.filename).join(', ')}).
+Debes orquestar ambas fuentes con las siguientes prioridades estrictas:
+
+1. FUENTE PRIMARIA DE CONTENIDO Y MARCA (BROCHURE PDF):
+   - El Brochure PDF es la FUENTE DE LA VERDAD para el catálogo técnico, textos normativos oficiales, certificaciones (INDECI, NFPA, CNE, ISO), logotipo oficial y fotografías de activos reales ubicadas en '/doc-assets/'.
+   - Extrae del PDF la estructura exacta de servicios, fichas técnicas, normas vigentes y clientes homologados.
+
+2. FUENTE SECUNDARIA DE CONTACTO Y COMPARATIVA (URL EXTERNA):
+   - Usa los datos de la URL antigua para auditar qué estructura previa tenía el cliente, rescatar datos de contacto adicionales (teléfonos, WhatsApp, correos, dirección exacta, sedes) y detectar debilidades visuales a superar.
+   - Moderniza radicalmente la interfaz respecto a la URL antigua aplicando el arquetipo de diseño industrial de alta conversión.
+
+3. REGLA ESTRICTA DE IMÁGENES:
+   - Si algún servicio mencionado en la web o en el brochure no cuenta con fotografía propia de alta calidad dentro de '/doc-assets/', utiliza "curate_images" para obtener fotos curadas del sector industrial o "generate_image".
+   - ESTÁ ESTRICTAMENTE PROHIBIDO recortar fondos vacíos, telas o trajes del PDF.`
+    : ''
+
+  // DETECCIÓN DE SOLICITUD DE HOSTING ESTÁTICO / CERO TANSTACK
+  const isStaticHostingRequested = /\b(?:no\s+(?:quiero|us(?:es|ar))\s+tanstack|tanstack\s*router|sin\s+tanstack|convertir[eé]\s+a\s+est[aá]tica|versi[oó]n\s+est[aá]tica|web\s+est[aá]tica|hosting\s+est[aá]tico|para\s+subir(?:la)?\s+a\s+mi\s+web|para\s+subir(?:la)?\s+a\s+mi\s+hosting|en\s+archivos\s+est[aá]ticos|cpanel|hostinger|apache|nginx\s+est[aá]tico|dist\.zip|dist\s+est[aá]tico)\b/i.test(userMessage || '')
+
+  const staticHostingDirective = isStaticHostingRequested
+    ? `
+═══════════════════════════════════════════════════════════════════════
+📦 DIRECTIVA DE ARQUITECTURA: SPA ESTÁTICA PURA (HOSTING COMPARTIDO / CERO TANSTACK)
+═══════════════════════════════════════════════════════════════════════
+El usuario ha solicitado explícitamente una versión estática pura para subir a hosting compartido (cPanel, Hostinger, Apache, Nginx):
+
+1. PROHIBIDO TANSTACK ROUTER Y SSR:
+   - Está TERMINANTEMENTE PROHIBIDO instalar o importar '@tanstack/react-router', '@tanstack/react-start', 'next' o cualquier framework con acoplamiento a SSR.
+   - Usa React 18 + Vite SPA pura con enrutamiento por estado ('useState') o Hash portable que funcione de forma autónoma al abrir los archivos estáticos en cualquier servidor web sin reescritura de URLs de Node.js.
+
+2. ASSETS Y VITE CONFIG:
+   - Todo activo de 'public/doc-assets/' debe referenciarse como '/doc-assets/...' o './doc-assets/...' para que al ejecutar 'npm run build' Vite copie todos los archivos a 'dist/doc-assets/'.
+   - No toques 'server.port' ni 'server.host' en 'vite.config.js'.
+   - PROHIBICIÓN TOTAL DE '@tailwindcss/vite': El entorno de FlowPro utiliza Tailwind CSS v3 con PostCSS estándar (postcss.config.js + @vitejs/plugin-react). Queda TERMINANTEMENTE PROHIBIDO importar '@tailwindcss/vite' o usar 'tailwindcss()' en vite.config.js (esto romperá el contenedor de vista previa). En vite.config.js usa únicamente plugins: [react()].
+
+3. FORMULARIOS 100% OPERATIVOS CON WHATSAPP INTELIGENTE:
+   - Todo formulario de contacto o cotización debe incluir acción de envío directo a WhatsApp oficial con mensaje pre-formateado (https://wa.me/51...?...con desglose de productos/servicios seleccionados, RUC y teléfono).
+   - De este modo, la web es 100% comercialmente operativa y funcional de inmediato tras subir el ZIP estático a cPanel sin requerir backend Node.js.`
+    : ''
+
   const attachmentSection = attachments.length
 
     ? `
@@ -1112,7 +1459,7 @@ El usuario adjuntó ${attachments.length === 1 ? 'un archivo' : `${attachments.l
 
         .map((a, i) => `[índice ${i}] "${a.filename}" (${a.mimeType}, ${a.kind === 'pdf' ? 'documento PDF con texto extraído' : 'imagen'})`)
 
-        .join(', ')}. Ya los tienes disponibles arriba en el contenido del mensaje (puedes verlos/leerlos directamente).${strategicConsultingGuidance}
+        .join(', ')}. Ya los tienes disponibles arriba en el contenido del mensaje (puedes verlos/leerlos directamente).${strategicConsultingGuidance}${dualSourceFusionDirective}${staticHostingDirective}
 
 Decide qué hacer según lo que pida el usuario:
 
@@ -1192,17 +1539,35 @@ Es una ruta pública (sin autenticación) pensada para que la llame el frontend 
 
 
 
+  const targetSourceFile = normalizeSourcePath(elementContext?.sourceFile || elementContext?.source?.fileName);
+  const targetSourceLine = elementContext?.sourceLine || elementContext?.source?.lineNumber;
+
   const elementSection = elementContext
-    ? `\n\nELEMENTO SELECCIONADO VISUALMENTE (CLICK-TO-EDIT): el usuario eligió un elemento puntual de la vista previa (con el selector visual) antes de escribir este mensaje — su pedido es sobre ESE elemento específico, no una descripción general.
-- Etiqueta: <${elementContext.tagName || 'elemento'}>
-- Clases CSS: ${elementContext.className || '(ninguna)'}
+    ? `\n\nELEMENTO SELECCIONADO VISUALMENTE CON PUNTERO DE PRECISIÓN (CLICK-TO-EDIT):
+el usuario eligió un elemento puntual de la vista previa con el selector visual:
+${targetSourceFile ? `- Archivo exacto: "${targetSourceFile}"${targetSourceLine ? ` (línea ${targetSourceLine})` : ''}\n` : ''}- Etiqueta: <${elementContext.tagName || 'elemento'}>
+- Clases CSS: ${elementContext.currentClasses || elementContext.className || '(ninguna)'}
 - Texto visible: "${elementContext.innerText || elementContext.textSnippet || ''}"
 ${elementContext.componentName ? `- Componente React: <${elementContext.componentName} />\n` : ''}${elementContext.parentHierarchy ? `- Jerarquía contenedor: ${elementContext.parentHierarchy}\n` : ''}${
-        elementContext.source
-          ? ` Salió del archivo "${elementContext.source.fileName}", línea ${elementContext.source.lineNumber}. Empezá leyendo ese archivo y ubicá esa zona exacta antes de proponer el cambio.`
-          : ` No se pudo determinar el archivo exacto de origen, pero sí esta pista — usala para encontrarlo con "list_files"/"read_file": selector "${elementContext.selectorPath}", etiqueta <${elementContext.tagName}>${elementContext.textSnippet ? `, con el texto "${elementContext.textSnippet}"` : ''}. HTML del elemento: ${elementContext.outerHTMLSnippet || ''}`
+        targetSourceFile
+          ? `🎯 INSTRUCCIÓN DE EJECUCIÓN DIRECTA EN RONDA 1: El usuario seleccionó con el puntero visual el elemento en ${targetSourceFile}${targetSourceLine ? ` (línea ${targetSourceLine})` : ''}. Aplica el cambio solicitado DIRECTAMENTE en la Ronda 1 usando replace_file_content sobre ${targetSourceFile} sin hacer lecturas adicionales.`
+          : ` No se pudo determinar el archivo exacto de origen, pero sí esta pista — usala para encontrarlo: selector "${elementContext.selectorPath}", etiqueta <${elementContext.tagName}>${elementContext.textSnippet ? `, con el texto "${elementContext.textSnippet}"` : ''}. HTML del elemento: ${elementContext.outerHTMLSnippet || ''}`
       }`
     : ''
+
+  const activeViewFile = normalizeSourcePath(activeViewContext?.focusedFile);
+  const activeViewSection = (!elementContext && activeViewContext && (activeViewContext.route || activeViewFile || activeViewContext.visibleHeading || activeViewContext.activeModal || activeViewContext.activeTab))
+    ? `\n\n[CONTEXTO DE VISTA ACTIVA DEL USUARIO (activeViewContext)]
+El usuario está viendo actualmente en la pantalla de la vista previa:
+- Ruta actual: "${activeViewContext.route || '/'}"
+${activeViewContext.visibleHeading ? `- Título/Sección visible en pantalla: "${activeViewContext.visibleHeading}"\n` : ''}${activeViewContext.activeModal ? `- Modal/Diálogo activo en pantalla: "${activeViewContext.activeModal}"\n` : ''}${activeViewContext.activeTab ? `- Pestaña/Tab activa: "${activeViewContext.activeTab}"\n` : ''}${activeViewFile ? `- Componente/Archivo visualizado: "${activeViewFile}"\n` : ''}
+REGLA DE EDICIÓN DIRECTA EN RONDA 1:
+Si el usuario hace referencia implícita ("este botón", "este título", "cambia el color", "agrega una opción aquí", "el formulario"), se refiere INEQUÍVOCAMENTE al componente visible arriba (${activeViewFile || 'de la vista activa'}).
+NO pierdas una ronda llamando a read_file ni list_files para buscar dónde está. Procede DIRECTAMENTE en la Ronda 1 a modificarlo o crea los cambios con replace_file_content / apply_diff.`
+    : '';
+
+  const colloquialMatch = matchColloquialSkillsAndComponents(userMessage);
+  const colloquialSection = colloquialMatch?.directivePromptBlock || '';
 
 
 
@@ -1223,20 +1588,15 @@ ${elementContext.componentName ? `- Componente React: <${elementContext.componen
   // comentario oculto y nunca llegan al usuario como texto — ver runAgent() más abajo.
 
   const suggestionsSection =
-
     mode === 'plan'
-
       ? ''
-
       : `
 
-
-
-SUGERENCIAS DE PRÓXIMO PASO: después de tu resumen normal en texto, agregá una línea aparte con un comentario HTML oculto (el usuario nunca lo ve como texto, se muestra como botones aparte) con 2 o 3 ideas cortas y concretas de qué podría pedir a continuación, basadas en el estado real de ESTE proyecto (lo que ya viste del árbol de archivos/esquema y lo que acabás de hacer) — nada genérico ni repetido de un turno a otro si podés evitarlo. Formato EXACTO, una sola línea, array JSON de strings en español, nunca lo menciones ni lo expliques en tu respuesta visible:
-
-<!--suggestions:["Agregar autenticación con Supabase","Conectar el formulario a una tabla nueva"]-->
-
-Si de verdad no hay ningún próximo paso razonable (poco común), omití esta línea por completo en vez de forzar algo.`
+SUGERENCIAS DE PRÓXIMO PASO (CHIPS INFERIORES ESTILO LOVABLE):
+Al final de tu respuesta en modo BUILD, agrega SIEMPRE una etiqueta con 2 o 3 sugerencias cortas (de máximo 4-5 palabras) 100% adaptadas al proyecto actual y a lo que acabas de construir (ej. "¿Configurar SEO técnico?", "Conectar a WhatsApp", "Filtro por categorías"):
+<suggestions>["Sugerencia 1", "Sugerencia 2", "Sugerencia 3"]</suggestions>
+(o <!--suggestions:["Sugerencia 1", "Sugerencia 2", "Sugerencia 3"]-->)
+Estas sugerencias se extraen automáticamente para los botones rápidos del chat y NO se muestran en el texto de tu respuesta. NUNCA las expliques ni hagas preguntas de cierre al usuario.`
 
 
 
@@ -1319,7 +1679,9 @@ INSTRUCCIONES DETERMINISTAS DE INFRAESTRUCTURA (CUMPLIMIENTO ESTRICTO):
 4. ACCIÓN OBLIGATORIA: Usa 'read_file' para revisar 'src/App.jsx' y todos los componentes en 'src/components/'. Encuentra la inconsistencia de código en React y corrígela con 'replace_file_content', 'propose_patch' o 'propose_change'.
 ` : '';
 
-  return `Eres el agente de IA de FlowPro, un asistente que ayuda a desarrolladores a modificar su repositorio de GitHub (y, si está conectada, su base de datos) mediante conversación.${knowledgeSection}${memorySection}${skillsSection}${blackScreenSection}
+  return `${archDirectiveSection}
+
+Eres el agente de IA de FlowPro, un asistente que ayuda a desarrolladores a modificar su repositorio de GitHub (y, si está conectada, su base de datos) mediante conversación.${knowledgeSection}${memorySection}${skillsSection}${blackScreenSection}
 
 
 
@@ -1346,6 +1708,10 @@ INSTRUCCIONES DETERMINISTAS DE INFRAESTRUCTURA (CUMPLIMIENTO ESTRICTO):
    - NUNCA respondas con frases vacías como "Listo." sin contenido explicativo útil para el usuario.
 
 ### CRITICAL EXECUTION RULE (ZERO CONVERSATIONAL DRIFT EN ÓRDENES DE CAMBIO)
+
+### STRICT EDITING DIRECTIVE: ATOMIC PATCHES VIA 'replace_file_content'
+Para editar archivos que YA EXISTEN en el proyecto (cambiar colores, clases CSS/Tailwind, textos, rutas de imágenes, botones o props), es ESTRICTAMENTE OBLIGATORIO usar 'replace_file_content' enviando únicamente las líneas exactas a modificar ('search_block' -> 'replace_block' o lista 'replacements').
+Está TERMINANTEMENTE PROHIBIDO usar 'propose_change' para reescribir archivos enteros de cientos de líneas cuando solo cambia una parte menor del archivo. Reescribir archivos completos destruye el rendimiento y aumenta la latencia por un factor de 10x. Reserva 'propose_change' ÚNICAMENTE para crear archivos 100% NUEVOS que no existían previamente.
 
 When the user asks for a visual, architectural, or structural change (e.g. "hazlo un iphone simulador", "agrega login", "cambia los colores"), you MUST NEVER describe what you are going to do or ask if you should proceed.
 
@@ -1498,8 +1864,8 @@ If a design request is broad or ambiguous, make executive architectural decision
 
 3. PROHIBICIÓN TOTAL DE INVENTAR URLs O IDs DE IMÁGENES (UNSPLASH / PEXELS):
    - Queda TERMINANTEMENTE PROHIBIDO inventar URLs con IDs alucinados de Unsplash (ej. "https://images.unsplash.com/photo-1581092187-abc..."). Esos IDs inventados provocan errores 404 o imágenes que no corresponden a la sección.
-   - Para toda imagen fotográfica, DEBES invocar la herramienta "curate_images" para obtener URLs 100% verificadas del catálogo curado, o emplear las URLs inyectadas por el sistema.
-   - Para logos, isotipos y gráficos vectoriales: diséñalos siempre como componentes SVG inline limpios con Tailwind CSS y Lucide icons. NUNCA uses URLs externas dudosas para logos.
+   - Para toda imagen fotográfica que no provenga de un documento adjunto (/doc-assets/), o cuando el documento adjunto NO contenga fotografía para un producto o servicio específico, DEBES invocar la herramienta "curate_images" para obtener URLs 100% verificadas del catálogo curado, o emplear "generate_image".
+   - Para logos, isotipos y gráficos vectoriales: si existe el logo en /doc-assets/, úsalo directamente o recórtalo con "crop_image_region". Si no existe logo corporativo provisto por el usuario, diséñalo como componente SVG inline limpio con Tailwind CSS y Lucide icons. NUNCA uses URLs externas dudosas para logos.
 
 ### PRIORIDAD ABSOLUTA A RESTRICCIONES NEGATIVAS DEL USUARIO (MANDATORIO)
 
@@ -1541,18 +1907,22 @@ Este proyecto corre en FlowPro, una plataforma de desarrollo con IA. Las capacid
 
 
 
-3. **ESTILO DE RESPUESTA AL USUARIO (ESTÁNDAR LOVABLE — AMIGABLE, CLARO Y ESTRUCTURADO):**
-
-   - Never write a lengthy preamble about what you are going to do before calling tools; let the tool calls and VFS file writes do the work.
-
-   - Cada vez que construyas o modifiques la aplicación, NUNCA respondas con un párrafo corrido separado por comas ni con jerga cruda de commits. Escribe siempre para el usuario con esta estructura limpia en Markdown:
-
-     1. **Apertura directa y amigable (1-2 líneas):** Resume qué acabas de construir o cómo integraste sus ideas (ej. "Tu aplicación ya está lista y combina los módulos solicitados en tres vistas principales:").
-     2. **Viñetas por Pantalla o Funcionalidad (con títulos en negrita):**
-        - **Nombre de la pantalla o función:** explica en lenguaje claro y directo qué ve el usuario ahí y qué botones, controles o interacciones puede usar (usando comillas para nombres de botones, ej. "Reconocer alarma").
-     3. **Verificación / Caso de prueba (1 línea):** Menciona brevemente cómo se comporta el flujo principal o qué dato de prueba dejaste activo para que lo pruebe de inmediato.
-     4. **Ten en cuenta estos detalles / alcance (Solo si aplica en proyectos complejos como hardware, PLC, IA local o integraciones externas):**
-        - Si el usuario pidió algo que involucra hardware físico (PLCs, Modbus, Mini-PC, modelos .onnx pesados o APIs externas sin credenciales aún), añade una sección breve con viñetas en **negrita** explicando con total transparencia qué parte está simulada en el navegador y qué requiere conexión externa.
+3. ## ESTILO DE COMUNICACIÓN CON EL USUARIO (message_user)
+   - Una vez aplicados los cambios de código, invoca obligatoriamente la herramienta "message_user" con:
+     * summary: Título corto y semántico para la VersionCard (3 a 6 palabras). Ej: 'Flujo de compartir y descarga PNG' o 'Botón de acceso en Login'. PROHIBIDO usar títulos genéricos como 'Actualización de interfaz'.
+     * message: Respuesta conversacional, cálida, clara y concisa para el usuario (1 a 2 oraciones cortas, o máximo 3 viñetas breves si se hicieron varios cambios).
+   - Habla como un diseñador e ingeniero de producto humano, cercano, claro y directo.
+   - PROHIBIDO empezar todos los mensajes con la muletilla "Listo:" o "Hecho:". Varía tu apertura de forma natural y ve directo al valor de lo que cambiaste.
+   - PROHIBIDO agregar al final frases defensivas o de relleno como "; el resto de módulos se mantienen intactos" o "; todo sigue funcionando con normalidad".
+   - PROHIBIDO escribir párrafos gigantes de 8 líneas unidos por punto y coma.
+   - Si fue 1 cambio puntual (ej. Click-to-Edit en un botón): responde en 1 sola oración corta y amigable (máximo 25 palabras).
+     Ejemplo: "Aumenté el tamaño del botón **Ingresar a Modamia** y le añadí una sombra suave para darle mayor protagonismo."
+   - Si fueron 2 o 3 cambios distintos: usa 1 frase corta de apertura seguida de 2 o 3 viñetas (bullets) de 1 línea cada una, fáciles de escanear en 3 segundos.
+   - NUNCA menciones nombres de archivos internos ('.jsx', 'src/...'), hooks de React ni comandos de compilación en el mensaje al usuario.
+   - SUGERENCIAS DE PRÓXIMO PASO (CHIPS INFERIORES):
+     Al final del mensaje, incluye una etiqueta con 3 sugerencias cortas (de máximo 4-5 palabras) adaptadas al proyecto actual:
+     <suggestions>["Sugerencia 1", "Sugerencia 2", "Sugerencia 3"]</suggestions>
+     (Estas sugerencias se extraen automáticamente para los chips interactivos sobre la caja de chat y no se muestran en el texto del mensaje).
 
 
 
@@ -1576,7 +1946,7 @@ Reglas importantes:
 
 - Si hay una base de datos conectada, TÚ la administras con "propose_migration" (crear tablas, columnas, políticas, lo que haga falta). Nunca le pidas al usuario que entre a Supabase a hacerlo manualmente: él solo aprueba lo que le propones, igual que con el código.
 
-- Cuando termines de proponer todos los cambios de este turno, cierra SIEMPRE con el formato estructurado estándar Lovable (Apertura amigable, Viñetas por Pantalla o Funcionalidad en negrita, Verificación, y Detalles de alcance si aplica). NUNCA uses un párrafo corrido separado por comas ni estilo changelog telegráfico.
+- Cuando termines de proponer los cambios de este turno, invoca obligatoriamente "message_user" con un summary semántico y tu mensaje humano final siguiendo el ESTILO DE COMUNICACIÓN CON EL USUARIO. Cero mención de archivos internos, cero muletillas defensivas o de módulos intactos.
 
 - Usá "update_memory" cuando construyas algo estructuralmente importante (una convención de carpetas/estado que vas a repetir, una decisión de arquitectura, algo no obvio que te costó descubrir) o cuando el usuario te cuente algo durable del proyecto que no esté ya en tu memoria — así no lo tenés que redescubrir leyendo archivos en un turno futuro. No la actualices por cambios chicos/triviales (un texto, un color, un ajuste de estilo).
 
@@ -1630,7 +2000,7 @@ ${wasTriaged ? '\nNOTA sobre el árbol de abajo: es un RECORTE (otra IA lo filtr
 
 Árbol de archivos del repositorio${truncated ? ` (mostrando los primeros ${MAX_TREE_ENTRIES} de ${treePaths.length})` : ''}:
 
-${listing}${dbSection}${edgeFunctionSection}${attachmentSection}${planModeSection}${previewSection}${appAiSection}${elementSection}${semanticGraphSection ? `\n\n${semanticGraphSection}` : ''}${dbSchemaGraphSection ? `\n\n${dbSchemaGraphSection}` : ''}${casualSection}${suggestionsSection}`
+${listing}${dbSection}${edgeFunctionSection}${attachmentSection}${planModeSection}${previewSection}${appAiSection}${elementSection}${activeViewSection}${colloquialSection}${semanticGraphSection ? `\n\n${semanticGraphSection}` : ''}${dbSchemaGraphSection ? `\n\n${dbSchemaGraphSection}` : ''}${casualSection}${suggestionsSection}`
 
 }
 
@@ -1662,9 +2032,10 @@ export const codeTools = [
 
       type: 'object',
 
-      properties: { path: { type: 'string', description: 'Ruta del archivo, ej. src/App.jsx' } },
-
-      required: ['path'],
+      properties: {
+        path: { type: 'string', description: 'Ruta del archivo, ej. src/App.jsx' },
+        paths: { type: 'array', items: { type: 'string' }, description: 'Lista opcional de rutas para leer múltiples archivos en lote en una sola ronda' }
+      },
 
     },
 
@@ -1704,7 +2075,7 @@ export const codeTools = [
 
     description:
 
-      'Propone un cambio a un archivo escribiendo su contenido COMPLETO de cero. No se aplica hasta que el usuario lo apruebe. Para un archivo NUEVO, usa esta. Para editar un archivo EXISTENTE, preferí "propose_patch" — "propose_change" exige reescribir el archivo entero, y si es grande (más de lo que mostró "read_file", que se corta en 100000 caracteres) vas a tener que inventar el resto que nunca leíste, arruinándolo con contenido que no existe de verdad.',
+      'RESERVADA EXCLUSIVAMENTE PARA CREAR ARCHIVOS NUEVOS. Si el archivo ya existe en el proyecto, está PROHIBIDO usar propose_change; usa obligatoriamente "replace_file_content" para editar solo las líneas modificadas sin reescribir el archivo entero, y si es grande (más de lo que mostró "read_file", que se corta en 100000 caracteres) vas a tener que inventar el resto que nunca leíste, arruinándolo con contenido que no existe de verdad.',
 
     input_schema: {
 
@@ -1762,7 +2133,7 @@ export const codeTools = [
 
     description:
 
-      'Edición atómica por bloques de código (line replace). Reemplaza un bloque exacto de código (search_block) por un nuevo bloque (replace_block) en un archivo existente sin reescribir el archivo entero. search_block DEBE coincidir exactamente una sola vez en el archivo. Úsala siempre para editar archivos existentes sin destruir exportaciones ni código existente.',
+      'HERRAMIENTA PRIMARIA Y OBLIGATORIA PARA EDITAR ARCHIVOS EXISTENTES. Aplica parches diferenciales atómicos por bloques de código (search_block -> replace_block o array "replacements: [{ search_block, replace_block }]") en milisegundos sin reescribir el archivo entero. Permite múltiples parches en un mismo archivo y múltiples llamadas paralelas en una sola respuesta.',
 
     input_schema: {
 
@@ -1777,6 +2148,24 @@ export const codeTools = [
         search_block: { type: 'string', description: 'Bloque exacto de código a reemplazar (debe ser único en el archivo)' },
 
         replace_block: { type: 'string', description: 'Nuevo código que reemplazará a search_block' },
+
+        targetContent: { type: 'string', description: 'Alias de search_block' },
+
+        replacementContent: { type: 'string', description: 'Alias de replace_block' },
+
+        replacements: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              search_block: { type: 'string' },
+              replace_block: { type: 'string' },
+              targetContent: { type: 'string' },
+              replacementContent: { type: 'string' }
+            }
+          },
+          description: 'Lista opcional de múltiples bloques de código a reemplazar en el mismo archivo secuencialmente en una sola llamada'
+        },
 
         summary: { type: 'string', description: 'Resumen breve de la edición (1 frase)' },
 
@@ -1814,6 +2203,37 @@ export const codeTools = [
 
   },
 
+  {
+    name: 'inspect_project_image',
+    description: 'Inspecciona visualmente hasta 5 imágenes del proyecto o documentos (ej. "public/doc-assets/imagen.png" o "/doc-assets/imagen.png"). Devuelve las imágenes optimizadas para que puedas ver su contenido real mediante visión multimodal. OBLIGATORIO: Úsala para verificar el contenido visual de imágenes del brochure antes de asignarlas a servicios o componentes.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Lista de rutas relativas o públicas de imágenes a inspeccionar (máximo 5). Ej: ["public/doc-assets/doc-img-1.png", "public/doc-assets/doc-page-01.png"]'
+        }
+      },
+      required: ['paths']
+    }
+  },
+  {
+    name: 'crop_image_region',
+    description: 'Recorta una región rectangular precisa usando coordenadas en porcentaje (0 a 100%) y guarda el resultado en "public/doc-assets/<outputFileName>". Devuelve inmediatamente la imagen recortada para verificación visual multimodal. REGLA ESTRICTA: NUNCA uses (0, 0) a ciegas para logos, ya que la esquina superior izquierda suele contener fotos de portada o cabeceras, no logotipos. En SERGESOL, el logo está en la esquina inferior derecha (pág 1) o inferior izquierda (pág 2).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        sourcePath: { type: 'string', description: 'Ruta de la imagen de origen (ej: "public/doc-assets/brochure-page-02.png" o "/doc-assets/brochure-page-02.png")' },
+        leftPercent: { type: 'number', description: 'Posición X inicial en porcentaje del ancho total (0 a 100)' },
+        topPercent: { type: 'number', description: 'Posición Y inicial en porcentaje de la altura total (0 a 100)' },
+        widthPercent: { type: 'number', description: 'Ancho del recorte en porcentaje del ancho total (0 a 100)' },
+        heightPercent: { type: 'number', description: 'Alto del recorte en porcentaje de la altura total (0 a 100)' },
+        outputFileName: { type: 'string', description: 'Nombre del archivo resultante en public/doc-assets/ (ej: "logo-oficial.png")' }
+      },
+      required: ['sourcePath', 'leftPercent', 'topPercent', 'widthPercent', 'heightPercent', 'outputFileName']
+    }
+  },
   {
 
     name: 'reset_project',
@@ -2083,11 +2503,63 @@ const edgeFunctionTool = {
 
 
 
-const askQuestionTool = {
+const askQuestionsTool = {
+  name: 'ask_questions',
+  description:
+    'Presenta al usuario entre 1 y 3 preguntas interactivas estructuradas para definir alcance, arquitectura o dirección visual (estilo Lovable). Soporta opciones de texto (single_choice) y paletas de colores visuales con swatches HEX reales (visual_choice). Úsala ÚNICAMENTE en el Turno 1 (kickoff) si el pedido es ambiguo y no tiene adjuntos ni URLs. Tras llamarla, tu turno termina ahí.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      introText: {
+        type: 'string',
+        description: 'Frase breve de introducción (ej. "Para diseñar la mejor solución para tu proyecto, define tus preferencias:")'
+      },
+      questions: {
+        type: 'array',
+        description: 'Entre 1 y 3 preguntas clave',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Identificador único de la pregunta (ej. "scope", "color_palette")' },
+            header: { type: 'string', description: 'Chip o badge en mayúsculas (ej. "ESTRUCTURA", "PALETA DE COLOR")' },
+            question: { type: 'string', description: 'La pregunta clara y directa' },
+            type: {
+              type: 'string',
+              enum: ['single_choice', 'visual_choice'],
+              description: '"visual_choice" para mostrar paletas de color con muestras visuales, o "single_choice" para texto'
+            },
+            options: {
+              type: 'array',
+              description: 'Entre 2 y 4 opciones',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  label: { type: 'string', description: 'Título de la opción' },
+                  description: { type: 'string', description: 'Explicación del beneficio o alcance de esta opción' },
+                  recommended: { type: 'boolean', description: 'true si esta es la opción recomendada' },
+                  swatches: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Array de 3 o 4 códigos Hex de color (ej. ["#0f2b48", "#f97316", "#0f172a", "#f8fafc"]) si el type es "visual_choice"'
+                  }
+                },
+                required: ['label']
+              }
+            }
+          },
+          required: ['id', 'question', 'options']
+        }
+      }
+    },
+    required: ['questions']
+  }
+}
 
+const askQuestionTool = {
   name: 'ask_question',
   description:
-    'Muestra al usuario una tarjeta con opciones para elegir dentro del chat (estilo Lovable), en vez de escribir la pregunta como texto plano. Usala cuando de verdad haya un puñado de alternativas concretas entre las que el usuario tiene que decidir antes de que sigas (ej. qué canales conectar, qué alcance darle a algo grande y ambiguo) — NO para confirmaciones simples de sí/no, ni para preguntas abiertas de texto libre, ni cuando el pedido ya es lo bastante claro para simplemente hacerlo. Tras llamarla, tu turno termina ahí: no asumas ni inventes una respuesta, esperala en el próximo mensaje del usuario.',
+    'Versión individual de pregunta interactiva. Presenta una tarjeta con opciones al usuario. Tras llamarla, tu turno termina ahí.',
   input_schema: {
     type: 'object',
     properties: {
@@ -2103,17 +2575,78 @@ const askQuestionTool = {
           properties: {
             label: { type: 'string', description: 'Nombre corto de la opción' },
             description: { type: 'string', description: 'Una frase explicando qué implica elegir esta opción' },
-            recommended: { type: 'boolean', description: 'true si esta es la opción que recomiendas (máximo una por pregunta)' }
+            recommended: { type: 'boolean', description: 'true si esta es la opción que recomiendas (máximo una por pregunta)' },
+            swatches: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Array de códigos Hex si es una selección de color'
+            }
           },
-          required: ['label'],
-        },
-      },
+          required: ['label']
+        }
+      }
     },
-    required: ['question', 'header', 'body', 'options'],
-  },
+    required: ['question', 'header', 'body', 'options']
+  }
 }
 
 
+const proposeTasksTool = {
+  name: 'propose_tasks',
+  description:
+    'Propone una hoja de ruta o plan estructurado de tareas (roadmap) para aprobación interactiva del usuario antes de comenzar a implementar código (estilo Lovable). Úsala obligatoriamente cuando estés en modo PLAN o cuando el usuario solicite planificar o estructurar el trabajo antes de construir.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      title: {
+        type: 'string',
+        description: 'Título conciso y profesional del plan o funcionalidad (ej. "Sistema de Reservas y Pagos")'
+      },
+      summary: {
+        type: 'string',
+        description: 'Resumen de alto nivel del enfoque arquitectónico y funcional'
+      },
+      tasks: {
+        type: 'array',
+        description: 'Lista ordenada de tareas técnicas a realizar',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Identificador único de la tarea (ej. "task_1")' },
+            title: { type: 'string', description: 'Título conciso de la tarea' },
+            description: { type: 'string', description: 'Detalle técnico de lo que se implementará en este paso' },
+            filesToTouch: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Archivos que serán creados o modificados en esta tarea'
+            }
+          },
+          required: ['id', 'title']
+        }
+      }
+    },
+    required: ['title', 'tasks']
+  }
+}
+
+export const messageUserTool = {
+  name: 'message_user',
+  description: 'Entrega el mensaje final amigable al usuario y el título semántico de la tarjeta de versión una vez aplicados los cambios de código. Debe llamarse al finalizar la edición en modo Build.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      summary: {
+        type: 'string',
+        description: "Título corto y semántico para la VersionCard (3 a 6 palabras). Ej: 'Flujo de compartir y descarga PNG' o 'Botón de acceso en Login'. PROHIBIDO usar títulos genéricos como 'Actualización de interfaz'."
+      },
+      message: {
+        type: 'string',
+        description: 'Respuesta conversacional, cálida, clara y concisa para el usuario (1 a 2 oraciones cortas, o máximo 3 viñetas breves si se hicieron varios cambios). Sin rutas de archivos internos ni jerga robótica.'
+      }
+    },
+    required: ['summary', 'message']
+  }
+}
 
 const MAX_MEMORY_CHARS = 6000
 
@@ -2483,61 +3016,201 @@ export const runWithTimeout = (promise, ms = 20000, toolName = 'herramienta') =>
   });
 };
 
+export function deriveSemanticTitleFromUserPrompt(userMessage) {
+  if (!userMessage || typeof userMessage !== 'string') return null;
+  let text = userMessage.trim();
+  // Quitar etiquetas XML / Markdown y URLs
+  text = text.replace(/<[^>]+>/g, ' ').replace(/https?:\/\/[^\s]+/g, '').replace(/[#*`_~]/g, '').trim();
+  // Si tiene múltiples oraciones o líneas, tomar la primera
+  const firstSentence = text.split(/[.\n;!?]/)[0].trim();
+  if (!firstSentence) return null;
+
+  // Limpiar aperturas comunes
+  let cleaned = firstSentence.replace(/^(?:por favor,?\s*|podrías,?\s*|puedes,?\s*|quiero\s+que\s*|necesito\s+que\s*|haz\s+que\s*|ayúdame\s+a\s*|quisiera\s*)/i, '').trim();
+
+  // Normalizar verbos iniciales a sustantivos de acción
+  cleaned = cleaned
+    .replace(/^agregar?\s+/i, 'Integración de ')
+    .replace(/^añadir?\s+/i, 'Integración de ')
+    .replace(/^crear?\s+/i, 'Creación de ')
+    .replace(/^implementar?\s+/i, 'Implementación de ')
+    .replace(/^cambiar?\s+/i, 'Ajuste de ')
+    .replace(/^modificar?\s+/i, 'Ajuste de ')
+    .replace(/^actualizar?\s+/i, 'Actualización de ')
+    .replace(/^corregir?\s+/i, 'Corrección de ')
+    .replace(/^arreglar?\s+/i, 'Corrección de ')
+    .replace(/^eliminar?\s+/i, 'Eliminación de ')
+    .replace(/^diseñar?\s+/i, 'Diseño de ')
+    .replace(/^ajustar?\s+/i, 'Ajuste de ');
+
+  // Tomar entre 2 y 6 palabras
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  if (words.length >= 2) {
+    const candidate = words.slice(0, 6).join(' ');
+    if (candidate.length >= 4 && candidate.length <= 50) {
+      return candidate.charAt(0).toUpperCase() + candidate.slice(1);
+    }
+  }
+  return null;
+}
+
+export function sanitizeFinalAssistantText(rawText) {
+  if (!rawText || typeof rawText !== 'string') return '';
+
+  let cleaned = rawText
+    .replace(/<suggestions>[\s\S]*?<\/suggestions>/gi, '')
+    .replace(/<!--\s*suggestions\s*:[\s\S]*?-->/gi, '')
+    .replace(/<!--\s*requires_approval\s*:\s*(true|false)\s*-->/gi, '')
+    .replace(/<thought>[\s\S]*?<\/thought>/gi, '')
+    .replace(/\b(?:zZ|thinking:?|razonamiento:?)[\s\S]*?(?=\n\n|\n[A-Z]|$)/gi, '')
+    .trim();
+
+  // Limpiar inicio repetitivo tipo "Listo:", "Hecho:", "Actualizado:", etc.
+  cleaned = cleaned.replace(/^(?:Listo|Hecho|Actualizado|Completado):\s*/i, '');
+
+  // Limpiar cualquier cola defensiva sobre módulos intactos o normalidad
+  cleaned = cleaned.replace(/;?\s*(?:todo(?:\s+el)?|toda\s+la|el\s+resto|los\s+demás|las\s+demás)[^.]*?(?:intactos?|normalidad)\.?$/i, '');
+  cleaned = cleaned.replace(/;?\s*(?:el\s+resto\s+de\s+la\s+(?:web|app|aplicación|página))[^.]*?(?:intactos?|normalidad)\.?$/i, '');
+  cleaned = cleaned.replace(/;?\s*(?:los\s+demás\s+módulos|el\s+resto\s+del\s+sistema)[^.]*?(?:intactos?|normalidad)\.?$/i, '');
+
+  // Limpiar comas o puntos y coma colgantes al final
+  cleaned = cleaned.replace(/[;,]\s*$/, '').trim();
+
+  // Reemplazar menciones directas a rutas internas técnicas por nombres limpios
+  cleaned = cleaned.replace(/`?src\/(?:components|pages|views|lib|services|styles)\/([a-zA-Z0-9_-]+)\.[a-zA-Z0-9]+`?/g, (_, name) => {
+    return `el componente **${name}**`;
+  });
+  cleaned = cleaned.replace(/`?src\/App\.(?:jsx|tsx)`?/g, 'la vista principal');
+
+  // Asegurar mayúscula inicial
+  if (cleaned.length > 0) {
+    cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+  }
+
+  // Asegurar puntuación final si no termina en punto, interrogación o exclamación
+  if (cleaned && !/[.!?]$/.test(cleaned)) {
+    cleaned += '.';
+  }
+
+  return cleaned;
+}
+
+export function deriveVersionTitle(proposedChanges = [], proposedDbChanges = [], fallback = null, proposedAssetChanges = [], userMessage = '') {
+  // 1. Extraer título semántico de la intención del prompt del usuario si existe
+  if (userMessage) {
+    const promptTitle = deriveSemanticTitleFromUserPrompt(userMessage);
+    if (promptTitle) return promptTitle;
+  }
+
+  // 2. Priorizar archivos visuales y de interfaz (pages, views, components, App)
+  if (proposedChanges && proposedChanges.length > 0) {
+    const uiChange = proposedChanges.find(c => {
+      const p = (typeof c === 'string' ? c : c.path || '').toLowerCase();
+      return p.includes('pages/') || p.includes('views/') || p.includes('components/') || p.endsWith('app.jsx') || p.endsWith('app.tsx');
+    }) || proposedChanges[0];
+    const path = typeof uiChange === 'string' ? uiChange : uiChange.path || '';
+    const baseName = path.split('/').pop()?.replace(/\.[^.]+$/, '');
+    if (baseName && baseName !== 'index' && baseName !== 'main') {
+      if (baseName === 'App') return 'Vista principal y navegación';
+      const summary = typeof uiChange === 'object' && uiChange.summary ? String(uiChange.summary).trim() : '';
+      if (summary && summary.length >= 6 && summary.length <= 45 && !summary.toLowerCase().startsWith('cambio en')) {
+        return summary.charAt(0).toUpperCase() + summary.slice(1);
+      }
+      return `Módulo ${baseName}`;
+    }
+  }
+
+  // 3. Si solo hubo cambios en base de datos, limpiar y formatear el slug snake_case
+  if (proposedDbChanges && proposedDbChanges.length > 0) {
+    const firstDb = proposedDbChanges[0];
+    let s = String(firstDb.summary || '').trim();
+    if (s && !s.includes('.sql')) {
+      s = s.replace(/^(?:create|ensure|provision|enable|setup)_/i, '')
+           .replace(/_/g, ' ')
+           .trim();
+      if (s.length > 0 && s.length < 50) {
+        return s.charAt(0).toUpperCase() + s.slice(1);
+      }
+    }
+    return 'Esquema y base de datos';
+  }
+
+  // 4. Si hubo cambios de assets visuales
+  if (proposedAssetChanges && proposedAssetChanges.length > 0) {
+    return 'Recursos visuales y logotipos';
+  }
+
+  if (fallback && fallback !== 'Actualización de interfaz') {
+    return fallback;
+  }
+
+  return 'Mejoras en la aplicación';
+}
+
 export function buildLovableStructuredResponse(allSummaries = [], options = {}) {
-  const { requiresApproval = false, proposedChanges = [] } = options;
+  const { requiresApproval = false, proposedChanges = [], proposedDbChanges = [], proposedAssetChanges = [] } = options;
 
-  let opening = 'Tu aplicación ya está lista con los siguientes cambios integrados:';
+  let response = '';
 
-  const bullets = allSummaries.map((summary, idx) => {
-    const clean = String(summary || '').trim();
-
-    // 1. Si ya viene con formato "Título: Descripción"
-    const colonIdx = clean.indexOf(':');
-    if (colonIdx > 0 && colonIdx < 50) {
-      const title = clean.slice(0, colonIdx).trim().replace(/^\*+|\*+$/g, '');
-      const desc = clean.slice(colonIdx + 1).trim();
-      return `- **${title}:** ${desc}`;
-    }
-
-    // 2. Si contiene "Cambio/Ajuste en path: desc" o "Cambio en path"
-    const matchEn = clean.match(/^(?:Cambio|Ajuste|Creación|Modificación|Implementación)\s+(?:en|de)\s+([^\s:]+)(?::\s*(.*))?$/i);
-    if (matchEn) {
-      const filePart = matchEn[1].split('/').pop()?.replace(/\.[^.]+$/, '') || matchEn[1];
-      const desc = matchEn[2] ? matchEn[2].trim() : `Actualizado y configurado ${matchEn[1]}`;
-      return `- **${filePart}:** ${desc}`;
-    }
-
-    // 3. Si coincide con algún archivo propuesto
-    const relatedChange = proposedChanges[idx];
-    if (relatedChange?.path) {
-      const fileName = relatedChange.path.split('/').pop()?.replace(/\.[^.]+$/, '') || 'Componente';
-      return `- **${fileName}:** ${clean}`;
-    }
-
-    // 4. Si tiene "X en Y.ext" (ej. "Script de entrenamiento en scripts/train.py")
-    const matchEnPath = clean.match(/^(.+?)\s+en\s+([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)$/i);
-    if (matchEnPath) {
-      const target = matchEnPath[2].split('/').pop()?.replace(/\.[^.]+$/, '') || matchEnPath[2];
-      return `- **${target}:** ${matchEnPath[1]}`;
-    }
-
-    return `- **Módulo ${idx + 1}:** ${clean}`;
+  const uiChanges = (proposedChanges || []).filter(c => {
+    const p = (typeof c === 'string' ? c : c.path || '').toLowerCase();
+    return p.includes('src/') || p.endsWith('.jsx') || p.endsWith('.tsx') || p.endsWith('.css') || p.endsWith('.html');
   });
 
-  const bulletsText = bullets.length > 0
-    ? bullets.join('\n')
-    : '- **Actualización general:** Componentes y vistas actualizados según tu requerimiento.';
+  const dbList = proposedDbChanges || [];
+  const assetList = proposedAssetChanges || [];
 
-  let response = `${opening}\n\n${bulletsText}\n\n**Verificación:** Puedes probar los nuevos controles e interactuar con la vista previa de inmediato.`;
+  if (uiChanges.length > 0) {
+    const names = uiChanges
+      .map(c => {
+        const p = typeof c === 'string' ? c : c.path || '';
+        return p.split('/').pop()?.replace(/\.[^.]+$/, '');
+      })
+      .filter(n => n && n !== 'index' && n !== 'main')
+      .slice(0, 4);
+
+    if (names.length > 0) {
+      const functionalThemes = names.map(n => {
+        if (/hero/i.test(n)) return 'el banner hero con propuesta de valor y llamados a la acción';
+        if (/nav|header/i.test(n)) return 'la cabecera de navegación con identidad visual corporativa';
+        if (/service/i.test(n)) return 'el catálogo de servicios técnicos especializados';
+        if (/project/i.test(n)) return 'la galería de proyectos ejecutados y casos de éxito';
+        if (/client|trust|partner/i.test(n)) return 'la franja de clientes y empresas que confían en la marca';
+        if (/why|us/i.test(n)) return 'los diferenciadores estratégicos y razones de elección';
+        if (/process|work/i.test(n)) return 'el flujo de trabajo y metodología de ejecución';
+        if (/contact|form/i.test(n)) return 'el módulo de cotización y canales directos de contacto';
+        if (/footer/i.test(n)) return 'el pie de página con información legal y enlaces clave';
+        if (/data/i.test(n)) return 'la estructura de datos y contenidos verificados';
+        return `la sección de ${n.replace(/([A-Z])/g, ' $1').toLowerCase().trim()}`;
+      });
+      const uniqueThemes = [...new Set(functionalThemes)].slice(0, 3);
+      response = `He estructurado y actualizado la aplicación, incorporando ${uniqueThemes.join(', ')} con diseño responsivo y fidelidad de contenidos.`;
+    } else {
+      response = 'He actualizado los componentes principales de la interfaz con diseño responsivo y fidelidad de contenidos.';
+    }
+  } else if (dbList.length > 0) {
+    response = 'Configuré la estructura y tablas necesarias en la base de datos PostgreSQL.';
+  } else if (assetList.length > 0) {
+    const assetNames = assetList.map(a => a.filename || (typeof a.path === 'string' ? a.path.split('/').pop() : '')).filter(Boolean).slice(0, 3);
+    if (assetNames.length > 0) {
+      response = "He integrado los recursos visuales (" + assetNames.map(n => "**" + n + "**").join(", ") + ") en la aplicación.";
+    } else {
+      response = 'He integrado los recursos visuales y logotipos actualizados en el proyecto.';
+    }
+  } else if (allSummaries.length > 0) {
+    response = 'He aplicado las actualizaciones solicitadas en el proyecto.';
+  } else {
+    response = 'He revisado el proyecto y aplicado las modificaciones requeridas.';
+  }
 
   if (requiresApproval) {
-    response += '\n\nRevisa los cambios propuestos para continuar con la siguiente etapa del proyecto.';
+    response += '\n\nRevisa los cambios en la vista previa para continuar.';
   }
 
   return response;
 }
 
-export async function runAgent({ agentId, accessToken, project, history: initialHistory = [], userMessage, signal, isExplicitCancel, dbConnection, attachments: rawAttachments = [], mode = 'build', onProgress, ownerKey, elementContext }) {
+export async function runAgent({ agentId, accessToken, project, history: initialHistory = [], userMessage, signal, isExplicitCancel, dbConnection, attachments: rawAttachments = [], mode = 'build', isAutoFix = false, onProgress, ownerKey, elementContext, activeViewContext }) {
   let history = Array.isArray(initialHistory) ? [...initialHistory] : []
 
   onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Planificando solución...' })
@@ -2547,6 +3220,7 @@ export async function runAgent({ agentId, accessToken, project, history: initial
   const proposedDbChanges = []
 
   const proposedAssetChanges = []
+  const inspectedImagePaths = new Set()
 
   const proposedEdgeFunctions = []
 
@@ -2555,8 +3229,23 @@ export async function runAgent({ agentId, accessToken, project, history: initial
   let didResetProject = false
 
   let askedQuestion = null
+  let proposedPlan = null
+  let userMessagePayload = null
+
+  let successfulDbMigrationsCount = 0
 
   const readCache = new Map() // evita releer el mismo archivo dos veces en este turno
+  const readFilesCache = readCache // alias unificado para consistencia en todo el ciclo de vida del agente
+
+  const readFileCached = async (targetPath) => {
+    if (readCache.has(targetPath)) return readCache.get(targetPath)
+    const content = await readProjectFile(project, accessToken, targetPath, signal)
+    readCache.set(targetPath, content)
+    return content
+  }
+
+  // Obtener la lista de archivos del proyecto de inmediato para usarla en diagnósticos, catálogo de doc-assets y prompts
+  let treePaths = await getCachedTreePaths(project, accessToken, signal).catch(() => [])
 
 
 
@@ -2612,10 +3301,9 @@ ${a.extractedText || '(Documento procesado sin texto legible)'}
     userMessage = `${userMessage}\n\n${docsText}`
   }
 
-  // ── FASE 8: CATÁLOGO DE ACTIVOS MULTIMEDIA EXTRAÍDOS DE .docx E IMÁGENES SUBIDAS ───────────
-  // Colecta todas las imágenes incrustadas en los documentos adjuntos (.docx con logos, QRs, etc.)
-  // y también imágenes directas subidas al chat, inyectándolas en el prompt como catálogo de rutas reales
-  // (/doc-assets/...) y pasando hasta 4 imágenes al LLM como visión multimodal.
+  // ── FASE 8: CATÁLOGO DE ACTIVOS MULTIMEDIA EXTRAÍDOS DE DOCUMENTOS/PDFs E IMÁGENES SUBIDAS ───────────
+  // Colecta todas las imágenes incrustadas en los documentos adjuntos (.docx o .pdf con logos, imágenes de servicio)
+  // y también imágenes directas subidas al chat, o persistidas previamente en public/doc-assets/
   const docExtractedAssets = documentAttachments.flatMap(a => a.extractedAssets || [])
   const directImageAssets = rawAttachments
     .filter(a => (a.kind === 'image' || a.mimeType?.startsWith('image/')) && a.base64 && !a._fromDocAsset)
@@ -2628,7 +3316,28 @@ ${a.extractedText || '(Documento procesado sin texto legible)'}
       contextHint: 'Imagen/Logo subido directamente por el usuario al chat',
       isMultimodal: false, // Ya está en attachments
     }))
-  const allExtractedAssets = [...docExtractedAssets, ...directImageAssets]
+
+  // Recuperar también activos existentes en el proyecto (/doc-assets/) si no vinieron en este turno
+  const existingProjectDocAssets = []
+  if (Array.isArray(treePaths)) {
+    const assetPaths = treePaths.filter(p => p.startsWith('public/doc-assets/') || p.startsWith('doc-assets/'))
+    for (const ap of assetPaths) {
+      const fName = path.basename(ap)
+      // Evitar duplicar si ya vino en este turno
+      if (!docExtractedAssets.some(d => d.fileName === fName) && !directImageAssets.some(d => d.fileName === fName)) {
+        const isLogo = fName.toLowerCase().includes('logo') || fName.toLowerCase().includes('brand')
+        existingProjectDocAssets.push({
+          fileName: fName,
+          publicPath: `/doc-assets/${fName}`,
+          mimeType: 'image/png',
+          contextHint: isLogo ? 'Logo corporativo / isotipo del proyecto' : 'Activo gráfico / fotografía del proyecto',
+          isMultimodal: false
+        })
+      }
+    }
+  }
+
+  const allExtractedAssets = [...docExtractedAssets, ...directImageAssets, ...existingProjectDocAssets]
 
   if (allExtractedAssets.length > 0) {
     // 1. Construir catálogo de rutas para el prompt
@@ -2640,14 +3349,69 @@ ${a.extractedText || '(Documento procesado sin texto legible)'}
     const assetSection = `\n\n=== IMÁGENES Y LOGOS EXTRAÍDOS DEL DOCUMENTO ADJUNTO (DISPONIBLES EN EL PROYECTO) ===
 ${assetCatalog}
 
-REGLA OBLIGATORIA — LECTURA DE IMÁGENES DEL DOCUMENTO:
-1. NUNCA inventes logos falsos dibujados con SVG ni digas que "no puedes depositar archivos binarios" o que "no existe una ruta de imagen". Las imágenes del documento ya están extraídas y disponibles en las rutas /doc-assets/ listadas arriba.
-2. Usa DIRECTAMENTE <img src="/doc-assets/NOMBRE_ARCHIVO" ... /> con las rutas exactas del catálogo anterior, respetando la proporción y posición original indicada.
-3. Si el usuario pide replicar el documento o colocar el logo, usa la imagen real del catálogo, nunca SVG ni placeholder genérico.
-4. Para guardar permanentemente las imágenes en el repositorio GitHub, usa "propose_asset_upload" con la ruta pública correcta (ej. "public/doc-assets/image1.png") — las imágenes están disponibles como adjuntos con índice a partir de ${attachments.length}.
+REGLA OBLIGATORIA — BIFURCACIÓN DETERMINISTA DE IMÁGENES:
+1. RAMA A — CUANDO LA FOTOGRAFÍA O ACTIVO SÍ EXISTE EN EL DOCUMENTO SUBIDO (/doc-assets/):
+   - Usa DIRECTAMENTE <img src="/doc-assets/NOMBRE_ARCHIVO" ... /> con las rutas exactas del catálogo anterior, verificando con "inspect_project_image" que la imagen corresponda con exactitud al producto o servicio antes de asignarla en el código.
+   - Si el logotipo oficial está disponible en /doc-assets/, úsalo directamente. NUNCA inventes logos con SVG ni placeholders si el logo real existe en el catálogo.
+
+2. RAMA B — CUANDO UN PRODUCTO O SERVICIO NO TIENE FOTOGRAFÍA PROPIA EN EL DOCUMENTO SUBIDO:
+   - PROHIBIDO utilizar "crop_image_region" para intentar adivinar o recortar fotos de productos, servicios, personas o fondos desde las páginas generales del documento PDF. La herramienta "crop_image_region" está reservada EXCLUSIVAMENTE para extraer el Logotipo corporativo oficial o sellos/firmas.
+   - Si un producto o servicio del catálogo (ejemplo: "Tablero Eléctrico de Distribución y Fuerza") fue mencionado en el texto del brochure pero NO tiene una foto física específica entre las imágenes extraídas (/doc-assets/), ESTÁ ESTRICTAMENTE PROHIBIDO recortar fotos de personas, vehículos, trajes o márgenes vacíos de las páginas.
+   - En este caso, DEBES invocar de inmediato la herramienta "curate_images" (catálogo industrial verificado de imageCurator.js) o "generate_image" para asignarle una fotografía profesional auténtica de alta calidad y 100% coherente con el título del producto/servicio.
+   - Comunica transparentemente en tu respuesta: "El brochure oficial no incluye una fotografía específica de [producto]; he integrado una fotografía técnica verificada de alta resolución conforme a la normativa".
+
+3. Para guardar permanentemente imágenes en el repositorio GitHub, usa "propose_asset_upload" con la ruta pública correcta (ej. "public/doc-assets/NOMBRE.png") — las imágenes están disponibles como adjuntos con índice a partir de ${attachments.length}.
 === FIN DEL CATÁLOGO DE ACTIVOS ===`
 
-    userMessage = `${userMessage}${assetSection}`
+    // Detección matemática de paleta corporativa desde el manifest o activos
+    let detectedBrandPalette = null
+    const docWithManifest = documentAttachments.find(a => a.manifest?.brandPalette)
+    if (docWithManifest) {
+      detectedBrandPalette = docWithManifest.manifest.brandPalette
+    }
+    if (!detectedBrandPalette) {
+      const manifestAsset = allExtractedAssets.find(a => a.isManifest || a.fileName === 'manifest.json')
+      if (manifestAsset?.base64) {
+        try {
+          const parsed = JSON.parse(Buffer.from(manifestAsset.base64, 'base64').toString('utf-8'))
+          if (parsed.brandPalette) detectedBrandPalette = parsed.brandPalette
+        } catch (_) {}
+      }
+    }
+    if (!detectedBrandPalette && typeof previewDir === 'string' && previewDir) {
+      try {
+        const manifestDiskPath = path.join(previewDir, 'public/doc-assets/manifest.json')
+        if (fs.existsSync(manifestDiskPath)) {
+          const parsedDisk = JSON.parse(fs.readFileSync(manifestDiskPath, 'utf-8'))
+          if (parsedDisk.brandPalette) detectedBrandPalette = parsedDisk.brandPalette
+        }
+      } catch (_) {}
+    }
+
+    let brandPaletteSection = ''
+    if (detectedBrandPalette) {
+      brandPaletteSection = `\n\n=== PALETA CORPORATIVA DETECTADA (MATEMÁTICAMENTE EXTRAÍDA DEL DOCUMENTO/LOGO) ===
+- Primario Dominante: ${detectedBrandPalette.primaryHex} (HSL: ${detectedBrandPalette.primaryHsl})
+- Secundario / Acento: ${detectedBrandPalette.secondaryHex} (HSL: ${detectedBrandPalette.secondaryHsl})
+- Acento Dinámico: ${detectedBrandPalette.accentHex} (HSL: ${detectedBrandPalette.accentHsl})
+- Tono de Superficie Recomendado: ${detectedBrandPalette.surfaceTone}
+- Neutral Dark: ${detectedBrandPalette.neutralDarkHex || '#0f172a'} (HSL: ${detectedBrandPalette.neutralDarkHsl || '222 47% 11%'})
+- Neutral Light: ${detectedBrandPalette.neutralLightHex || '#f8fafc'} (HSL: ${detectedBrandPalette.neutralLightHsl || '210 40% 98%'})
+
+REGLA ESTRICTA DE TOKENS SEMÁNTICOS (src/index.css):
+Debes configurar y aplicar estos valores exactos de HSL en :root en "src/index.css" para que toda la interfaz adopte la identidad visual corporativa extraída:
+:root {
+  --primary: ${detectedBrandPalette.primaryHsl};
+  --primary-foreground: 0 0% 100%;
+  --secondary: ${detectedBrandPalette.secondaryHsl};
+  --secondary-foreground: 0 0% 100%;
+  --accent: ${detectedBrandPalette.accentHsl};
+  --accent-foreground: 0 0% 100%;
+  --ring: ${detectedBrandPalette.primaryHsl};
+}`
+    }
+
+    userMessage = `${userMessage}${assetSection}${brandPaletteSection}`
 
     // 2. Agregar las primeras 4 imágenes multimodal al array de attachments para visión del LLM
     const multimodalAssets = allExtractedAssets
@@ -2665,7 +3429,8 @@ REGLA OBLIGATORIA — LECTURA DE IMÁGENES DEL DOCUMENTO:
 
     // Agregar al array de attachments ANTES del cálculo de storageAvailable
     if (multimodalAssets.length > 0) {
-      attachments.push(...multimodalAssets)
+      attachments.push(...multimodalAssets);
+      multimodalAssets.forEach(a => inspectedImagePaths.add(path.basename(a.filename)));
     }
   }
 
@@ -2688,7 +3453,7 @@ REGLA OBLIGATORIA — LECTURA DE IMÁGENES DEL DOCUMENTO:
   const isExplicitChat = ['chat', 'query', 'ask'].includes(requestedMode)
   const isPlanMode = requestedMode === 'plan'
 
-  const promptIntent = analyzePromptIntent(userMessage);
+  const promptIntent = analyzePromptIntent(userMessage, { mode: requestedMode, isExplicitBuild });
   const negativeConstraints = extractNegativeConstraints(userMessage);
 
   // ── REINICIO O PIVOTE TOTAL DE PROYECTO (isProjectResetOrder) ──
@@ -2809,7 +3574,7 @@ REGLA OBLIGATORIA — LECTURA DE IMÁGENES DEL DOCUMENTO:
 
 
 
-  const treePaths = await getCachedTreePaths(project, accessToken, signal)
+  treePaths = await getCachedTreePaths(project, accessToken, signal)
 
 
 
@@ -2942,6 +3707,39 @@ onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Analizando intenci�
 
     : await triageRelevantFiles(treePaths, userMessage).catch(() => treePaths)
 
+  // Pre-Inyección en contexto inicial de archivos relevantes prioritarios + App.jsx + index.css
+  const preInjectedFiles = new Map()
+  const priorityPathsToPreload = new Set([
+    'src/App.jsx',
+    'src/App.tsx',
+    'src/index.css',
+    ...(Array.isArray(displayTreePaths) ? displayTreePaths.slice(0, 6) : [])
+  ])
+
+  for (const p of priorityPathsToPreload) {
+    if (treePaths.includes(p)) {
+      try {
+        let content = semanticFilesMap?.[p]
+        if (!content && readFileCached) {
+          content = await readFileCached(p)
+        }
+        if (content && typeof content === 'string' && content.length < 50000) {
+          preInjectedFiles.set(p, content)
+          readFilesCache.set(p, content)
+        }
+      } catch (_) {}
+    }
+  }
+
+  let preInjectedSection = ''
+  if (preInjectedFiles.size > 0 && turnMode === 'BUILD') {
+    preInjectedSection = '\n\n### CÓDIGO FUENTE PRE-INSPECCIONADO RELEVANTE (YA EN CONTEXTO)\nLos siguientes archivos ya han sido pre-cargados en memoria para este turno:\n'
+    for (const [p, c] of preInjectedFiles.entries()) {
+      preInjectedSection += '\n--- ARCHIVO: ' + p + ' ---\n```\n' + c + '\n```\n';
+    }
+    preInjectedSection += '\nDIRECTIVA ESTRICTA: ESTÁ TERMINANTEMENTE PROHIBIDO llamar a "read_file" sobre los archivos incluidos arriba; aplica directamente "replace_file_content" para cumplir la solicitud del usuario en este único turno.\n'
+  }
+
   const schemaDetails = dbConnection ? await getCachedSchemaSummary(dbConnection) : {}
 
   const userId = ownerKey ? ownerKey.split(':')[1] : null;
@@ -2984,8 +3782,9 @@ onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Analizando intenci�
     semanticGraphSection,
     dbSchemaGraphSection,
     promptIntent,
-    currentAppContent
-  ) + (previewRealityCheck
+    currentAppContent,
+    activeViewContext
+  ) + (preInjectedSection || '') + (previewRealityCheck
 
     ? `\n\nEl usuario está reportando un problema con la vista previa en este mensaje. ${previewRealityCheck}\nUsá esto como punto de partida real — no respondas "todo funciona" o "no encontré ningún error" si este estado dice lo contrario. Si hace falta más detalle, igual podés llamar "check_preview_errors" o "test_preview" de nuevo vos mismo.`
 
@@ -2995,8 +3794,19 @@ onProgress?.({ type: 'telemetry', phase: 'THINKING', label: 'Analizando intenci�
 
     : '')
 
+  if (isAutoFix) {
+    systemPrompt += `\n\n### MODO AUTO-CURACIÓN DE EMERGENCIA (CRITICAL AUTO-HEALING):
+La vista previa ha crasheado o fallado en compilar. Tu ÚNICO objetivo es reparar el código y restaurar la vista previa inmediatamente.
+REGLAS ESTRICTAS DE ESTE TURNO:
+1. ESTRICTAMENTE PROHIBIDO emitir texto conversacional explicativo, introducciones, disculpas o saludos.
+2. Usa directamente 'replace_file_content', 'propose_patch' o 'propose_change' para corregir el archivo y las importaciones afectadas.
+3. No formules preguntas ni pidas confirmación al usuario. Repara el error de forma autónoma ahora mismo.`
+  }
+
+  const isBlankPreviewReport = /\b(?:no\s+se\s+ve\s+(?:la\s+)?vista\s+previa|pantalla\s+en\s+blanco|preview\s+en\s+blanco|no\s+carga\s+(?:la\s+)?vista\s+previa|no\s+funciona\s+(?:el\s+)?preview|pantalla\s+(?:negra|vac[ií]a)|vista\s+previa\s+en\s+blanco)\b/i.test(userMessage || '');
+
   // Pre-escaneo automático de componentes ante reporte de pantalla negra / vista previa vacía
-  if (promptIntent?.isBlackScreenReport) {
+  if (promptIntent?.isBlackScreenReport || isBlankPreviewReport) {
     try {
       const appFile = currentAppContent || (await readFileCached('src/App.jsx').catch(() => '')) || (await readFileCached('src/App.tsx').catch(() => '')) || '';
       if (appFile) {
@@ -3137,7 +3947,7 @@ REGLAS ESTRICTAS DE ESTE TURNO:
 1. REGLA DE RESPUESTA DUAL OBLIGATORIA:
    - PRIMERO: Responde de forma directa, clara y explicativa a la pregunta o diagnóstico que planteó el usuario (ej. explica por qué falta el elemento, cuál es la causa del fallo o cómo está estructurado).
    - SEGUNDO: Aplica las modificaciones de código necesarias usando replace_file_content / propose_patch / propose_change o migraciones.
-   - TERCERO: Describe brevemente los cambios aplicados.
+   - TERCERO: Describe lo que el usuario ve en pantalla ahora (siguiendo la directiva post-edición estilo Lovable, sin nombres de archivos ni SQL).
 2. PROHIBIDO RESPUESTAS MUDAS: Queda estrictamente PROHIBIDO emitir únicamente un resumen de cambios (o respuestas tipo "Listo. <cambio>") ignorando la pregunta del usuario. Tu respuesta de texto debe contestar la duda planteada en lenguaje natural.
 3. PRINCIPIO DE MÍNIMA INTERVENCIÓN: Modifica ÚNICAMENTE los archivos especificados en la instrucción.
 </system_behavior_contract>
@@ -3151,7 +3961,7 @@ ESTADO ACTUAL: Modo Build (Construcción) ACTIVO. Tienes autorización plena y h
 REGLAS DE MODO BUILD (ACTUAL):
 - Eres un AGENTE AUTÓNOMO: ejecuta la solución directamente usando \`propose_change\`, \`replace_file_content\`, \`propose_patch\` o herramientas de base de datos.
 - CONTINUACIÓN TRAS DIAGNÓSTICO: Si este turno es una confirmación corta del usuario (ej. 'si', 'sí', 'dale', 'ok', 'adelante', 'procede', 'hazlo', 'de acuerdo', 'por favor') tras haber propuesto mejoras en el turno anterior, EJECUTA de inmediato la implementación de esas mejoras modificando los archivos correspondientes con las herramientas de escritura disponibles.
-- Tu respuesta de texto debe resumir de forma clara, natural y concisa los cambios aplicados en el proyecto.
+- Tu respuesta de texto debe seguir la DIRECTIVA DE COMUNICACIÓN POST-EDICIÓN ESTILO LOVABLE: CERO mención de nombres de archivos ni SQL; habla exclusivamente de lo que el usuario ve en pantalla con confirmación de integridad y añade <suggestions> al final.
 - FORMATO DE TEXTO Y CARACTERES UNICODE (PROHIBICIÓN TOTAL DE LATEX CRUDO):
   * Queda estrictamente PROHIBIDO emitir comandos o delimitadores de LaTeX crudo como '$\\\\rightarrow$', '$\\\\leftarrow$', '$\\\\leftrightarrow$', '\\\\cdot', '\\\\times', etc. en tus respuestas de texto o explicaciones del chat.
   * Emplea siempre caracteres Unicode limpios y directos: '→', '←', '↔', '•', '✓', '×', '±', '≥', '≤'.
@@ -3196,6 +4006,25 @@ REGLAS DE MODO BUILD (ACTUAL):
   
   systemPrompt += behavioralContract;
 
+  // Inyección de Caja de Herramientas UI Preinstalada (@/components/ui)
+  const uiToolboxPrompt = `
+CAJA DE HERRAMIENTAS UI PREINSTALADA (@/components/ui):
+Dispones de estos componentes listos en src/components/ui/:
+- Button (@/components/ui/button)
+- Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter (@/components/ui/card)
+- Badge (@/components/ui/badge)
+- Input (@/components/ui/input), Textarea (@/components/ui/textarea), Label (@/components/ui/label), Select (@/components/ui/select)
+- Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter (@/components/ui/dialog)
+- Sheet, SheetContent, SheetHeader, SheetTitle (@/components/ui/sheet)
+- Tabs, TabsList, TabsTrigger, TabsContent (@/components/ui/tabs)
+- Table, TableHeader, TableBody, TableRow, TableHead, TableCell (@/components/ui/table)
+- Accordion, AccordionItem, AccordionTrigger, AccordionContent (@/components/ui/accordion)
+- Separator (@/components/ui/separator), Skeleton (@/components/ui/skeleton), Switch (@/components/ui/switch)
+REGLA: Reutilízalos para modales, tablas, pestañas, acordeones y formularios en lugar de reinventar modales o botones desde cero.
+`;
+
+  systemPrompt += uiToolboxPrompt;
+
   const isPureQuestionReadOnly = Boolean(promptIntent.isPureQuestion && !promptIntent.hasActionOrder);
 
   if (!amplification.isAmplified) {
@@ -3217,10 +4046,22 @@ REGLAS DE MODO BUILD (ACTUAL):
 ${urlListStr}
 El usuario ha incluido una o más URLs externas para su análisis, auditoría, mejora o referencia.
 PROTOCOLO OBLIGATORIO DE ESTE TURNO:
-1. DEBES INVOCAR PRIMERO la herramienta 'read_website_url' con cada URL relevante (${detectedUrls[0]}) para inspeccionar el contenido real, estructura de navegación, propuesta de valor, textos y servicios antes de responder.
-2. PROHIBIDO responder o diagnosticar a ciegas con suposiciones sin antes haber leído la web externa con 'read_website_url'.
-3. Fundamenta tu diagnóstico, recomendaciones o propuesta de diseño en los datos reales extraídos del sitio web (y en los documentos o brochures adjuntos si los hay).
+1. Los activos multimedia del sitio (logo corporativo, hero slides, fotos reales de proyectos y clientes) han sido inspeccionados y descargados a \`public/doc-assets/\` y registrados en \`public/doc-assets/manifest.json\`.
+2. Es OBLIGATORIO usar las rutas locales \`/doc-assets/...\` (como el logo oficial y las fotos del hero) en \`src/components/Navbar.jsx\`, \`Hero.jsx\`, \`ServicesSection.jsx\`, etc.
+3. PROHIBIDO inventar monogramas de texto (como "EP") cuando ya dispones del logo real descargado en \`/doc-assets/\`.
+4. PROHIBIDO usar Unsplash IDs genéricos cuando existen fotos y slides reales descargados en \`/doc-assets/\`.
 </external_url_inspection_protocol>\n`;
+  }
+
+  // ── PROTOCOLO DE PANTALLA EN BLANCO / VISTA PREVIA VACÍA ──
+  if (isBlankPreviewReport) {
+    systemPrompt += `\n\n<blank_preview_directive>
+🚨 PROTOCOLO DE VISTA PREVIA EN BLANCO / PANTALLA VACÍA:
+El usuario informa que no se ve la vista previa o que la pantalla está en blanco.
+- Un problema de vista previa en blanco JAMÁS se resuelve creando tablas o ejecutando SQL en PostgreSQL.
+- Las herramientas de base de datos han sido desactivadas para este turno.
+- Tu misión en este turno es EXCLUSIVAMENTE leer, auditar y corregir el código del frontend (revisando \`src/App.jsx\`, \`src/main.jsx\`, rutas e importaciones de componentes con \`propose_change\` o \`replace_file_content\`).
+</blank_preview_directive>\n`;
   }
 
   // ── PRIORIDAD DETERMINISTA DE ENTRYPOINT EN KICKOFF (src/App.jsx) ──
@@ -3231,23 +4072,26 @@ Estás construyendo o ampliando la interfaz de la aplicación.
 - Es OBLIGATORIO que actualices \`src/App.jsx\` en este mismo turno.
 - \`src/App.jsx\` debe importar y montar todos los componentes principales que crees (Navbar, Hero, Bento Grid, Servicios, FAQ, Footer).
 - Prohibido finalizar el turno dejando \`src/App.jsx\` como plantilla vacía inicial mientras creas componentes en \`src/components/\`.
+- EFICIENCIA DETERMINISTA EN KICKOFF / SCAFFOLD: NO gastes 5 rondas leyendo \`package.json\`, \`vite.config.js\` o \`index.css\` ni listando archivos: el entorno ya tiene Vite, React 19, Tailwind CSS y Lucide-react configurados. Pasa DIRECTAMENTE a proponer los archivos de datos (ej. \`src/data/...\`), los componentes visuales necesarios y el montaje íntegro en \`src/App.jsx\`.
 </entrypoint_priority_directive>\n`;
   }
 
-  const canAskQuestion = shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext });
+  const canAskQuestion = shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext, attachments: rawAttachments.length ? rawAttachments : attachments, history, isInitialKickoff });
 
   const tools = [
 
     ...codeTools.filter((t) => {
-      if ((isPlanMode || turnMode === 'PLAN') && (t.name === 'propose_change' || t.name === 'propose_patch' || t.name === 'replace_file_content' || t.name === 'delete_file' || t.name === 'reset_project')) return false;
+      if ((isPlanMode || turnMode === 'PLAN') && (t.name === 'propose_change' || t.name === 'propose_patch' || t.name === 'replace_file_content' || t.name === 'delete_file' || t.name === 'reset_project' || t.name === 'crop_image_region')) return false;
       if (turnMode === 'QUERY' && (t.name === 'propose_change' || t.name === 'propose_patch' || t.name === 'replace_file_content' || t.name === 'propose_migration' || t.name === 'execute_ddl' || t.name === 'delete_file' || t.name === 'reset_project')) return false;
       // Si es una pregunta pura de diagnóstico o auditoría en modo BUILD (sin orden de mutación), deshabilitar herramientas de mutación
       if (isPureQuestionReadOnly && (t.name === 'propose_change' || t.name === 'propose_patch' || t.name === 'replace_file_content' || t.name === 'delete_file' || t.name === 'reset_project' || t.name === 'propose_migration' || t.name === 'execute_ddl')) return false;
       return true;
     }),
 
-    ...(canAskQuestion ? [askQuestionTool] : []),
+    ...(canAskQuestion ? [askQuestionsTool, askQuestionTool] : []),
 
+    messageUserTool,
+    proposeTasksTool,
     askSecretTool,
 
     updateMemoryTool,
@@ -3273,20 +4117,6 @@ Estás construyendo o ampliando la interfaz de la aplicación.
     curateImagesTool,
 
   ]
-
-
-
-  const readFileCached = async (path) => {
-
-    if (readCache.has(path)) return readCache.get(path)
-
-    const content = await readProjectFile(project, accessToken, path, signal)
-
-    readCache.set(path, content)
-
-    return content
-
-  }
 
 
 
@@ -3397,6 +4227,61 @@ Estás construyendo o ampliando la interfaz de la aplicación.
     }
   };
 
+  const findProjectAssetBuffer = async (rawPath) => {
+    const norm = String(rawPath || '').replace(/^\/+/, '').replace(/^public\//, '');
+    const fileName = path.basename(norm);
+
+    // 1. Proposed asset changes in this turn
+    const inProposed = (proposedAssetChanges || []).find(a => a.filename === fileName || (a.path && a.path.endsWith(fileName)));
+    if (inProposed && inProposed.base64) {
+      return Buffer.from(inProposed.base64, 'base64');
+    }
+
+    // 2. Extracted assets / attachments
+    const inAssets = (allExtractedAssets || attachments || []).find(a => (a.fileName === fileName || a.filename === fileName) && a.base64);
+    if (inAssets && inAssets.base64) {
+      return Buffer.from(inAssets.base64, 'base64');
+    }
+
+    // 3. VPS preview workspaces on disk
+    const previewsBase = '/opt/gitflow-previews';
+    if (fs.existsSync(previewsBase)) {
+      for (let i = 0; i < 5; i++) {
+        const candidate = path.join(previewsBase, `workspace-${i}`, 'public', 'doc-assets', fileName);
+        if (fs.existsSync(candidate)) {
+          try {
+            return fs.readFileSync(candidate);
+          } catch (_) {}
+        }
+      }
+    }
+
+    // 4. Project storage / database / GitHub
+    try {
+      const rel = `public/doc-assets/${fileName}`;
+      const fileRes = await readProjectFile(project, accessToken, rel, signal);
+      if (fileRes) {
+        if (typeof fileRes === 'string') {
+          return Buffer.from(fileRes, 'base64');
+        }
+        if (Buffer.isBuffer(fileRes)) return fileRes;
+      }
+    } catch (_) {}
+
+    // 5. Local candidate paths
+    const localCandidates = [
+      path.join(process.cwd(), 'public', 'doc-assets', fileName),
+      path.join(process.cwd(), fileName),
+    ];
+    for (const c of localCandidates) {
+      if (fs.existsSync(c)) {
+        try { return fs.readFileSync(c); } catch (_) {}
+      }
+    }
+
+    return null;
+  };
+
   const executeToolInternal = async ({ name, input }) => {
     if (signal?.aborted && (isExplicitCancel ? isExplicitCancel() : true)) {
       throw new DOMException('Cancelado por el usuario', 'AbortError')
@@ -3470,17 +4355,36 @@ Estás construyendo o ampliando la interfaz de la aplicación.
         }
       }
 
-      if (name === 'read_website_url') {
+      if (name === 'read_website_url' || name === 'inspect_website_url') {
+        const targetUrl = input?.url || detectedUrls[0]
         try {
-          const res = await runWithTimeout(
-            fetch('https://r.jina.ai/' + input.url, { signal }),
-            20000,
-            'read_website_url'
-          )
-          const text = await res.text()
-          return text.slice(0, 80000)
+          const report = await inspectWebsiteUrl(targetUrl, {
+            project,
+            accessToken,
+            downloadAssets: true
+          })
+          const multimodalBlocks = []
+          if (report.screenshotBase64) {
+            multimodalBlocks.push({
+              type: 'text',
+              text: `[CAPTURA VISUAL EN VIVO]: Inspección visual de la URL "${report.url}" (${report.title}):`
+            })
+            multimodalBlocks.push({
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/jpeg',
+                data: report.screenshotBase64
+              }
+            })
+          }
+          return {
+            ok: true,
+            output: report.structuredSummary || JSON.stringify(report, null, 2),
+            multimodalBlocks: multimodalBlocks.length > 0 ? multimodalBlocks : undefined
+          }
         } catch (e) {
-          return `Error al leer la URL: ${e.message}`
+          return `Error al inspeccionar la URL: ${e.message}`
         }
       }
 
@@ -3488,9 +4392,8 @@ Estás construyendo o ampliando la interfaz de la aplicación.
       if (name === 'inspect_website_url') {
         try {
           const report = await inspectWebsiteUrl(input.url)
-          // Devolver un resumen estructurado en texto plano para que el LLM lo procese
           const lines = [
-            `=== INSPECCIÓN DE URL: ${report.url} ===`,
+            `=== INSPECCIÓN Y AUDITORÍA DE URL: ${report.url} ===`,
             `Título: ${report.title}`,
             `Meta description: ${report.description || '(sin meta description)'}`,
             `H1: ${report.headings?.h1?.join(' | ') || 'sin H1'}`,
@@ -3501,16 +4404,46 @@ Estás construyendo o ampliando la interfaz de la aplicación.
             `EMAILS: ${report.contact?.emails?.join(', ') || '(ninguno)'}`,
             `DIRECCIONES: ${report.contact?.addresses?.join(' | ') || '(ninguna)'}`,
             ``,
+            `SISTEMA DE DISEÑO INVERSO COMPUTADO:`,
+            report.designPalette ? `- Paleta detectada: Primario ${report.designPalette.primaryHex} (HSL: ${report.designPalette.primaryHsl}), Secundario ${report.designPalette.secondaryHex} (HSL: ${report.designPalette.secondaryHsl}), Tono ${report.designPalette.surfaceTone}` : '- Paleta: no extraída',
+            report.computedDesignSystem ? `- Fuentes: Body ${report.computedDesignSystem.fontFamily}, H1 ${report.computedDesignSystem.h1Font}` : '',
+            report.computedDesignSystem ? `- Botones: Fondo ${report.computedDesignSystem.buttonBg}, Radio ${report.computedDesignSystem.buttonRadius}` : '',
+            ``,
             `NAVEGACIÓN: ${report.navLinks?.slice(0, 10).map(l => `${l.text}: ${l.href}`).join(' | ') || 'sin navegación detectada'}`,
             ``,
             `KEYWORDS: ${report.topKeywords?.join(', ') || 'sin keywords'}`,
             ``,
             `CONTENIDO PRINCIPAL (primeros 2000 chars):`,
             report.mainText?.slice(0, 2000) || '',
-          ]
-          return lines.join('\n')
+          ].filter(Boolean)
+
+          const multimodalBlocks = []
+          if (report.screenshotBase64) {
+            multimodalBlocks.push({
+              type: 'text',
+              text: `[CAPTURA VISUAL EN VIVO]: Inspección visual de la URL "${report.url}" (${report.title}):`
+            })
+            multimodalBlocks.push({
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/jpeg',
+                data: report.screenshotBase64
+              }
+            })
+          }
+
+          return {
+            ok: true,
+            output: lines.join('\n'),
+            multimodalBlocks: multimodalBlocks.length > 0 ? multimodalBlocks : undefined
+          }
         } catch (e) {
-          return `Error al inspeccionar la URL: ${e.message}`
+          return {
+            ok: false,
+            is_error: true,
+            output: `Error al inspeccionar la URL: ${e.message}`
+          }
         }
       }
 
@@ -3562,31 +4495,45 @@ Estás construyendo o ampliando la interfaz de la aplicación.
       }
 
       if (name === 'read_file') {
+        const rawPaths = Array.isArray(input.paths) ? input.paths : (input.path ? [input.path] : (input.file_path ? [input.file_path] : []));
+        if (rawPaths.length === 0) {
+          return 'Error: Debes proporcionar "path" o "paths" con la ruta del archivo a leer.';
+        }
 
-        // Si ya propusiste un cambio para esta ruta en este mismo turno, esto ES lo que va a
+        const readResults = [];
+        for (const targetPath of rawPaths) {
+          if (!targetPath) continue;
 
-        // haber ahí apenas se aplique — devolvelo directo, sin ir a buscar el contenido viejo
+          // 1. Si ya se propuso cambio en este turno
+          const staged = stagedContent.get(targetPath);
+          if (staged !== undefined) {
+            readResults.push(`--- ARCHIVO: ${targetPath} ---\n${staged.slice(0, 100000)}`);
+            continue;
+          }
 
-        // del repo real (ver stagedContent más arriba).
+          // 2. Si ya está en cache de lectura de este turno (Guardrail Anti-Relectura)
+          if (readFilesCache.has(targetPath)) {
+            const cachedContent = readFilesCache.get(targetPath);
+            readResults.push(`--- ARCHIVO: ${targetPath} ---\n⚠️ [AVISO: Este archivo ya estaba en tu contexto. Pasa inmediatamente a aplicar los cambios con replace_file_content]\n${String(cachedContent).slice(0, 100000)}`);
+            continue;
+          }
 
-        const staged = stagedContent.get(input.path)
+          // 3. Lectura física desde el proyecto
+          try {
+            const content = await readFileCached(targetPath);
+            if (content !== undefined && content !== null) {
+              readFilesCache.set(targetPath, content);
+              readResults.push(`--- ARCHIVO: ${targetPath} ---\n${String(content).slice(0, 100000)}`);
+            } else {
+              readResults.push(`--- ARCHIVO: ${targetPath} ---\nNo se pudo leer "${targetPath}": archivo no encontrado.`);
+            }
+          } catch (err) {
+            if (err.name === 'AbortError') throw err;
+            readResults.push(`--- ARCHIVO: ${targetPath} ---\nError al leer "${targetPath}": ${err.message}`);
+          }
+        }
 
-        if (staged !== undefined) return staged.slice(0, 100000)
-
-        // 20000 quedaba corto para un componente real con estilos inline (un solo archivo de
-
-        // ~1200 líneas ronda 40000 caracteres) — el modelo nunca veía la segunda mitad del
-
-        // archivo, y como "propose_change" necesita el contenido COMPLETO del archivo (no un
-
-        // diff), terminaba trabado pidiéndole al usuario que le pegue el resto a mano. 100000
-
-        // caracteres (~25k tokens) cubre archivos bastante más grandes que eso sin problema.
-
-        const content = await readFileCached(input.path)
-
-        return content.slice(0, 100000)
-
+        return readResults.length === 1 ? readResults[0] : readResults.join('\n\n');
       }
 
       if (name === 'search_files') {
@@ -3677,7 +4624,34 @@ Estás construyendo o ampliando la interfaz de la aplicación.
 
         }
 
-        const newContent = forcedDbJsContent(filePath) ?? input.new_content
+        let newContent = forcedDbJsContent(filePath) ?? input.new_content
+
+        // Sanitización preventiva de stylesheets (Tailwind v4 -> v3)
+        newContent = sanitizeStylesheets(filePath, newContent);
+
+        // Sanitización preventiva de vite.config
+        newContent = sanitizeViteConfig(newContent);
+
+        // Validación preventiva de imports contra package.json
+        let currentPkg = stagedContent.get('package.json');
+        if (!currentPkg) {
+          try { currentPkg = await readFileCached('package.json'); } catch (_) {}
+        }
+        if (currentPkg) {
+          const importValidation = validateImportsAgainstPackageJson(filePath, newContent, currentPkg);
+          if (!importValidation.valid) {
+            return importValidation.error;
+          }
+        }
+
+        // Validación estática pre-escritura (Arnés de Prevención: íconos inexistentes o @/components/ui/ muertos)
+        const preWriteCheck = validatePreWriteComponent(filePath, newContent, {
+          projectFiles: Object.keys(semanticFilesMap || {}),
+          stagedContent
+        });
+        if (!preWriteCheck.valid) {
+          return preWriteCheck.error;
+        }
 
         // Protección contra código truncado o reducción destructiva no justificada
         // Durante un hard reset de proyecto (isProjectResetOrder), se permite la reescritura total
@@ -3760,20 +4734,69 @@ Estás construyendo o ampliando la interfaz de la aplicación.
           return `Cambio registrado para ${filePath}. Se aplica solo al final de tu respuesta (salvo que esta etapa requiera aprobación).`
         }
 
-        const old = String(input.search_block ?? input.old_string ?? '')
-        const newString = String(input.replace_block ?? input.new_string ?? '')
-
-        // Motor de Parcheo Resiliente (Multi-tier: exacto -> normalizado -> trimmed-lines -> fuzzy)
-        const patchResult = applyPatch(base, old, newString)
-        if (!patchResult.success) {
-          const hadPriorStaged = stagedContent.has(filePath)
-          if (hadPriorStaged && patchResult.reason.includes('no se encontró')) {
-            return `Conflicto de parche secuencial en "${filePath}": no se encontró el bloque tras la edición previa. Aplica los cambios en un solo bloque unificado.`
+        // Determinar lista de parches a aplicar (soporte de bloque único y lista multi-reemplazo "replacements")
+        const patchList = [];
+        if (Array.isArray(input.replacements) && input.replacements.length > 0) {
+          for (const rep of input.replacements) {
+            const oldStr = String(rep.search_block ?? rep.old_string ?? rep.targetContent ?? '');
+            const newStr = String(rep.replace_block ?? rep.new_string ?? rep.replacementContent ?? '');
+            if (oldStr) patchList.push({ old: oldStr, newString: newStr });
           }
-          return `No se pudo aplicar el parche en "${filePath}": ${patchResult.reason} Releé el fragmento exacto con "read_file" antes de reintentar.`
+        } else {
+          const old = String(input.search_block ?? input.old_string ?? input.targetContent ?? '');
+          const newString = String(input.replace_block ?? input.new_string ?? input.replacementContent ?? '');
+          if (old) patchList.push({ old, newString });
         }
 
-        const newContent = patchResult.newContent
+        if (patchList.length === 0) {
+          return `Error en ${name}: Debes proporcionar "search_block" y "replace_block" (o el array "replacements").`;
+        }
+
+        let currentContent = base;
+        for (let patchIdx = 0; patchIdx < patchList.length; patchIdx++) {
+          const { old, newString } = patchList[patchIdx];
+          const patchResult = applyPatch(currentContent, old, newString);
+          if (!patchResult.success) {
+            const hadPriorStaged = stagedContent.has(filePath);
+            const stepNotice = patchList.length > 1 ? ` en el reemplazo ${patchIdx + 1}/${patchList.length}` : '';
+            if (hadPriorStaged && patchResult.reason.includes('no se encontró')) {
+              return `Conflicto de parche secuencial en "${filePath}"${stepNotice}: no se encontró el bloque tras la edición previa. Aplica los cambios en un solo bloque unificado o usa el array "replacements".`;
+            }
+            return `No se pudo aplicar el parche${stepNotice} en "${filePath}": ${patchResult.reason} Releé el fragmento exacto con "read_file" antes de reintentar.`;
+          }
+          currentContent = patchResult.newContent;
+        }
+
+        let newContent = currentContent;
+
+        // Sanitización preventiva de stylesheets (Tailwind v4 -> v3)
+        newContent = sanitizeStylesheets(filePath, newContent);
+
+        // Sanitización preventiva de vite.config
+        newContent = sanitizeViteConfig(newContent);
+
+        // Validación preventiva de imports contra package.json
+        let currentPkgPatch = stagedContent.get('package.json');
+        if (!currentPkgPatch) {
+          try { currentPkgPatch = await readFileCached('package.json'); } catch (_) {}
+        }
+        if (currentPkgPatch) {
+          const importValidation = validateImportsAgainstPackageJson(filePath, newContent, currentPkgPatch);
+          if (!importValidation.valid) {
+            return importValidation.error;
+          }
+        }
+
+        // Validación estática pre-escritura (Arnés de Prevención: íconos inexistentes o @/components/ui/ muertos)
+        const preWriteCheckPatch = validatePreWriteComponent(filePath, newContent, {
+          projectFiles: Object.keys(semanticFilesMap || {}),
+          stagedContent
+        });
+        if (!preWriteCheckPatch.valid) {
+          return preWriteCheckPatch.error;
+        }
+
+        readFilesCache.set(filePath, newContent);
 
         // ── ARNÉS 4: Candado Determinista de Infraestructura sobre vite.config.* ──
         const isViteConfig = filePath.endsWith('vite.config.js') || filePath.endsWith('vite.config.ts') || filePath.endsWith('vite.config.mjs');
@@ -3906,6 +4929,14 @@ Estás construyendo o ampliando la interfaz de la aplicación.
       }
 
       if (name === 'propose_db_change' || name === 'propose_migration' || name === 'execute_ddl' || name === 'apply_migration') {
+        if (successfulDbMigrationsCount >= 1) {
+          return {
+            ok: false,
+            is_error: true,
+            output: '⛔ LÍMITE DE MIGRACIONES ALCANZADO: Ya se aplicó la migración SQL en este turno. Está TERMINANTEMENTE PROHIBIDO volver a llamar a propose_migration o execute_ddl. Pasa AHORA MISMO a escribir los componentes de React y actualizar src/App.jsx con propose_change.'
+          }
+        }
+
         const sql = input.up_sql || input.sql || input.ddl || ''
         const summary = input.name || input.summary || 'Cambio en base de datos'
 
@@ -3940,40 +4971,100 @@ Estás construyendo o ampliando la interfaz de la aplicación.
           }
         }
 
+        successfulDbMigrationsCount++
         proposedDbChanges.push({ sql: forceSql, summary, alreadyApplied: Boolean(dbConnection), status: dbConnection ? 'applied' : 'pending' })
         invalidateDbSchemaGraph(project.id)
         return {
           ok: true,
-          output: `Migración DDL ejecutada y registrada exitosamente: "${summary}".`
+          output: `✅ MIGRACIÓN SQL APLICADA Y TABLAS CREADAS EN POSTGRESQL. PROHIBIDO volver a llamar a propose_migration o execute_ddl en este turno. Pasa INMEDIATAMENTE a escribir los componentes de React y actualizar src/App.jsx con propose_change.`
         }
       }
 
-      if (name === 'ask_question') {
-        if (!shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext })) {
+      if (name === 'ask_questions' || name === 'ask_question') {
+        const activeAttachments = rawAttachments.length ? rawAttachments : attachments;
+        if (!shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext, attachments: activeAttachments, history, isInitialKickoff })) {
           return {
             ok: false,
             is_error: true,
-            output: 'La herramienta ask_question está deshabilitada para este turno porque el pedido del usuario es específico, contiene código/SQL o ya definió la acción a realizar. Procede directamente con la ejecución o análisis.'
+            output: 'La herramienta ask_questions está deshabilitada para este turno porque el pedido del usuario es específico, contiene archivos adjuntos/URL, código/SQL o ya definió la acción a realizar. Procede directamente con la ejecución o análisis.'
           }
         }
 
-        askedQuestion = {
-
-          question: input.question,
-
-          multiSelect: Boolean(input.multiSelect),
-
-          allowCustom: Boolean(input.allowCustom),
-
-          options: (input.options || []).map((o, i) => ({ id: String(i), label: o.label, description: o.description || '' })),
-
+        if (name === 'ask_questions' || Array.isArray(input.questions)) {
+          askedQuestion = {
+            kind: 'ask_questions',
+            introText: input.introText || 'Para definir la mejor solución para tu proyecto, por favor elige tus preferencias:',
+            questions: (input.questions || []).slice(0, 3).map((q, qIdx) => ({
+              id: q.id || `q_${qIdx}`,
+              header: q.header || 'OPCIÓN',
+              question: q.question,
+              type: q.type || (q.options?.some(o => Array.isArray(o.swatches) && o.swatches.length > 0) ? 'visual_choice' : 'single_choice'),
+              options: (q.options || []).slice(0, 4).map((o, oIdx) => ({
+                id: o.id || `opt_${qIdx}_${oIdx}`,
+                label: o.label,
+                description: o.description || '',
+                recommended: Boolean(o.recommended),
+                swatches: Array.isArray(o.swatches) ? o.swatches : []
+              }))
+            }))
+          }
+        } else {
+          // Soporte retrocompatible con ask_question singular
+          askedQuestion = {
+            kind: 'ask_questions',
+            introText: input.body || 'Para definir la mejor solución para tu proyecto, por favor elige tus preferencias:',
+            questions: [
+              {
+                id: 'q_0',
+                header: input.header || 'OPCIÓN',
+                question: input.question,
+                type: 'single_choice',
+                options: (input.options || []).map((o, i) => ({
+                  id: String(i),
+                  label: o.label,
+                  description: o.description || '',
+                  recommended: Boolean(o.recommended),
+                  swatches: Array.isArray(o.swatches) ? o.swatches : []
+                }))
+              }
+            ],
+            question: input.question,
+            multiSelect: Boolean(input.multiSelect),
+            allowCustom: Boolean(input.allowCustom),
+            options: (input.options || []).map((o, i) => ({ id: String(i), label: o.label, description: o.description || '' }))
+          }
         }
 
         return 'Se le mostró la tarjeta de opciones al usuario. Tu turno termina acá — no asumas ninguna respuesta, esperala en el próximo mensaje.'
-
       }
 
-            if (name === 'ask_secret') {
+            
+      if (name === 'message_user' || name === 'user_messaging--message_user') {
+        userMessagePayload = {
+          summary: String(input?.summary || '').trim(),
+          message: String(input?.message || '').trim()
+        };
+        return 'Mensaje registrado exitosamente para el usuario. Tu turno de edición concluye con este mensaje.';
+      }
+
+      if (name === 'propose_tasks' || name === 'roadmap--propose_tasks') {
+        const tasks = (input.tasks || []).map((t, idx) => ({
+          id: t.id || `task_${idx + 1}`,
+          title: t.title || `Tarea ${idx + 1}`,
+          description: t.description || '',
+          filesToTouch: Array.isArray(t.filesToTouch) ? t.filesToTouch : [],
+        }));
+        proposedPlan = {
+          title: input.title || 'Plan de Implementación',
+          summary: input.summary || '',
+          tasks,
+          status: 'WAITING_APPROVAL',
+        };
+        requiresApproval = true;
+        return 'Se presentó el plan estructurado (roadmap) al usuario para su aprobación interactiva. Tu turno se pausa aquí hasta que el usuario lo apruebe o realice ajustes.';
+      }
+
+      if (name === 'ask_secret') {
 
         askedQuestion = {
 
@@ -4042,9 +5133,9 @@ Estás construyendo o ampliando la interfaz de la aplicación.
           sizeBytes: attachment.sizeBytes,
 
           summary: input.summary,
-
+          status: 'applied',
+          alreadyApplied: true,
         })
-
         return `Subida propuesta a ${input.path} en el repositorio. Se aplica automáticamente al final del turno.`
 
       }
@@ -4059,6 +5150,22 @@ Estás construyendo o ampliando la interfaz de la aplicación.
 
           const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg'
           const filename = (input.path || 'public/logo.png').split('/').pop() || `generated.${ext}`
+          const imageBuf = Buffer.from(base64, 'base64');
+
+          // Guardar síncronamente en los workspaces de vista previa en VPS para evitar 404 inmediato
+          const previewsBase = '/opt/gitflow-previews';
+          if (fs.existsSync(previewsBase)) {
+            for (let i = 0; i < 5; i++) {
+              const wsPath = path.join(previewsBase, `workspace-${i}`);
+              if (fs.existsSync(wsPath)) {
+                const targetFile = path.join(wsPath, input.path || `public/doc-assets/${filename}`);
+                try {
+                  fs.mkdirSync(path.dirname(targetFile), { recursive: true });
+                  fs.writeFileSync(targetFile, imageBuf);
+                } catch (_) {}
+              }
+            }
+          }
 
           proposedAssetChanges.push({
             target: 'github',
@@ -4068,8 +5175,9 @@ Estás construyendo o ampliando la interfaz de la aplicación.
             base64,
             sizeBytes: Buffer.from(base64, 'base64').length,
             summary: input.summary || 'Logo generado',
+            status: 'applied',
+            alreadyApplied: true,
           })
-
           return `Imagen generada y guardada en ${input.path || 'public/logo.png'}. Se aplica automáticamente al final del turno.`
         } catch (err) {
           console.error(`Error en generate_image para "${input?.path}":`, err.message)
@@ -4150,6 +5258,255 @@ Estás construyendo o ampliando la interfaz de la aplicación.
 
         }
 
+      }
+
+      if (name === 'inspect_project_image') {
+        const rawPaths = Array.isArray(input.paths) ? input.paths : (input.path ? [input.path] : []);
+        const targetPaths = rawPaths.slice(0, 5);
+        if (targetPaths.length === 0) {
+          return { ok: false, is_error: true, output: 'Debes proporcionar al menos una ruta de imagen en el parámetro "paths".' };
+        }
+
+        const multimodalBlocks = [];
+        const inspectedSummaries = [];
+
+        for (const p of targetPaths) {
+          const baseName = path.basename(p);
+          if (inspectedImagePaths.has(p) || inspectedImagePaths.has(baseName)) {
+            inspectedSummaries.push(`- ${p}: [YA INSPECCIONADA EN ESTE TURNO - imagen ya en contexto]`);
+            multimodalBlocks.push({
+              type: 'text',
+              text: `Imagen ${p}: Ya fue visualizada e inspeccionada en este turno. Pasa directamente a aplicar los cambios en el código con replace_file_content.`
+            });
+            continue;
+          }
+
+          const buf = await findProjectAssetBuffer(p);
+
+          if (!buf) {
+            inspectedSummaries.push(`- ${p}: [NO ENCONTRADA o ilegible]`);
+            multimodalBlocks.push({
+              type: 'text',
+              text: `Imagen ${p}: No se pudo leer el archivo desde el proyecto ni desde los activos adjuntos.`
+            });
+            continue;
+          }
+
+          try {
+            const meta = await sharp(buf).metadata();
+            // Compresión estricta a máx 900x900, jpeg calidad 75 (~80-120 KB máximo por imagen)
+            const resized = await sharp(buf)
+              .resize({ width: 900, height: 900, fit: 'inside', withoutEnlargement: true })
+              .jpeg({ quality: 75 })
+              .toBuffer();
+
+            const kbSize = Math.round(resized.length / 1024);
+            inspectedSummaries.push(`- ${p}: ${meta.width}x${meta.height}px (${meta.format}, comprimida a ${kbSize} KB)`);
+            inspectedImagePaths.add(p);
+            inspectedImagePaths.add(baseName);
+            multimodalBlocks.push({
+              type: 'text',
+              text: `Imagen: ${p} | Dimensiones originales: ${meta.width}x${meta.height}px | Tamaño optimizado: ${kbSize} KB`
+            });
+            multimodalBlocks.push({
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/jpeg',
+                data: resized.toString('base64')
+              }
+            });
+          } catch (sharpErr) {
+            inspectedSummaries.push(`- ${p}: Error al procesar imagen: ${sharpErr.message}`);
+            multimodalBlocks.push({
+              type: 'text',
+              text: `Error al procesar ${p}: ${sharpErr.message}`
+            });
+          }
+        }
+
+        return {
+          ok: true,
+          output: `Inspección visual completada para ${targetPaths.length} imagen(es):\n${inspectedSummaries.join('\n')}`,
+          multimodalBlocks
+        };
+      }
+
+      if (name === 'crop_image_region') {
+        const sourcePath = String(input.sourcePath || input.path || '').trim();
+        const leftP = Number(input.leftPercent);
+        const topP = Number(input.topPercent);
+        const widthP = Number(input.widthPercent);
+        const heightP = Number(input.heightPercent);
+        const rawOutName = String(input.outputFileName || input.filename || 'cropped-asset.png').trim();
+
+        if (!sourcePath) {
+          return { ok: false, is_error: true, output: 'Falta el parámetro obligatorio "sourcePath".' };
+        }
+        if (isNaN(leftP) || isNaN(topP) || isNaN(widthP) || isNaN(heightP)) {
+          return { ok: false, is_error: true, output: 'Las coordenadas leftPercent, topPercent, widthPercent y heightPercent deben ser números porcentuales (0 a 100).' };
+        }
+
+        const sourceBuf = await findProjectAssetBuffer(sourcePath);
+        if (!sourceBuf) {
+          return { ok: false, is_error: true, output: `No se pudo encontrar la imagen de origen "${sourcePath}". Verifica que la ruta exista en /doc-assets/.` };
+        }
+
+        const baseFileName = path.basename(sourcePath);
+        const hasBeenInspected = inspectedImagePaths.has(baseFileName);
+        const isBlindZeroZeroCrop = (leftP <= 1 && topP <= 1);
+
+        // ── CANDADO ANTI-RECORTE DE PRODUCTOS EN PÁGINAS GENERALES ──
+        // crop_image_region está reservado EXCLUSIVAMENTE para extraer logotipos, isotipos y firmas.
+        // Si el modelo intenta recortar productos o servicios desde las páginas del PDF, bloquear y forzar curate_images
+        const isDocPage = /page-\d+/i.test(sourcePath);
+        const isLogoOrBrand = /logo|brand|isotipo|imagotipo|emblem|icon|favicon|sello|firma/i.test(rawOutName);
+        if (isDocPage && !isLogoOrBrand) {
+          return {
+            ok: false,
+            is_error: true,
+            output: `⚠️ REGLA DE BIFURCACIÓN DE IMÁGENES ACTIVADA: La herramienta "crop_image_region" está reservada EXCLUSIVAMENTE para extraer logotipos corporativos oficiales, sellos o firmas. ESTÁ ESTRICTAMENTE PROHIBIDO recortar fotos de productos, servicios, personas o fondos desde las páginas generales del documento ("${sourcePath}").\n\nEl producto o servicio "${rawOutName}" no tiene una fotografía propia en el documento subido. DEBES invocar de inmediato la herramienta "curate_images" (para obtener una fotografía industrial real verificada del catálogo de imageCurator.js) o "generate_image". No recortes las páginas del documento.`
+          };
+        }
+
+        // ── CANDADO ANTI-RECORTE A CIEGAS ──
+        // Si no se inspeccionó previamente la imagen o si intenta recortar la esquina (0, 0):
+        if (!hasBeenInspected || isBlindZeroZeroCrop) {
+          inspectedImagePaths.add(baseFileName);
+          try {
+            const meta = await sharp(sourceBuf).metadata();
+            const resizedSource = await sharp(sourceBuf)
+              .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
+              .jpeg({ quality: 80 })
+              .toBuffer();
+
+            const warningMsg = isBlindZeroZeroCrop
+              ? `⚠️ CANDADO ANTI-RECORTE A CIEGAS ACTIVADO: Has solicitado recortar en la esquina superior izquierda (0%, 0%), que en documentos y brochures suele corresponder a fotografías de portada, cascos o fondos de cabecera, NO al logotipo oficial. Observa detenidamente la imagen completa de origen que te adjunto a continuación. REVISA VISUALMENTE: En "brochure-sergesol-page-01.png" el logo oficial de SERGESOL está en la ESQUINA INFERIOR DERECHA (aprox left: 70%, top: 88%), y en "brochure-sergesol-page-02.png" está en la ESQUINA INFERIOR IZQUIERDA (left: 3.5%, top: 91.5%, width: 25.5%, height: 7.0%). Además, el archivo "/doc-assets/logo-sergesol-oficial.png" YA EXISTE y está listo para usarse. Por favor, revisa la imagen y llama nuevamente a crop_image_region con las coordenadas porcentuales exactas donde ves el logotipo.`
+              : `⚠️ PRE-REQUISITO DE VISIÓN: Antes de recortar "${sourcePath}", debes observar la imagen para ubicar con exactitud el elemento deseado. Se te adjunta la imagen completa a continuación para que determines las coordenadas exactas (leftPercent, topPercent, widthPercent, heightPercent) y vuelvas a llamar a crop_image_region.`;
+
+            return {
+              ok: false,
+              is_error: true,
+              output: warningMsg,
+              multimodalBlocks: [
+                {
+                  type: 'text',
+                  text: `[VISTA DE PÁGINA COMPLETA] Imagen de origen "${sourcePath}" (${meta.width}x${meta.height}px):`
+                },
+                {
+                  type: 'image',
+                  source: {
+                    type: 'base64',
+                    media_type: 'image/jpeg',
+                    data: resizedSource.toString('base64')
+                  }
+                }
+              ]
+            };
+          } catch (visionErr) {
+            console.warn('[crop_image_region] Error al generar visión previa:', visionErr.message);
+          }
+        }
+
+        try {
+          const meta = await sharp(sourceBuf).metadata();
+          if (!meta.width || !meta.height) {
+            return { ok: false, is_error: true, output: `No se pudieron leer las dimensiones de la imagen "${sourcePath}".` };
+          }
+
+          // Conversión de porcentajes a píxeles con clamping estricto para evitar fallos de sharp
+          const left = Math.max(0, Math.min(meta.width - 1, Math.round((leftP / 100) * meta.width)));
+          const top = Math.max(0, Math.min(meta.height - 1, Math.round((topP / 100) * meta.height)));
+          let width = Math.max(1, Math.round((widthP / 100) * meta.width));
+          let height = Math.max(1, Math.round((heightP / 100) * meta.height));
+          if (left + width > meta.width) width = meta.width - left;
+          if (top + height > meta.height) height = meta.height - top;
+
+          const croppedPng = await sharp(sourceBuf)
+            .extract({ left, top, width, height })
+            .png()
+            .toBuffer();
+
+          let safeFileName = path.basename(rawOutName).replace(/[^a-zA-Z0-9_.-]/g, '_');
+          if (!safeFileName.endsWith('.png') && !safeFileName.endsWith('.jpg') && !safeFileName.endsWith('.webp')) {
+            safeFileName += '.png';
+          }
+
+          const targetRelPath = `public/doc-assets/${safeFileName}`;
+          const targetPublicPath = `/doc-assets/${safeFileName}`;
+
+          // Registrar en proposedAssetChanges como 'applied' directamente (auto-ejecución silenciosa)
+          proposedAssetChanges.push({
+            target: 'github',
+            path: targetRelPath,
+            filename: safeFileName,
+            mimeType: 'image/png',
+            base64: croppedPng.toString('base64'),
+            sizeBytes: croppedPng.length,
+            summary: `Recorte de imagen ${safeFileName} (${width}x${height}px) desde ${sourcePath}`,
+            status: 'applied',
+            alreadyApplied: true,
+          });
+
+          // Registrar en memoria de extractedAssets para este turno
+          allExtractedAssets.push({
+            fileName: safeFileName,
+            publicPath: targetPublicPath,
+            base64: croppedPng.toString('base64'),
+            mimeType: 'image/png',
+            sizeBytes: croppedPng.length,
+            widthPx: width,
+            heightPx: height,
+            contextHint: `Imagen recortada desde ${sourcePath} (${width}x${height}px)`,
+            isMultimodal: false
+          });
+
+          // Guardar físicamente en los workspaces de vista previa si existen en VPS
+          const previewsBase = '/opt/gitflow-previews';
+          if (fs.existsSync(previewsBase)) {
+            for (let i = 0; i < 5; i++) {
+              const wsPath = path.join(previewsBase, `workspace-${i}`);
+              if (fs.existsSync(wsPath)) {
+                const targetDir = path.join(wsPath, 'public', 'doc-assets');
+                try {
+                  fs.mkdirSync(targetDir, { recursive: true });
+                  fs.writeFileSync(path.join(targetDir, safeFileName), croppedPng);
+                } catch (_) {}
+              }
+            }
+          }
+
+          // Generar bloque multimodal para VERIFICACIÓN VISUAL POST-RECORTE (Loopback Multimodal)
+          const visionCropped = await sharp(croppedPng)
+            .resize({ width: 800, height: 800, fit: 'inside', withoutEnlargement: true })
+            .png()
+            .toBuffer();
+
+          return {
+            ok: true,
+            output: `✅ Recorte guardado con éxito en "${targetPublicPath}" (${width}x${height}px). Ya está disponible y lista para ser usada en el frontend con <img src="${targetPublicPath}" alt="..." />. Revisa visualmente la imagen resultante adjunta abajo en este turno: si observas que recortaste un fondo, personas o edificios en vez del logo corporativo, vuelve a llamar a crop_image_region con las coordenadas corregidas antes de asignarla en el código.`,
+            multimodalBlocks: [
+              {
+                type: 'text',
+                text: `[VERIFICACIÓN VISUAL POST-RECORTE] Vista del archivo generado "${safeFileName}" (${width}x${height}px desde ${sourcePath}):`
+              },
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: 'image/png',
+                  data: visionCropped.toString('base64')
+                }
+              }
+            ]
+          };
+        } catch (cropErr) {
+          return {
+            ok: false,
+            is_error: true,
+            output: `Error al recortar la imagen con sharp: ${cropErr.message}`
+          };
+        }
       }
 
       if (name === 'check_preview_errors') {
@@ -4268,6 +5625,13 @@ Estás construyendo o ampliando la interfaz de la aplicación.
     const isCancelled = () => signal?.aborted && (isExplicitCancel ? isExplicitCancel() : true)
     if (isCancelled()) throw new DOMException('Cancelado por el usuario', 'AbortError')
 
+    const activityDesc = buildHumanActivityDescription(name, input);
+    onProgress?.({
+      type: 'activity_description',
+      description: activityDesc,
+      timestamp: Date.now()
+    });
+
     onProgress?.(describeStep(name, input))
 
     try {
@@ -4305,7 +5669,7 @@ Estás construyendo o ampliando la interfaz de la aplicación.
 
   const MAX_INTENTOS = 4;
   const turnStartTime = Date.now();
-  const MAX_TURN_EXECUTION_TIME_MS = 360000; // 6 minutos de seguridad interna (watchdog global: 10 min)
+  const MAX_TURN_EXECUTION_TIME_MS = 900000; // 15 minutos de seguridad interna (watchdog global: 20 min)
 
   // Tracking de TODOS los componentes que el agente tocó en este turno (a través de TODOS
   // los intentos del while). Lo mantenemos a nivel del loop y no del guard para que en
@@ -4336,34 +5700,70 @@ Estás construyendo o ampliando la interfaz de la aplicación.
 
   let activeUserMessage = userMessage;
   if (elementContext) {
-    const matchedFile = findMatchingFileForElement(semanticGraph, semanticFilesMap, elementContext);
+    const directFile = normalizeSourcePath(elementContext.sourceFile || elementContext.source?.fileName);
+    const directLine = elementContext.sourceLine || elementContext.source?.lineNumber;
+    const matchedFile = directFile || findMatchingFileForElement(semanticGraph, semanticFilesMap, elementContext);
     let preloadedSourceBlock = '';
-    let fileContent = semanticFilesMap?.[matchedFile];
+    let fileContent = stagedContent.get(matchedFile) || readFilesCache.get(matchedFile) || semanticFilesMap?.[matchedFile];
     if (!fileContent && matchedFile) {
       try {
         fileContent = await readProjectFile(project, accessToken, matchedFile, signal);
       } catch (_) {}
     }
     if (matchedFile && fileContent) {
-      preloadedSourceBlock = `\n[CÓDIGO FUENTE PRE-CARGADO PARA EDICIÓN INMEDIATA: "${matchedFile}"]
+      readFilesCache.set(matchedFile, fileContent);
+      preloadedSourceBlock = `\n[CÓDIGO FUENTE PRE-CARGADO PARA EDICIÓN INMEDIATA: "${matchedFile}"${directLine ? ` (LÍNEA ${directLine})` : ''}]
 \`\`\`
 ${fileContent}
 \`\`\`
-INSTRUCCIÓN DE EDICIÓN RÁPIDA: El código completo de "${matchedFile}" ya está provisto arriba. NO uses "read_file" ni "list_files"; aplica directamente "propose_patch" o "replace_file_content" sobre "${matchedFile}" para cumplir la solicitud del usuario en este único turno.\n`;
+INSTRUCCIÓN DE EDICIÓN QUIRÚRGICA DIRECTA (RONDA 1):
+El usuario seleccionó con el puntero visual el elemento en ${matchedFile}${directLine ? ` (línea ${directLine})` : ''}.
+Aplica el cambio solicitado DIRECTAMENTE en la Ronda 1 usando replace_file_content sobre ${matchedFile} sin hacer lecturas adicionales.\n`;
     }
 
     const elementDirective = `[ELEMENTO SELECCIONADO VISUALMENTE (CLICK-TO-EDIT)]
 El usuario hizo clic sobre un elemento puntual en la vista previa (${elementContext.pathname || '/'}):
-• Etiqueta: <${elementContext.tagName || 'elemento'}>
-• Clases CSS: ${elementContext.className || '(ninguna)'}
+${matchedFile ? `• Archivo de origen: "${matchedFile}"${directLine ? ` (línea ${directLine})` : ''}\n` : ''}• Etiqueta: <${elementContext.tagName || 'elemento'}>
+• Clases CSS: ${elementContext.currentClasses || elementContext.className || '(ninguna)'}
 • Texto visible: "${elementContext.innerText || elementContext.textSnippet || ''}"
-${elementContext.componentName ? `• Componente React: <${elementContext.componentName} />\n` : ''}${elementContext.parentHierarchy ? `• Jerarquía contenedor: ${elementContext.parentHierarchy}\n` : ''}${matchedFile ? `• ARCHIVO IDENTIFICADO EN EL MAPA SEMÁNTICO: "${matchedFile}".\n` : ''}${preloadedSourceBlock}
+${elementContext.componentName ? `• Componente React: <${elementContext.componentName} />\n` : ''}${elementContext.parentHierarchy ? `• Jerarquía contenedor: ${elementContext.parentHierarchy}\n` : ''}${preloadedSourceBlock}
 El pedido del usuario sobre este elemento es:
 "${userMessage}"`;
     activeUserMessage = elementDirective;
+  } else if (activeViewContext && (activeViewContext.route || activeViewContext.focusedFile || activeViewContext.visibleHeading || activeViewContext.activeModal || activeViewContext.activeTab)) {
+    const focusedFile = normalizeSourcePath(activeViewContext.focusedFile);
+    let preloadedSourceBlock = '';
+    if (focusedFile) {
+      let fileContent = stagedContent.get(focusedFile) || readFilesCache.get(focusedFile) || semanticFilesMap?.[focusedFile];
+      if (!fileContent) {
+        try {
+          fileContent = await readProjectFile(project, accessToken, focusedFile, signal);
+        } catch (_) {}
+      }
+      if (fileContent) {
+        readFilesCache.set(focusedFile, fileContent);
+        preloadedSourceBlock = `\n[CÓDIGO FUENTE PRE-CARGADO DE LA VISTA ACTIVA: "${focusedFile}"]
+\`\`\`
+${fileContent}
+\`\`\`
+INSTRUCCIÓN DE EDICIÓN EN LA VISTA ACTIVA (RONDA 1):
+El usuario está interactuando con esta vista (${activeViewContext.route || '/'}).
+Si el pedido hace referencia implícita a elementos de esta pantalla, modifica directamente "${focusedFile}" en la Ronda 1 con replace_file_content sin gastar turnos en list_files ni read_file.\n`;
+      }
+    }
+
+    const activeViewDirective = `[CONTEXTO DE LA VISTA ACTIVA EN PANTALLA (activeViewContext)]
+El usuario tiene abierta actualmente la siguiente vista en la vista previa:
+• Ruta: "${activeViewContext.route || '/'}"
+${activeViewContext.visibleHeading ? `• Título/Sección visible: "${activeViewContext.visibleHeading}"\n` : ''}${activeViewContext.activeModal ? `• Modal/Diálogo abierto: "${activeViewContext.activeModal}"\n` : ''}${activeViewContext.activeTab ? `• Pestaña activa: "${activeViewContext.activeTab}"\n` : ''}${focusedFile ? `• Archivo del componente en pantalla: "${focusedFile}"\n` : ''}${preloadedSourceBlock}
+Pedido del usuario:
+"${userMessage}"`;
+    activeUserMessage = activeViewDirective;
   }
 
 
+
+  let preserveProposalsOnRetry = false;
 
   while (intentos < MAX_INTENTOS) {
     if (intentos > 0 && (Date.now() - turnStartTime) > MAX_TURN_EXECUTION_TIME_MS) {
@@ -4371,25 +5771,31 @@ El pedido del usuario sobre este elemento es:
       break;
     }
 
-    proposedChanges.length = 0;
+    if (!preserveProposalsOnRetry) {
+      proposedChanges.length = 0;
+      proposedDbChanges.length = 0;
+      proposedAssetChanges.length = 0;
+      proposedEdgeFunctions.length = 0;
+      proposedDeletions.length = 0;
+      stagedContent.clear();
+    } else {
+      console.log(`[runAgent:RetryGuard] Conservando ${proposedChanges.length} componentes en proposedChanges y ${stagedContent.size} archivos en stagedContent para integración en App.jsx`);
+      preserveProposalsOnRetry = false;
+    }
 
-    proposedDbChanges.length = 0;
-
-    proposedAssetChanges.length = 0;
-
-    proposedEdgeFunctions.length = 0;
-
-    proposedDeletions.length = 0;
-
-    stagedContent.clear();
 
 
+    // En reintentos de uiIntegrityGuard (intentos > 0), desactivamos herramientas de lectura
+    // para obligar al modelo a pasar directamente a la edición, forzando toolChoice: 'any'
+    const activeTools = intentos === 0
+      ? tools
+      : tools.filter((t) => !['read_file', 'list_files', 'inspect_project_image', 'search_files'].includes(t.name));
 
     const result = await runAgentWithRotation({
 
       system: systemPrompt,
 
-      tools,
+      tools: activeTools,
 
       history: compressedHistory,
 
@@ -4405,6 +5811,8 @@ El pedido del usuario sobre este elemento es:
 
       projectId: project.id,
 
+      toolChoice: intentos > 0 ? { type: 'any' } : undefined,
+
     })
 
 
@@ -4413,13 +5821,19 @@ El pedido del usuario sobre este elemento es:
 
     usage = result.usage;
 
+    // Corte Inmediato: si en este turno se propuso un plan interactivo, se formuló una pregunta
+    // o el modelo invocó message_user tras proponer cambios de código en este turno.
+    if (proposedPlan || askedQuestion || (userMessagePayload && (proposedChanges.length > 0 || proposedDbChanges.length > 0))) {
+      break;
+    }
+
     // Tracking cross-intento: registrar TODOS los componentes que el agente creó o modificó
     // en este turno. Se mantiene a nivel del while (no se borra en cada intento) para que el
     // guard pueda seguirlos considerando "creados en este turno" incluso en reintentos donde
     // los archivos ya están aplicados en el repo y por lo tanto ya están en `projectSet`.
     for (const c of proposedChanges) {
       const norm = String(c.path || '').replace(/\\/g, '/').replace(/^\.\//, '')
-      if (/^src\/(components|pages|views)\//.test(norm) && !/^src\/components\/ui\//.test(norm)) {
+      if (/^src\/(components|pages|views|data|services)\//.test(norm) && !/^src\/components\/ui\//.test(norm)) {
         componentsTouchedThisTurn.add(norm)
       }
     }
@@ -4488,7 +5902,22 @@ El pedido del usuario sobre este elemento es:
     // Guardrail de Evasión: si se requería acción de código y el modelo devolvió solo texto sin herramientas
     const hasAnyActionTaken = proposedChanges.length > 0 || proposedDbChanges.length > 0 || proposedAssetChanges.length > 0 || proposedEdgeFunctions.length > 0 || proposedDeletions.length > 0 || didResetProject;
 
-    if (turnMode === 'BUILD' && !promptIntent.isPureQuestion && promptIntent.hasActionOrder && !hasAnyActionTaken) {
+    if (turnMode === 'BUILD' && !hasAnyActionTaken && (promptIntent.isDefectReport || promptIntent.hasActionOrder)) {
+      // Si el usuario reportó un defecto visual o problema, jamás permitir finalizar sin proponer cambios
+      const isLegitimateExplanation = !promptIntent.isDefectReport && text && text.trim().length > 100 && (
+        /\b(?:no\s+es\s+necesario|ya\s+está|ya\s+existe|el\s+código\s+actual|para\s+hacer\s+esto|la\s+arquitectura|se\s+recomienda|el\s+motivo|porque|debido\s+a|revisé\s+el\s+código|no\s+se\s+requiere)\b/i.test(text)
+      );
+
+      if (!isLegitimateExplanation && result.usage?.finish_reason !== 'length') {
+        intentos++;
+        if (intentos < MAX_INTENTOS) {
+          onProgress?.({ type: 'telemetry', phase: 'HEALING', label: 'Forzando aplicación de corrección solicitada...' });
+          compressedHistory.push({ role: 'model', content: text || 'Revisé los archivos.' });
+          activeUserMessage = `🚨 Has inspeccionado los archivos pero aún NO has aplicado la corrección solicitada por el usuario ("${userMessage}"). Ejecuta replace_file_content o propose_change ahora mismo para corregir el problema reportado.`;
+          continue;
+        }
+      }
+    } else if (false) {
       // Verificar si el modelo respondió legítimamente una consulta técnica o dio una explicación sustancial
       const isLegitimateExplanation = text && text.trim().length > 100 && (
         /\b(?:no\s+es\s+necesario|ya\s+está|ya\s+existe|el\s+código\s+actual|para\s+hacer\s+esto|la\s+arquitectura|se\s+recomienda|el\s+motivo|porque|debido\s+a|revisé\s+el\s+código|no\s+se\s+requiere)\b/i.test(text)
@@ -4508,7 +5937,22 @@ El pedido del usuario sobre este elemento es:
       }
     }
 
+    // ── GUARDIA ANTI-TURNO SOLO BD (Obligar a construir la interfaz React) ──
+    const isAppScaffoldNow = isEntrypointStillScaffold(stagedContent.get('src/App.jsx') || currentAppContent);
+    const isDbOnlyTurn = proposedDbChanges.length > 0 && (proposedChanges.length === 0 || isAppScaffoldNow);
+    const isUiNeeded = turnMode === 'BUILD' && !promptIntent.isPureQuestion;
 
+    if (isDbOnlyTurn && isUiNeeded && intentos < MAX_INTENTOS - 1) {
+      intentos++;
+      onProgress?.({
+        type: 'telemetry',
+        phase: 'HEALING',
+        label: 'Construyendo interfaz de usuario requerida...',
+        payload: { attempt: intentos, maxAttempts: MAX_INTENTOS }
+      });
+      activeUserMessage = `🚨 ALERTA CRÍTICA: Ejecutaste cambios en la base de datos pero NO has escrito ni actualizado ningún archivo de la interfaz React (src/App.jsx sigue vacío o sin cambios). Está TERMINANTEMENTE PROHIBIDO cerrar el turno sin implementar la interfaz. Usa propose_change AHORA MISMO para construir y montar toda la interfaz visual en src/App.jsx. El pedido original era:\n\n${userMessage}`;
+      continue;
+    }
 
     // ── ARNÉS 4: Verificación Sintáctica AST Determinista (Anti-Overclaiming) ──
     if (proposedChanges.length > 0) {
@@ -4556,96 +6000,93 @@ El pedido del usuario sobre este elemento es:
         }
 
         // CAPA 1.5: Guardián de Integridad de Interfaz (uiIntegrityGuard)
-        const uiGuardResult = await validateUiIntegrity({
-          stagedContent,
-          proposedChanges,
-          proposedDbChanges,
-          projectFilesList,
-          readProjectFile: readFileCached,
-          userMessage: userMessage || activeUserMessage || '',
-          isProjectResetOrder: Boolean(promptIntent?.isProjectResetOrder),
-          // Cross-intento: el guard usa esta lista para considerar "creados en este turno"
-          // incluso en reintentos donde los archivos ya están aplicados en el repo. Sin
-          // esto, el guard se rinde y deja pasar un turno que no arregla App.jsx.
-          agentTouchedThisTurn: [...componentsTouchedThisTurn],
-        });
+        let uiGuardResult = { valid: true };
+        if (proposedPlan || turnMode === 'PLAN' || isPlanMode) {
+          // Bypass uiIntegrityGuard en etapa de propuesta de plan / roadmap
+        } else {
+          uiGuardResult = await validateUiIntegrity({
+            stagedContent,
+            proposedChanges,
+            proposedDbChanges,
+            projectFilesList,
+            readProjectFile: readFileCached,
+            userMessage: userMessage || activeUserMessage || '',
+            isProjectResetOrder: Boolean(promptIntent?.isProjectResetOrder),
+            agentTouchedThisTurn: [...componentsTouchedThisTurn],
+          });
 
-        if (uiGuardResult.seoAdvisories && uiGuardResult.seoAdvisories.length > 0) {
-          console.info('[uiIntegrityGuard:SEO] Sugerencias de optimización SEO 2026:', uiGuardResult.seoAdvisories);
-        }
-
-        if (!uiGuardResult.valid && intentos < MAX_INTENTOS - 1) {
-          // Safety net del kill switch: si ya se acabó el tiempo Y en el intento actual
-          // el modelo propuso un cambio a src/App.jsx que resuelve el scaffold, aplicarlo
-          // antes de salir. Caso real: el modelo corrigió al final pero se quedó sin
-          // presupuesto de tiempo y el break original perdía ese trabajo.
-          if ((Date.now() - turnStartTime) > MAX_TURN_EXECUTION_TIME_MS) {
-            let didRecoverEntrypoint = false
-            try {
-              const appChange = proposedChanges.find((c) => {
-                const p = String(c.path || '').replace(/\\/g, '/')
-                return p === 'src/App.jsx' || p === 'src/App.tsx'
-              })
-              if (appChange && typeof appChange.newContent === 'string') {
-                if (!isEntrypointStillScaffold(appChange.newContent)) {
-                  console.warn(`[uiIntegrityGuard] Kill switch disparó pero hay propuesta de App.jsx válida. Aplicando y saliendo.`)
-                  didRecoverEntrypoint = true
-                }
-              }
-            } catch (_) { /* si falla la verificación, seguir con el break normal */ }
-            if (!didRecoverEntrypoint) {
-              console.warn(`[uiIntegrityGuard] Tiempo acumulado alto (${Math.round((Date.now() - turnStartTime) / 1000)}s). Evitando reintento.`);
-              break;
-            }
-          }
-          intentos++;
-          const uiErrSummary = uiGuardResult.errors.join('\n');
-          console.warn('[uiIntegrityGuard] Fallos de integridad UI detectados:\n', uiErrSummary);
-
-          // Enriquecer el activeUserMessage con contexto accionable: (a) el contenido
-          // actual de App.jsx para que el modelo sepa qué está pisando, y (b) un catálogo
-          // de imports sugerido con los componentes que tocó en este turno. Sin este
-          // contexto, el modelo reintenta proponer cambios a los componentes (ya
-          // aplicados) en vez de actualizar el entrypoint — exactamente lo que pasó en
-          // la conversación d719af1c... donde quedaron 7 componentes huérfanos.
-          let appContextBlock = ''
-          try {
-            const stagedApp = stagedContent.get('src/App.jsx') || stagedContent.get('src/App.tsx')
-            let currentApp = stagedApp
-            if (!currentApp && typeof readFileCached === 'function') {
-              currentApp = (await readFileCached('src/App.jsx')) || (await readFileCached('src/App.tsx')) || ''
-            }
-            if (currentApp) {
-              const stillScaffold = isEntrypointStillScaffold(currentApp)
-              appContextBlock = `\n\n=== ESTADO ACTUAL DE src/App.jsx (${stillScaffold ? 'PLANTILLA VACÍA — DEBES REEMPLAZARLA' : 'ya no es scaffold'}) ===\n\`\`\`jsx\n${currentApp.slice(0, 4000)}\n\`\`\``
-            } else {
-              appContextBlock = `\n\n(No se pudo leer src/App.jsx actual — partí de una plantilla scaffold con un <h1> de placeholder y debés reemplazarlo entero.)`
-            }
-          } catch (_) {
-            appContextBlock = `\n\n(No se pudo leer src/App.jsx actual por error de lectura — partí de una plantilla scaffold con un <h1> de placeholder y debés reemplazarlo entero.)`
+          if (uiGuardResult.seoAdvisories && uiGuardResult.seoAdvisories.length > 0) {
+            console.info('[uiIntegrityGuard:SEO] Sugerencias de optimización SEO 2026:', uiGuardResult.seoAdvisories);
           }
 
-          let importCatalogBlock = ''
-          if (componentsTouchedThisTurn.size > 0) {
-            const lines = []
-            for (const p of [...componentsTouchedThisTurn].sort()) {
-              let compName = null
+          if (!uiGuardResult.valid && intentos < MAX_INTENTOS - 1) {
+            preserveProposalsOnRetry = true;
+            if ((Date.now() - turnStartTime) > MAX_TURN_EXECUTION_TIME_MS) {
+              let didRecoverEntrypoint = false
               try {
-                const stagedC = stagedContent.get(p)
-                const c = stagedC || (typeof readFileCached === 'function' ? await readFileCached(p) : null)
-                if (c) compName = extractLocalComponentName(p, c)
+                const appChange = proposedChanges.find((c) => {
+                  const p = String(c.path || '').replace(/\\/g, '/')
+                  return p === 'src/App.jsx' || p === 'src/App.tsx'
+                })
+                if (appChange && typeof appChange.newContent === 'string') {
+                  if (!isEntrypointStillScaffold(appChange.newContent)) {
+                    console.warn('[uiIntegrityGuard] Kill switch disparó pero hay propuesta de App.jsx válida. Aplicando y saliendo.')
+                    didRecoverEntrypoint = true
+                  }
+                }
               } catch (_) {}
-              if (!compName) compName = p.split('/').pop().replace(/\.(jsx|tsx|js|ts)$/i, '')
-              const importPath = './' + p.replace(/^src\//, '').replace(/\.(jsx|tsx|js|ts)$/i, '')
-              lines.push(`- import { ${compName} } from '${importPath}'   // ${p}`)
+              if (!didRecoverEntrypoint) {
+                console.warn('[uiIntegrityGuard] Tiempo acumulado alto (' + Math.round((Date.now() - turnStartTime) / 1000) + 's). Evitando reintento.');
+                break;
+              }
             }
-            importCatalogBlock = `\n\n=== CATÁLOGO DE COMPONENTES QUE TOCASTE EN ESTE TURNO (importalos y montalos en App.jsx) ===\n${lines.join('\n')}\n`
+            intentos++;
+            const uiErrSummary = uiGuardResult.errors.join('\n');
+            console.warn('[uiIntegrityGuard] Fallos de integridad UI detectados:\n', uiErrSummary);
+
+            let appContextBlock = ''
+            try {
+              const stagedApp = stagedContent.get('src/App.jsx') || stagedContent.get('src/App.tsx')
+              let currentApp = stagedApp
+              if (!currentApp && typeof readFileCached === 'function') {
+                currentApp = (await readFileCached('src/App.jsx')) || (await readFileCached('src/App.tsx')) || ''
+              }
+              if (currentApp) {
+                const stillScaffold = isEntrypointStillScaffold(currentApp)
+                appContextBlock = '\n\n=== ESTADO ACTUAL DE src/App.jsx (' + (stillScaffold ? 'PLANTILLA VACÍA — DEBES REEMPLAZARLA' : 'ya no es scaffold') + ') ===\n```jsx\n' + currentApp.slice(0, 4000) + '\n```'
+              } else {
+                appContextBlock = '\n\n(No se pudo leer src/App.jsx actual — partí de una plantilla scaffold con un <h1> de placeholder y debés reemplazarlo entero.)'
+              }
+            } catch (_) {
+              appContextBlock = '\n\n(No se pudo leer src/App.jsx actual por error de lectura — partí de una plantilla scaffold con un <h1> de placeholder y debés reemplazarlo entero.)'
+            }
+
+            let importCatalogBlock = ''
+            if (componentsTouchedThisTurn.size > 0) {
+              const lines = []
+              for (const p of [...componentsTouchedThisTurn].sort()) {
+                let compName = null
+                try {
+                  const stagedC = stagedContent.get(p)
+                  const c = stagedC || (typeof readFileCached === 'function' ? await readFileCached(p) : null)
+                  if (c) compName = extractLocalComponentName(p, c)
+                } catch (_) {}
+                if (!compName) compName = p.split('/').pop().replace(/\.(jsx|tsx|js|ts)$/i, '')
+                const importPath = './' + p.replace(/^src\//, '').replace(/\.(jsx|tsx|js|ts)$/i, '')
+                lines.push('- import { ' + compName + ' } from \'' + importPath + '\'   // ' + p)
+              }
+              importCatalogBlock = '\n\n=== CATÁLOGO DE COMPONENTES QUE TOCASTE EN ESTE TURNO (importalos y montalos en App.jsx) ===\n' + lines.join('\n') + '\n'
+            }
+
+            const createdComponentsList = Array.from(componentsTouchedThisTurn)
+              .filter(p => p.startsWith('src/'))
+              .map(p => p.split('/').pop().replace(/\.[^.]+$/, ''));
+            const createdCompStr = createdComponentsList.join(', ') || 'los componentes de interfaz';
+
+            activeUserMessage = 'Error de integridad de interfaz UI detectado en los componentes propuestos:\n' + uiErrSummary + '\n\nINSTRUCCIÓN ESPECÍFICA Y OBLIGATORIA: Ya creaste los componentes [' + createdCompStr + '] y están guardados en memoria. NO vuelvas a crearlos ni los dupliques con otros nombres.\nTu ÚNICA tarea en este paso es actualizar src/App.jsx con propose_change para importar y renderizar TODOS esos componentes en orden lógico.\n' + importCatalogBlock + appContextBlock + '\n\nEl pedido original era:\n' + userMessage;
+            continue;
           }
-
-          activeUserMessage = `Error de integridad de interfaz UI detectado en los componentes propuestos:\n${uiErrSummary}\n\nINSTRUCCIÓN ESPECÍFICA Y OBLIGATORIA: el entrypoint (src/App.jsx) sigue mostrando la plantilla vacía inicial. Tenés que ACTUALIZAR src/App.jsx en este mismo turno (usá propose_change o propose_patch sobre src/App.jsx) para importar y montar los componentes de abajo. NO modifiques los componentes — el problema es exclusivamente que App.jsx no los importa ni los renderiza.${importCatalogBlock}${appContextBlock}\n\nReglas:\n1. Reemplazá el contenido actual de App.jsx con un componente App que (a) importe cada componente del catálogo, (b) los monte en un orden lógico (Header arriba, Hero, secciones, Footer al final), y (c) devuelva un único árbol JSX.\n2. No le preguntes al usuario qué hacer — aplicá el cambio directamente.\n3. Si la auditoría también marca botones sin onClick, agregales un onClick mínimo o type="submit" antes de finalizar.\n\nEl pedido original del usuario era:\n${userMessage}`;
-          continue;
         }
-
         const filesMap = {};
         for (const [path, content] of stagedContent.entries()) {
           filesMap[path] = { content, isBase64: false };
@@ -4925,7 +6366,7 @@ ${userMessage}`;
 
   // texto visible. Si el modelo no devolvió JSON válido, se ignora sin romper la respuesta.
 
-  const SUGGESTIONS_RE = /<!--\s*suggestions\s*:\s*(\[[\s\S]*?\])\s*-->/i
+  const SUGGESTIONS_RE = /(?:<suggestions>\s*(\[[\s\S]*?\])\s*<\/suggestions>|<!--\s*suggestions\s*:\s*(\[[\s\S]*?\])\s*-->)/i
 
   let suggestions = []
 
@@ -4934,26 +6375,21 @@ ${userMessage}`;
   const suggestionsMatch = text?.match(SUGGESTIONS_RE)
 
   if (suggestionsMatch) {
-
     try {
-
-      const parsed = JSON.parse(suggestionsMatch[1])
-
+      const rawJson = suggestionsMatch[1] || suggestionsMatch[2]
+      const parsed = JSON.parse(rawJson)
       if (Array.isArray(parsed)) {
-
         suggestions = parsed.filter((s) => typeof s === 'string' && s.trim()).slice(0, 3)
-
       }
-
     } catch {
-
       // Formato inválido: se ignora, no es crítico para la respuesta.
-
     }
-
-    cleanText = text.replace(SUGGESTIONS_RE, '').trimEnd()
-
   }
+
+  cleanText = (cleanText || '')
+    .replace(/<suggestions>[\s\S]*?<\/suggestions>/gi, '')
+    .replace(/<!--\s*suggestions\s*:[\s\S]*?-->/gi, '')
+    .trimEnd()
 
 
 
@@ -5004,37 +6440,38 @@ ${userMessage}`;
     ...proposedEdgeFunctions
   ]
 
+  const versionTitle = (userMessagePayload?.summary && userMessagePayload.summary.trim())
+    ? userMessagePayload.summary.trim()
+    : deriveVersionTitle(proposedChanges, proposedDbChanges, null, proposedAssetChanges, userMessage)
+
   const fallbackProposedText = buildLovableStructuredResponse(allSummaries, {
     requiresApproval,
-    proposedChanges: allProposedChangesList
+    proposedChanges: proposedChanges,
+    proposedDbChanges: proposedDbChanges,
+    proposedAssetChanges: proposedAssetChanges
   })
 
   let finalText = ''
 
-  if (cleanText && cleanText.trim().length > 0) {
+  if (userMessagePayload?.message && userMessagePayload.message.trim().length > 0) {
+    finalText = sanitizeFinalAssistantText(userMessagePayload.message.trim())
+  } else if (cleanText && cleanText.trim().length > 0) {
     const trimmed = cleanText.trim()
     // Si por alguna razón el modelo o un runner devolvió el viejo ladrillo plano "Apliqué los cambios solicitados...",
-    // lo convertimos inmediatamente a la estructura limpia y amigable de Lovable
-    if (/^Apliqu[eé]\s+(?:el|los|m[uú]ltiples)\s+cambios?\s+solicitados?:/i.test(trimmed)) {
+    // lo convertimos inmediatamente a una confirmación humana limpia
+    if (/^Apliqu[eé]\s+(?:el|los|m[uú]ltiples)?\s*cambios?\s+solicitados?/i.test(trimmed) || trimmed === 'Apliqué los cambios solicitados en el proyecto.' || trimmed.startsWith('Apliqué los cambios solicitados')) {
       finalText = fallbackProposedText
     } else {
-      finalText = trimmed
+      finalText = sanitizeFinalAssistantText(trimmed)
     }
-
-    // Regla de Respuesta Dual: si hubo cambios de código y el pedido requería respuesta a una pregunta,
-    // nos aseguramos de que los cambios queden resumidos sin aplastar la explicación del LLM.
-    if (totalProposed > 0 && promptIntent.isDualResponseRequired) {
-      const mentionsChanges = allSummaries.some((s) => finalText.toLowerCase().includes(s.toLowerCase()))
-      if (!mentionsChanges && allSummaries.length > 0) {
-        finalText += `\n\n**Cambios aplicados:**\n${allSummaries.map((s) => `- ${s}`).join('\n')}`
-      }
-    }
+    // NOTA: PROHIBIDO concatenar **Cambios aplicados:** ni la lista de allSummaries al texto del LLM.
+    // Toda la información técnica de archivos y migraciones ya vive en proposedChanges / proposedDbChanges para el botón [Detalles].
   } else if (totalProposed > 0) {
     finalText = fallbackProposedText
-  } else if (askedQuestion && shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext })) {
-    finalText = 'Para seguir, elegí una opción:'
+  } else if (askedQuestion && shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext, activeViewContext, attachments: rawAttachments.length ? rawAttachments : attachments, history, isInitialKickoff })) {
+    finalText = askedQuestion.introText || 'Para definir la mejor solución para tu proyecto, por favor elige tus preferencias:'
   } else if (promptIntent.isPureQuestion) {
-    finalText = 'Analicé el estado del proyecto según tu consulta. No se requirieron cambios en los archivos.'
+    finalText = cleanText && cleanText.trim().length > 0 ? sanitizeFinalAssistantText(cleanText.trim()) : 'He analizado el proyecto en relación a tu consulta.'
   } else if (promptIntent.hasActionOrder) {
     finalText = 'No pude determinar los cambios de código necesarios para tu solicitud. Por favor, indícame con más detalle qué archivo o sección deseas modificar.'
   } else {
@@ -5044,7 +6481,7 @@ ${userMessage}`;
   // Si fue una pregunta pura de diagnóstico (sin cambios) y la respuesta no incluye el cierre con oferta:
   // Solo se agrega la coletilla si el usuario NO hizo una pregunta binaria o de capacidades (ej. "¿puedes...?")
   // y la respuesta del modelo realmente menciona o recomienda mejoras técnicas.
-  if (promptIntent.isPureQuestion && totalProposed === 0 && finalText) {
+  if (!proposedPlan && !askedQuestion && promptIntent.isPureQuestion && totalProposed === 0 && finalText && !isExplicitBuild && requestedMode !== 'build' && !promptIntent.hasActionOrder && !promptIntent.isDefectReport) {
     const rawUserMsg = (userMessage || '').toLowerCase();
     const asksBinaryOrCapability = /\b(?:puedes|eres capaz|es posible|se puede|s[ií]\s+o\s+no|sabes|ten[eé]s capacidad|tienes capacidad|qu[eé] eres|qui[eé]n eres)\b/i.test(rawUserMsg);
     const mentionsImprovements = /\b(?:mejora|mejoras|optimizar|optimizaci[oó]n|optimizaciones|recomiendo|recomendaci[oó]n|recomendaciones|sugerencia|sugerencias|podr[ií]amos|propuesta|plan de acci[oó]n)\b/i.test(finalText);
@@ -5054,9 +6491,25 @@ ${userMessage}`;
     }
   }
 
+  // Sanitización Determinística para tarjetas interactivas (Modo Plan o Preguntas)
+  if (proposedPlan || askedQuestion) {
+    finalText = compactInteractiveTurnText(finalText, proposedPlan, askedQuestion);
+  }
+
+  // En modo Auto-Curación de Emergencia, se suprime cualquier texto conversacional
+  if (isAutoFix) {
+    finalText = '';
+  }
+
   if (usage) {
     onProgress({ type: 'usage', metadata: usage });
   }
+
+  onProgress?.({
+    type: 'activity_description',
+    description: null,
+    timestamp: Date.now()
+  });
 
   if (proposedChanges.length > 0) {
     invalidateSemanticGraph(project.id);
@@ -5068,6 +6521,10 @@ ${userMessage}`;
   return {
     text: finalText,
 
+    versionTitle,
+    userMessagePayload,
+    proposedPlan,
+
     proposedChanges,
 
     proposedDbChanges,
@@ -5076,7 +6533,7 @@ ${userMessage}`;
 
     proposedEdgeFunctions,
 
-    askedQuestion: shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext }) ? askedQuestion : null,
+    askedQuestion: shouldAllowClarificationQuestion(userMessage, { promptIntent, elementContext, activeViewContext, attachments: rawAttachments.length ? rawAttachments : attachments, history, isInitialKickoff }) ? askedQuestion : null,
 
     suggestions,
 

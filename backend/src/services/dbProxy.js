@@ -118,15 +118,25 @@ async function withClient(connectionString, fn, userId) {
   const client = new Client({ connectionString })
   await client.connect()
   try {
+    // Siempre BEGIN — el contexto de sesión (authenticated vs anon) afecta las políticas RLS
+    // incluso para requests sin JWT. SET LOCAL solo vive dentro de una transacción.
+    await client.query('BEGIN')
     if (userId) {
-      await client.query('BEGIN')
+      // Backward-compat: current_user_id() lee 'app.user_id'
       await client.query('SELECT set_config($1, $2, true)', ['app.user_id', userId])
+      // Supabase-compat: auth.uid() lee 'request.jwt.claim.sub'
+      await client.query('SELECT set_config($1, $2, true)', ['request.jwt.claim.sub', userId])
+      await client.query('SET LOCAL ROLE authenticated').catch(() => {})
+    } else {
+      await client.query('SELECT set_config($1, $2, true)', ['app.user_id', ''])
+      await client.query('SELECT set_config($1, $2, true)', ['request.jwt.claim.sub', ''])
+      await client.query('SET LOCAL ROLE anon').catch(() => {})
     }
     const result = await fn(client)
-    if (userId) await client.query('COMMIT')
+    await client.query('COMMIT')
     return result
   } catch (err) {
-    if (userId) await client.query('ROLLBACK').catch(() => {})
+    await client.query('ROLLBACK').catch(() => {})
     throw err
   } finally {
     await client.end()
@@ -535,7 +545,7 @@ export async function signUp(connectionString, authSecret, email, password) {
       if (err.code === '23505') throw new ProxyError(409, 'Ya existe una cuenta con ese email')
       throw err
     }
-    const token = jwt.sign({ sub: row.id }, authSecret, { expiresIn: AUTH_TOKEN_EXPIRY })
+    const token = jwt.sign({ sub: row.id, email: row.email }, authSecret, { expiresIn: AUTH_TOKEN_EXPIRY })
     return { user: row, token }
   } finally {
     await client.end()
@@ -555,7 +565,8 @@ export async function signIn(connectionString, authSecret, email, password) {
       throw new ProxyError(401, 'Email o contraseña incorrectos')
     }
     delete user.password_hash
-    const token = jwt.sign({ sub: user.id }, authSecret, { expiresIn: AUTH_TOKEN_EXPIRY })
+    await client.query('UPDATE auth.users SET last_sign_in_at = now() WHERE id = $1', [user.id]).catch(() => {})
+    const token = jwt.sign({ sub: user.id, email: user.email }, authSecret, { expiresIn: AUTH_TOKEN_EXPIRY })
     return { user, token }
   } finally {
     await client.end()

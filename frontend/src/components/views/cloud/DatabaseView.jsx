@@ -67,13 +67,25 @@ function TableDataExplorer({ projectId, tableName, tables }) {
   const [page, setPage] = useState(1);
   const { data, isLoading, refetch } = useCloudTableRows(projectId, tableName, page);
   
-  const tableDef = tables.find(t => t.table_name === tableName);
-  const columns = tableDef?.columns || [];
+  const tableDef = tables.find(t => (t.table_name || t.name) === tableName);
+  const effectiveColumns = (data?.columns && data.columns.length > 0)
+    ? data.columns
+    : (tableDef?.columns && tableDef.columns.length > 0)
+      ? tableDef.columns
+      : (data?.rows && data.rows.length > 0)
+        ? Object.keys(data.rows[0]).map(k => ({
+            column_name: k,
+            data_type: typeof data.rows[0][k] === 'number' ? 'integer' : typeof data.rows[0][k] === 'boolean' ? 'boolean' : 'text',
+            is_primary: k === 'id'
+          }))
+        : [];
+  const columns = effectiveColumns;
   
-  const getColIcon = (type) => {
-    if (type.includes('int') || type.includes('numeric') || type.includes('float')) return <Hash className="w-3 h-3" />;
-    if (type.includes('time') || type.includes('date')) return <Calendar className="w-3 h-3" />;
-    if (type.includes('bool')) return <ToggleLeft className="w-3 h-3" />;
+  const getColIcon = (type = '') => {
+    const t = String(type || '').toLowerCase();
+    if (t.includes('int') || t.includes('numeric') || t.includes('float')) return <Hash className="w-3 h-3" />;
+    if (t.includes('time') || t.includes('date')) return <Calendar className="w-3 h-3" />;
+    if (t.includes('bool')) return <ToggleLeft className="w-3 h-3" />;
     return <Type className="w-3 h-3" />;
   };
 
@@ -105,39 +117,43 @@ function TableDataExplorer({ projectId, tableName, tables }) {
         <table className="w-full text-left border-collapse text-sm whitespace-nowrap">
           <thead className="sticky top-0 bg-[#141518] border-b border-[#23252a] shadow-sm z-10">
             <tr>
-              {columns.map(col => (
-                <th key={col.column_name} className="px-4 py-2 font-medium text-[#8a8f98] border-r border-[#23252a] last:border-0">
-                  <div className="flex items-center gap-1.5">
-                    {col.is_primary && <Key className="w-3 h-3 text-amber-500" />}
-                    {getColIcon(col.data_type)}
-                    <span>{col.column_name}</span>
-                  </div>
-                </th>
-              ))}
+              {columns.map(col => {
+                const colName = col.column_name || col.name;
+                return (
+                  <th key={colName} className="px-4 py-2 font-medium text-[#8a8f98] border-r border-[#23252a] last:border-0 font-mono text-xs">
+                    <div className="flex items-center gap-1.5">
+                      {col.is_primary && <Key className="w-3 h-3 text-amber-500" />}
+                      {getColIcon(col.data_type || col.type)}
+                      <span>{colName}</span>
+                    </div>
+                  </th>
+                );
+              })}
             </tr>
           </thead>
           <tbody>
             {isLoading ? (
               <tr>
-                <td colSpan={columns.length} className="px-4 py-8 text-center text-[#8a8f98]">
+                <td colSpan={Math.max(1, columns.length)} className="px-4 py-8 text-center text-[#8a8f98]">
                   Cargando registros...
                 </td>
               </tr>
             ) : data?.rows?.length === 0 ? (
               <tr>
-                <td colSpan={columns.length} className="px-4 py-8 text-center text-[#8a8f98]">
-                  La tabla est? vac?a.
+                <td colSpan={Math.max(1, columns.length)} className="px-4 py-8 text-center text-[#8a8f98]">
+                  La tabla está vacía.
                 </td>
               </tr>
             ) : (
               data?.rows?.map((row, i) => (
-                <tr key={i} className="border-b border-[#23252a]/50 hover:bg-[#1a1c20] transition-colors">
+                <tr key={i} className="border-b border-[#23252a]/50 hover:bg-[#1a1c20] transition-colors font-mono text-[13px]">
                   {columns.map(col => {
-                    let val = row[col.column_name];
+                    const colName = col.column_name || col.name;
+                    let val = row[colName];
                     if (typeof val === 'object' && val !== null) val = JSON.stringify(val);
                     return (
-                      <td key={col.column_name} className="px-4 py-2 text-[#ededed] border-r border-[#23252a]/50 last:border-0 max-w-[200px] truncate">
-                        {val === null ? <span className="text-[#8a8f98] italic">null</span> : String(val)}
+                      <td key={colName} className="px-4 py-2 text-[#ededed] border-r border-[#23252a]/50 last:border-0 max-w-[200px] truncate">
+                        {val === null || val === undefined ? <span className="text-[#8a8f98] italic font-sans text-xs">null</span> : String(val)}
                       </td>
                     );
                   })}
@@ -153,7 +169,7 @@ function TableDataExplorer({ projectId, tableName, tables }) {
           <span>Mostrando {data.rows.length} de {data.totalCount} registros</span>
           <div className="flex gap-2">
             <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1} className="px-2 py-1 rounded bg-[#1a1c20] border border-[#23252a] disabled:opacity-50">Anterior</button>
-            <span className="px-2 py-1">P?gina {page} de {data.totalPages}</span>
+            <span className="px-2 py-1">Página {page} de {data.totalPages}</span>
             <button onClick={() => setPage(p => Math.min(data.totalPages, p + 1))} disabled={page === data.totalPages} className="px-2 py-1 rounded bg-[#1a1c20] border border-[#23252a] disabled:opacity-50">Siguiente</button>
           </div>
         </div>
