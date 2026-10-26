@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createClient } from '@supabase/supabase-js';
 import { runAgentWithRotation } from './aiAccounts.js';
 import { commitTree } from './github.js';
 import { supabase } from '../db/supabaseClient.js';
@@ -64,6 +65,12 @@ function buildHumanActivityDescription(toolName, toolArgs) {
   }
   if (toolName === 'list_files') {
     return 'Explorando la estructura del proyecto...';
+  }
+  if (toolName === 'read_table_rows') {
+    return `Consultando datos de la tabla "${toolArgs.table || ''}" en Supabase...`;
+  }
+  if (toolName === 'propose_db_migration') {
+    return `Diseñando migración SQL para la base de datos (${toolArgs.migration_name || ''})...`;
   }
   if (toolName === 'message_user') {
     return 'Finalizando y redactando resumen de cambios...';
@@ -238,6 +245,56 @@ export async function processLovableDispatch({ projectId, prompt, github, active
     } catch (_) {}
   }
 
+  // Resolver credenciales y cliente de Supabase del proyecto Lovable si existen
+  let supabaseUrl = '';
+  let supabaseAnonKey = '';
+  let projectSupabase = null;
+
+  const envPath = path.join(workspaceDir, '.env');
+  if (fs.existsSync(envPath)) {
+    try {
+      const envRaw = await fs.promises.readFile(envPath, 'utf8');
+      const urlM = envRaw.match(/VITE_SUPABASE_URL=["']?([^"'\r\n]+)/);
+      const keyM = envRaw.match(/VITE_SUPABASE_PUBLISHABLE_KEY=["']?([^"'\r\n]+)/) ||
+                   envRaw.match(/VITE_SUPABASE_ANON_KEY=["']?([^"'\r\n]+)/);
+      if (urlM && urlM[1]) supabaseUrl = urlM[1].trim();
+      if (keyM && keyM[1]) supabaseAnonKey = keyM[1].trim();
+    } catch (_) {}
+  }
+
+  // Fallback: buscar URL en src/integrations/supabase/client.ts
+  if (!supabaseUrl) {
+    const clientPath = path.join(workspaceDir, 'src', 'integrations', 'supabase', 'client.ts');
+    if (fs.existsSync(clientPath)) {
+      try {
+        const clientRaw = await fs.promises.readFile(clientPath, 'utf8');
+        const urlM = clientRaw.match(/https:\/\/[a-z0-9-]+\.supabase\.co/i);
+        if (urlM) supabaseUrl = urlM[0];
+      } catch (_) {}
+    }
+  }
+
+  if (supabaseUrl && supabaseAnonKey) {
+    try {
+      projectSupabase = createClient(supabaseUrl, supabaseAnonKey, {
+        auth: { persistSession: false, autoRefreshToken: false }
+      });
+      console.log(`[LovableBridge] Conectado a Supabase de Lovable: ${supabaseUrl}`);
+    } catch (e) {
+      console.warn(`[LovableBridge] No se pudo inicializar cliente de Supabase:`, e.message);
+    }
+  }
+
+  // Leer migraciones SQL existentes en supabase/migrations/
+  let existingMigrations = [];
+  const migrationsDir = path.join(workspaceDir, 'supabase', 'migrations');
+  if (fs.existsSync(migrationsDir)) {
+    try {
+      const migFiles = await fs.promises.readdir(migrationsDir);
+      existingMigrations = migFiles.filter(f => f.endsWith('.sql')).sort();
+    } catch (_) {}
+  }
+
   // Leer package.json para respetar dependencias existentes
   let packageJsonContent = '';
   const pkgPath = path.join(workspaceDir, 'package.json');
@@ -275,20 +332,28 @@ INFORMACIÓN DEL ENTORNO DE LOVABLE:
 - Tecnologías: Vite + React + TypeScript + Tailwind CSS v3 + shadcn/ui + Lucide React.
 - Ruta activa en pantalla de Lovable: "${activeRoute || '/'}"
 ${selectedElementBlock}
+${projectSupabase ? `- Base de datos Supabase conectada y activa: "${supabaseUrl}". Dispones de la herramienta "read_table_rows" para consultar registros reales.\n` : ''}
 ${supabaseTypes ? `- Esquema de Base de Datos Supabase (types.ts):\n\`\`\`typescript\n${supabaseTypes}\n\`\`\`\n` : ''}
+${existingMigrations.length > 0 ? `- Migraciones SQL registradas (${existingMigrations.length}):\n${existingMigrations.slice(-5).map(m => `  • supabase/migrations/${m}`).join('\n')}\n` : ''}
 ${packageJsonContent ? `- package.json del proyecto:\n\`\`\`json\n${packageJsonContent}\n\`\`\`\n` : ''}
 
 ÁRBOL DE ARCHIVOS ACTUAL DEL REPOSITORIO:
 ${fileTree.slice(0, 100).map(f => `- ${f}`).join('\n')}
 
 REGLAS DE ORO:
-1. OBLIGATORIO: Tu objetivo es MODIFICAR EL CÓDIGO en disco. Usa search_files para encontrar dónde está el texto o elemento solicitado, lee el archivo con read_file, y aplica los cambios con propose_change o replace_file_content. NO respondas solo con texto explicativo sin modificar archivos.
+1. OBJETIVO PRINCIPAL:
+   - Si la solicitud requiere cambios de código o diseño, modifica los archivos en disco usando search_files, read_file y propose_change o replace_file_content.
+   - Si la solicitud es una consulta o auditoría (ej: qué tablas hay, qué datos existen, cómo funciona el backend), usa read_table_rows y read_file para investigar y responde detalladamente con message_user.
 2. Aplica los cambios usando "propose_change", "replace_file_content" o "create_file". Devuelve código COMPLETO sin placeholders ni omitir líneas existentes.
 3. Respeta el diseño existente: Tailwind CSS v3 (usa tokens semánticos o clases nativas), componentes shadcn/ui en @/components/ui, y lucide-react.
 4. NO uses Tailwind v4 (@import "tailwindcss" o @theme).
-5. Al terminar, llama OBLIGATORIAMENTE a "message_user" con:
-   - summary: Un título semántico muy corto (3 a 6 palabras) del cambio realizado (ej: "Eliminación del camino al mundial").
-   - message: Una explicación conversacional limpia, natural y concisa (1 o 2 párrafos) de las modificaciones implementadas.`;
+5. GESTIÓN DE BASE DE DATOS Y SUPABASE:
+   - Para consultar datos existentes o ver qué registros contiene una tabla, usa la herramienta "read_table_rows".
+   - Para crear nuevas tablas o añadir/modificar columnas, usa "propose_db_migration" generando un archivo SQL en supabase/migrations/ con DDL idempotente (CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD COLUMN IF NOT EXISTS), y actualiza los componentes que consumen la tabla.
+   - Respeta siempre el esquema de Supabase tipado en "src/integrations/supabase/types.ts".
+6. Al terminar, llama OBLIGATORIAMENTE a "message_user" con:
+   - summary: Un título semántico muy corto (3 a 6 palabras) del cambio o diagnóstico realizado (ej: "Auditoría de base de datos completada").
+   - message: Una explicación conversacional limpia, natural y concisa (1 o 2 párrafos) de las modificaciones o hallazgos.`;
 
   // ── 1. DEFINICIÓN DE HERRAMIENTAS UNIVERSAL (Antigravity, Anthropic, Gemini, OpenAI) ──
   const makeTool = (name, description, schema) => ({
@@ -368,6 +433,31 @@ REGLAS DE ORO:
           query: { type: 'string', description: 'Texto o término a buscar' }
         },
         required: ['query']
+      }
+    ),
+    makeTool(
+      'read_table_rows',
+      'Lee filas y registros reales de una tabla en la base de datos Supabase conectada.',
+      {
+        type: 'object',
+        properties: {
+          table: { type: 'string', description: 'Nombre exacto de la tabla (ej: categories, orders, products, profiles)' },
+          limit: { type: 'integer', description: 'Cantidad máxima de filas a consultar (por defecto 15, máx 50)' }
+        },
+        required: ['table']
+      }
+    ),
+    makeTool(
+      'propose_db_migration',
+      'Crea una nueva migración SQL en supabase/migrations/<timestamp>_<nombre>.sql para añadir o modificar tablas, columnas, funciones o RLS en Supabase.',
+      {
+        type: 'object',
+        properties: {
+          migration_name: { type: 'string', description: 'Nombre descriptivo en snake_case (ej: add_status_to_orders, create_bookings_table)' },
+          sql_content: { type: 'string', description: 'Sentencias SQL completas e idempotentes (CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD COLUMN IF NOT EXISTS, RLS, etc.)' },
+          summary: { type: 'string', description: 'Resumen descriptivo del cambio en la estructura de la base de datos' }
+        },
+        required: ['migration_name', 'sql_content']
       }
     ),
     makeTool(
@@ -459,12 +549,51 @@ REGLAS DE ORO:
       return `Archivo "${cleanPath}" guardado exitosamente.`;
     }
 
-    // E. update_memory: noop para compatibilidad con Antigravity
+    // E. read_table_rows: consulta de registros reales en Supabase
+    if (toolName === 'read_table_rows') {
+      if (!projectSupabase) {
+        return 'No se pudo conectar a la base de datos Supabase: credenciales VITE_SUPABASE_URL o VITE_SUPABASE_PUBLISHABLE_KEY no encontradas en el archivo .env del repositorio.';
+      }
+      const tableName = String(toolArgs.table || '').trim();
+      const limit = Math.min(Math.max(Number(toolArgs.limit) || 15, 1), 50);
+      try {
+        const { data, error } = await projectSupabase.from(tableName).select('*').limit(limit);
+        if (error) {
+          return `Error al consultar la tabla "${tableName}": ${error.message} (Código: ${error.code || 'N/A'}). Verifica si la tabla existe en types.ts y las políticas RLS.`;
+        }
+        if (!data || data.length === 0) {
+          return `La tabla "${tableName}" existe pero no contiene ningún registro actualmente.`;
+        }
+        return JSON.stringify(data, null, 2);
+      } catch (err) {
+        return `Error ejecutando consulta en "${tableName}": ${err.message}`;
+      }
+    }
+
+    // F. propose_db_migration: crear archivo de migración SQL en supabase/migrations/
+    if (toolName === 'propose_db_migration') {
+      const rawName = String(toolArgs.migration_name || 'migration').replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
+      const now = new Date();
+      const timestamp = now.toISOString().replace(/[-:T]/g, '').slice(0, 14); // YYYYMMDDHHMMSS
+      const fileName = `${timestamp}_${rawName}.sql`;
+      const relPath = path.join('supabase', 'migrations', fileName).replace(/\\/g, '/');
+      const fullPath = path.join(workspaceDir, relPath);
+
+      await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+      await fs.promises.writeFile(fullPath, toolArgs.sql_content, 'utf8');
+      filesModified.add(relPath);
+
+      if (toolArgs.summary) agentSummary = toolArgs.summary;
+      console.log(`[LovableBridge] ✅ Migración SQL creada: ${relPath}`);
+      return `Migración SQL creada exitosamente en "${relPath}". Se subirá a GitHub para aplicarse en Supabase.`;
+    }
+
+    // G. update_memory: noop para compatibilidad con Antigravity
     if (toolName === 'update_memory') {
       return 'Memoria registrada.';
     }
 
-    // F. message_user: cierre de turno
+    // H. message_user: cierre de turno
     if (toolName === 'message_user') {
       agentSummary = toolArgs.summary || agentSummary;
       agentMessage = toolArgs.message || '';
@@ -495,12 +624,22 @@ REGLAS DE ORO:
   const modifiedList = Array.from(filesModified);
 
   if (modifiedList.length === 0) {
+    if (agentMessage) {
+      console.log(`[LovableBridge] Turno informativo/consulta completado sin modificaciones de archivos para: "${prompt}"`);
+      return {
+        ok: true,
+        summary: agentSummary || 'Consulta completada',
+        message: agentMessage,
+        filesModified: [],
+        commitSha: null
+      };
+    }
     console.warn(`[LovableBridge] La IA no modificó ningún archivo para el prompt: "${prompt}"`);
     return {
       ok: false,
       error: 'NO_FILES_MODIFIED',
       summary: agentSummary || 'No se modificaron archivos',
-      message: agentMessage || 'El modelo analizó la solicitud pero no aplicó cambios con "propose_change" o "replace_file_content". Por favor sé más específico con el componente o archivo a editar.',
+      message: 'El modelo analizó la solicitud pero no aplicó cambios con "propose_change" o "replace_file_content".',
       filesModified: [],
       commitSha: null
     };
