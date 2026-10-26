@@ -187,7 +187,6 @@ export async function processLovableDispatch({ projectId, prompt, github, active
   console.log(`[LovableBridge] Ejecutando bucle de inferencia para: "${prompt}"...`);
 
   const filesModified = new Set();
-  const fileContentsBefore = new Map();
   let agentSummary = '';
   let agentMessage = '';
 
@@ -204,67 +203,128 @@ ${packageJsonContent ? `- package.json del proyecto:\n\`\`\`json\n${packageJsonC
 ${fileTree.slice(0, 100).map(f => `- ${f}`).join('\n')}
 
 REGLAS DE ORO:
-1. Lee primero los archivos existentes que necesitas cambiar usando "read_file".
+1. OBLIGATORIO: Tu objetivo es MODIFICAR EL CÓDIGO en disco. Usa search_files para encontrar dónde está el texto o elemento solicitado, lee el archivo con read_file, y aplica los cambios con replace_file_content. NO respondas solo con texto explicativo sin modificar archivos.
 2. Aplica los cambios usando "replace_file_content" o "create_file". Devuelve código COMPLETO sin placeholders ni omitir líneas existentes.
 3. Respeta el diseño existente: Tailwind CSS v3 (usa tokens semánticos o clases nativas), componentes shadcn/ui en @/components/ui, y lucide-react.
 4. NO uses Tailwind v4 (@import "tailwindcss" o @theme).
 5. Al terminar, llama OBLIGATORIAMENTE a "message_user" con el resumen conciso de los cambios.`;
 
+  // ── 1. DEFINICIÓN UNIVERSAL DE HERRAMIENTAS (Compatible con Anthropic, Gemini, OpenAI y Antigravity) ──
+  const makeTool = (name, description, schema) => ({
+    name,
+    description,
+    input_schema: schema,
+    parameters: schema
+  });
+
   const tools = [
-    {
-      name: 'read_file',
-      description: 'Lee el contenido de un archivo del repositorio para entender su estructura.',
-      parameters: {
+    makeTool(
+      'list_files',
+      'Lista las rutas de los archivos disponibles en el repositorio.',
+      {
         type: 'object',
         properties: {
-          filePath: { type: 'string', description: 'Ruta relativa del archivo (ej: src/components/Navbar.tsx)' }
-        },
-        required: ['filePath']
+          directory: { type: 'string', description: 'Directorio opcional (ej: src/components)' }
+        }
       }
-    },
-    {
-      name: 'replace_file_content',
-      description: 'Modifica o sobreescribe un archivo existente con el código nuevo completo.',
-      parameters: {
+    ),
+    makeTool(
+      'search_files',
+      'Busca texto, frases o componentes dentro de los archivos del repositorio (útil para encontrar dónde está un texto específico).',
+      {
         type: 'object',
         properties: {
-          filePath: { type: 'string', description: 'Ruta relativa del archivo a modificar' },
+          query: { type: 'string', description: 'Texto o término a buscar (ej: camino al mundial)' }
+        },
+        required: ['query']
+      }
+    ),
+    makeTool(
+      'read_file',
+      'Lee el contenido completo de un archivo del repositorio.',
+      {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Ruta relativa del archivo (ej: src/pages/Index.tsx)' },
+          filePath: { type: 'string', description: 'Ruta alternativa' }
+        }
+      }
+    ),
+    makeTool(
+      'replace_file_content',
+      'Modifica o sobreescribe un archivo existente con el código nuevo completo sin omitir partes no relacionadas.',
+      {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Ruta relativa del archivo a modificar' },
+          filePath: { type: 'string', description: 'Ruta alternativa' },
           content: { type: 'string', description: 'Código fuente completo actualizado' },
-          summary: { type: 'string', description: 'Resumen descriptivo del cambio' }
+          summary: { type: 'string', description: 'Resumen descriptivo del cambio realizado' }
         },
-        required: ['filePath', 'content']
+        required: ['content']
       }
-    },
-    {
-      name: 'create_file',
-      description: 'Crea un nuevo archivo en el repositorio.',
-      parameters: {
+    ),
+    makeTool(
+      'create_file',
+      'Crea un nuevo archivo en el repositorio.',
+      {
         type: 'object',
         properties: {
-          filePath: { type: 'string', description: 'Ruta relativa del nuevo archivo (ej: src/components/ContactModal.tsx)' },
-          content: { type: 'string', description: 'Código fuente del nuevo archivo' },
-          summary: { type: 'string', description: 'Resumen descriptivo del nuevo archivo' }
+          path: { type: 'string', description: 'Ruta relativa del nuevo archivo' },
+          filePath: { type: 'string', description: 'Ruta alternativa' },
+          content: { type: 'string', description: 'Código fuente completo' },
+          summary: { type: 'string', description: 'Resumen descriptivo' }
         },
-        required: ['filePath', 'content']
+        required: ['content']
       }
-    },
-    {
-      name: 'message_user',
-      description: 'Cierra el turno notificando el resumen final de lo implementado.',
-      parameters: {
+    ),
+    makeTool(
+      'message_user',
+      'Notifica al usuario el resumen final de lo implementado tras realizar las modificaciones.',
+      {
         type: 'object',
         properties: {
-          summary: { type: 'string', description: 'Título o resumen de los cambios (ej: Botón y modal de contacto agregados al Navbar)' },
-          message: { type: 'string', description: 'Detalle amigable de lo implementado' }
+          summary: { type: 'string', description: 'Título o resumen de los cambios' },
+          message: { type: 'string', description: 'Detalle de los cambios' }
         },
         required: ['summary']
       }
-    }
+    )
   ];
 
+  // ── 2. EJECUTOR DE HERRAMIENTAS ROBUSTO ──
   const executeTool = async (toolName, toolArgs) => {
+    const rawPath = toolArgs.path || toolArgs.filePath || '';
+    const cleanPath = rawPath.replace(/^\.?\//, '');
+
+    if (toolName === 'list_files') {
+      const subTree = toolArgs.directory
+        ? fileTree.filter(f => f.startsWith(toolArgs.directory.replace(/^\.?\//, '')))
+        : fileTree;
+      return subTree.slice(0, 150).join('\n') || 'No se encontraron archivos en ese directorio.';
+    }
+
+    if (toolName === 'search_files') {
+      const q = (toolArgs.query || '').toLowerCase();
+      if (!q) return 'Debes especificar un término de búsqueda.';
+      const matches = [];
+      for (const rel of fileTree) {
+        if (!rel.startsWith('src/')) continue;
+        const full = path.join(workspaceDir, rel);
+        try {
+          const txt = await fs.promises.readFile(full, 'utf8');
+          if (txt.toLowerCase().includes(q)) {
+            matches.push(rel);
+          }
+        } catch (_) {}
+      }
+      return matches.length > 0
+        ? `Coincidencias encontradas en los siguientes archivos:\n${matches.join('\n')}`
+        : `No se encontró ninguna coincidencia para "${toolArgs.query}".`;
+    }
+
     if (toolName === 'read_file') {
-      const cleanPath = (toolArgs.filePath || '').replace(/^\.?\//, '');
+      if (!cleanPath) return 'Error: Debes proporcionar la ruta del archivo (path).';
       const fullTarget = path.join(workspaceDir, cleanPath);
       if (!fs.existsSync(fullTarget)) {
         return `Error: El archivo "${cleanPath}" no existe en el repositorio.`;
@@ -274,14 +334,15 @@ REGLAS DE ORO:
     }
 
     if (toolName === 'replace_file_content' || toolName === 'create_file') {
-      const cleanPath = (toolArgs.filePath || '').replace(/^\.?\//, '');
+      if (!cleanPath) return 'Error: Debes proporcionar la ruta del archivo (path).';
+      const fileContent = toolArgs.content || toolArgs.code || toolArgs.new_str || '';
+      if (!fileContent) return 'Error: El contenido del archivo no puede estar vacío.';
+
       const fullTarget = path.join(workspaceDir, cleanPath);
       await fs.promises.mkdir(path.dirname(fullTarget), { recursive: true });
-      await fs.promises.writeFile(fullTarget, toolArgs.content, 'utf8');
+      await fs.promises.writeFile(fullTarget, fileContent, 'utf8');
       filesModified.add(cleanPath);
-      if (toolArgs.summary && !agentSummary) {
-        agentSummary = toolArgs.summary;
-      }
+      if (toolArgs.summary) agentSummary = toolArgs.summary;
       return `Archivo "${cleanPath}" guardado exitosamente.`;
     }
 
@@ -309,69 +370,79 @@ REGLAS DE ORO:
     throw new Error(`Fallo en la inferencia del agente: ${agentErr.message}`);
   }
 
-  const finalSummary = agentSummary || 'Actualización de componentes e interfaz';
+  // ── 3. VALIDACIÓN ESTRICTA DE CAMBIOS ANTES DE COMMIT ──
   const modifiedList = Array.from(filesModified);
+
+  if (modifiedList.length === 0) {
+    console.warn(`[LovableBridge] La IA no modificó ningún archivo para el prompt: "${prompt}"`);
+    return {
+      ok: false,
+      error: 'NO_FILES_MODIFIED',
+      summary: agentSummary || 'No se modificaron archivos',
+      message: agentMessage || 'El modelo analizó la solicitud pero no aplicó cambios con "replace_file_content". Por favor sé más específico con el componente o archivo a editar.',
+      filesModified: [],
+      commitSha: null
+    };
+  }
+
+  const finalSummary = agentSummary || 'Actualización de componentes e interfaz';
 
   // ── PASO C: Commit y Push Atómico a GitHub ──
   console.log(`[LovableBridge] Guardando cambios y preparando git push (${modifiedList.length} archivos modificados)...`);
 
   let commitSha = null;
 
-  if (modifiedList.length > 0) {
-    try {
-      await clearGitLocks(workspaceDir);
-      await execAsync('git add .', { cwd: workspaceDir });
+  try {
+    await clearGitLocks(workspaceDir);
+    await execAsync('git add .', { cwd: workspaceDir });
+    
+    const statusRes = await execAsync('git status --porcelain', { cwd: workspaceDir });
+    if (statusRes.stdout.trim().length > 0) {
+      const commitMsg = `feat(flowpro): ${finalSummary}`;
+      await execAsync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { cwd: workspaceDir });
       
-      const statusRes = await execAsync('git status --porcelain', { cwd: workspaceDir });
-      if (statusRes.stdout.trim().length > 0) {
-        const commitMsg = `feat(flowpro): ${finalSummary}`;
-        await execAsync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { cwd: workspaceDir });
-        
-        console.log(`[LovableBridge] Haciendo push a origin/${branch}...`);
-        await execAsync(`git push origin "${branch}"`, { cwd: workspaceDir });
-        
-        const revRes = await execAsync('git rev-parse HEAD', { cwd: workspaceDir });
-        commitSha = revRes.stdout.trim();
-        console.log(`[LovableBridge] Push exitoso. Commit SHA: ${commitSha}`);
-      } else {
-        const revRes = await execAsync('git rev-parse HEAD', { cwd: workspaceDir });
-        commitSha = revRes.stdout.trim();
-      }
-    } catch (gitPushErr) {
-      console.warn(`[LovableBridge] git push vía CLI falló (${gitPushErr.message}). Intentando fallback con GitHub API...`);
-      if (token) {
-        try {
-          const filesMap = {};
-          for (const relPath of modifiedList) {
-            const content = await fs.promises.readFile(path.join(workspaceDir, relPath), 'utf8');
-            filesMap[relPath] = content;
-          }
-          const apiRes = await commitTree(
-            token,
-            owner,
-            repo,
-            filesMap,
-            `feat(flowpro): ${finalSummary}`,
-            branch
-          );
-          commitSha = apiRes.commitSha;
-          console.log(`[LovableBridge] Commit exitoso vía GitHub API. SHA: ${commitSha}`);
-        } catch (apiErr) {
-          console.error(`[LovableBridge] Fallback API también falló:`, apiErr.message);
-          throw new Error(`Fallo al sincronizar con GitHub: ${gitPushErr.message}`);
-        }
-      } else {
-        throw gitPushErr;
-      }
+      console.log(`[LovableBridge] Haciendo push a origin/${branch}...`);
+      await execAsync(`git push origin "${branch}"`, { cwd: workspaceDir });
+      
+      const revRes = await execAsync('git rev-parse HEAD', { cwd: workspaceDir });
+      commitSha = revRes.stdout.trim();
+      console.log(`[LovableBridge] Push exitoso. Commit SHA: ${commitSha}`);
+    } else {
+      const revRes = await execAsync('git rev-parse HEAD', { cwd: workspaceDir });
+      commitSha = revRes.stdout.trim();
     }
-  } else {
-    const revRes = await execAsync('git rev-parse HEAD', { cwd: workspaceDir }).catch(() => ({ stdout: '' }));
-    commitSha = revRes.stdout ? revRes.stdout.trim() : null;
+  } catch (gitPushErr) {
+    console.warn(`[LovableBridge] git push vía CLI falló (${gitPushErr.message}). Intentando fallback con GitHub API...`);
+    if (token) {
+      try {
+        const filesMap = {};
+        for (const relPath of modifiedList) {
+          const content = await fs.promises.readFile(path.join(workspaceDir, relPath), 'utf8');
+          filesMap[relPath] = content;
+        }
+        const apiRes = await commitTree(
+          token,
+          owner,
+          repo,
+          filesMap,
+          `feat(flowpro): ${finalSummary}`,
+          branch
+        );
+        commitSha = apiRes.commitSha;
+        console.log(`[LovableBridge] Commit exitoso vía GitHub API. SHA: ${commitSha}`);
+      } catch (apiErr) {
+        console.error(`[LovableBridge] Fallback API también falló:`, apiErr.message);
+        throw new Error(`Fallo al sincronizar con GitHub: ${gitPushErr.message}`);
+      }
+    } else {
+      throw gitPushErr;
+    }
   }
 
   return {
     ok: true,
     summary: finalSummary,
+    message: agentMessage || null,
     filesModified: modifiedList,
     commitSha: commitSha || 'unknown'
   };
