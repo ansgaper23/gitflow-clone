@@ -40,7 +40,6 @@ authRouter.post('/register', async (req, res) => {
   const { data: existing } = await supabase.from('users').select('id').eq('email', normalizedEmail).maybeSingle()
   if (existing) return res.status(409).json({ error: 'Ya existe una cuenta con ese email' })
 
-
   let reseller_id = null
   if (ref) {
     let query = supabase.from('reseller_licenses').select('user_id')
@@ -75,7 +74,6 @@ authRouter.post('/login', async (req, res) => {
   const valid = await verifyPassword(password, user.password_hash)
   if (!valid) return res.status(401).json({ error: 'Email o contraseña incorrectos' })
 
-  
   let resellerPaymentUrl = null
   if (user.reseller_id) {
     const { data: rl } = await supabase.from('reseller_licenses').select('payment_url').eq('user_id', user.reseller_id).maybeSingle()
@@ -84,32 +82,102 @@ authRouter.post('/login', async (req, res) => {
 
   res.json({
     resellerPaymentUrl: resellerPaymentUrl,
-    resellerId: user.reseller_id, token: signSession(user.id) })
-})
-
-// --- GitHub OAuth (login normal, o "conectar" una cuenta ya logueada por email/Google) ---
-
-authRouter.get('/github/login', (req, res) => {
-  if (!isGithubConfigured) {
-    return res.status(503).send('GitHub OAuth no está configurado en el backend (.env)')
-  }
-  let state
-  if (req.query.linkToken) {
-    const userId = verifySession(req.query.linkToken)
-    if (userId) state = createLinkState(pendingGithubLinks, userId)
-  }
-  const params = new URLSearchParams({
-    client_id: config.githubClientId,
-    redirect_uri: `${req.protocol}://${req.get('host')}/api/auth/github/callback`,
-    scope: 'repo delete_repo read:user user:email',
-    ...(state ? { state } : {}),
+    resellerId: user.reseller_id,
+    token: signSession(user.id)
   })
-  res.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`)
 })
 
-authRouter.get('/github/callback', async (req, res) => {
+// --- Helpers para GitHub OAuth y Lovable Bridge ---
+
+function decodeBridgeState(state) {
+  if (!state) return null
+  try {
+    const decoded = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'))
+    if (decoded && (decoded.isBridge || decoded.projectId !== undefined)) return decoded
+  } catch (_) {
+    try {
+      const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf8'))
+      if (decoded && (decoded.isBridge || decoded.projectId !== undefined)) return decoded
+    } catch (_) {}
+  }
+  return null
+}
+
+function renderBridgeSuccessHtml({ login, token, projectId }) {
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>FlowPro - GitHub Conectado</title>
+  <style>
+    body { background: #090d16; color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #0f172a; border: 1px solid rgba(59,130,246,0.3); border-radius: 12px; padding: 28px 32px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); max-width: 380px; }
+    .spinner { width: 30px; height: 30px; border: 3px solid rgba(56,189,248,0.2); border-top-color: #38bdf8; border-radius: 50%; animation: spin 0.7s linear infinite; margin: 0 auto 16px; }
+    h3 { margin: 0 0 8px; color: #38bdf8; font-size: 17px; }
+    p { margin: 0; color: #94a3b8; font-size: 13px; line-height: 1.5; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <h3>¡GitHub Conectado con Éxito!</h3>
+    <p>Conectado como <b>@${login || 'usuario'}</b>.<br>Cerrando ventana...</p>
+  </div>
+  <script>
+    try {
+      if (window.opener) {
+        window.opener.postMessage({
+          type: 'FLOWPRO_GITHUB_AUTH_SUCCESS',
+          token: ${JSON.stringify(token)},
+          login: ${JSON.stringify(login)},
+          projectId: ${JSON.stringify(projectId)}
+        }, '*');
+      }
+    } catch (e) {
+      console.error('Error enviando mensaje a la extensión:', e);
+    }
+    setTimeout(() => {
+      window.close();
+    }, 800);
+  </script>
+</body>
+</html>`
+}
+
+function renderBridgeErrorHtml(title, message) {
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>FlowPro - ${title}</title>
+  <style>
+    body { background: #090d16; color: #f87171; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #0f172a; border: 1px solid rgba(239,68,68,0.3); border-radius: 12px; padding: 24px 30px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h3>${title}</h3>
+    <p>${message}</p>
+    <p style="font-size:12px;color:#94a3b8">Cerrando ventana automáticamente...</p>
+  </div>
+  <script>setTimeout(() => window.close(), 3000);</script>
+</body>
+</html>`
+}
+
+async function handleGithubOAuthCallback(req, res, forceBridge = false) {
   const { code, state } = req.query
-  if (!code) return res.redirect(`${config.frontendUrl}/auth?error=missing_code`)
+  const bridgePayload = decodeBridgeState(state) || (forceBridge ? { isBridge: true } : null)
+
+  if (!code) {
+    if (bridgePayload) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8')
+      return res.status(400).send(renderBridgeErrorHtml('Error de Autorización', 'No se recibió código de autorización de GitHub.'))
+    }
+    return res.redirect(`${config.frontendUrl}/auth?error=missing_code`)
+  }
 
   try {
     const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
@@ -123,27 +191,36 @@ authRouter.get('/github/callback', async (req, res) => {
     })
     const tokenData = await tokenRes.json()
     if (!tokenData.access_token) {
+      if (bridgePayload) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8')
+        return res.status(400).send(renderBridgeErrorHtml('Error de Token', tokenData.error_description || tokenData.error || 'Código expirado o inválido'))
+      }
       return res.redirect(`${config.frontendUrl}/auth?error=token_exchange_failed`)
     }
-    // La app tiene "expiring user tokens" activado en GitHub: el access_token vence en unas
-    // horas (tokenData.expires_in) y viene con un refresh_token para renovarlo — ver
-    // services/github.js -> getValidGithubToken(), que lo usa para renovar solo, sin que el
-    // usuario tenga que reconectar cada vez que expira.
+
     const githubTokenFields = {
       github_refresh_token: tokenData.refresh_token || null,
       github_token_expires_at: tokenData.expires_in ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString() : null,
     }
 
     const ghUserRes = await fetch('https://api.github.com/user', {
-      headers: { Authorization: `Bearer ${tokenData.access_token}`, 'User-Agent': 'gitflow-clone' },
+      headers: { Authorization: `Bearer ${tokenData.access_token}`, 'User-Agent': 'FlowPro-Lovable-Bridge' },
     })
     const ghUser = await ghUserRes.json()
 
     if (!supabase) {
+      if (bridgePayload) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8')
+        return res.send(renderBridgeSuccessHtml({
+          login: ghUser?.login || '',
+          token: tokenData.access_token,
+          projectId: bridgePayload.projectId || ''
+        }))
+      }
       return res.redirect(`${config.frontendUrl}/auth?error=supabase_not_configured`)
     }
 
-    const linkUserId = state ? consumeLinkState(pendingGithubLinks, state) : null
+    const linkUserId = state && !bridgePayload ? consumeLinkState(pendingGithubLinks, state) : null
 
     const { data: existingByGithub } = await supabase
       .from('users')
@@ -165,6 +242,7 @@ authRouter.get('/github/callback', async (req, res) => {
           avatar_url: ghUser.avatar_url,
           github_access_token: tokenData.access_token,
           ...githubTokenFields,
+          updated_at: new Date().toISOString()
         })
         .eq('id', userId)
     } else if (existingByGithub) {
@@ -176,6 +254,7 @@ authRouter.get('/github/callback', async (req, res) => {
           avatar_url: ghUser.avatar_url,
           github_access_token: tokenData.access_token,
           ...githubTokenFields,
+          updated_at: new Date().toISOString()
         })
         .eq('id', userId)
     } else {
@@ -185,14 +264,28 @@ authRouter.get('/github/callback', async (req, res) => {
           github_id: String(ghUser.id),
           github_login: ghUser.login,
           avatar_url: ghUser.avatar_url,
-          email: ghUser.email,
+          email: ghUser.email || null,
           github_access_token: tokenData.access_token,
           ...githubTokenFields,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
         })
         .select('id')
         .single()
-      if (error) throw error
-      userId = created.id
+      if (error) {
+        if (!bridgePayload) throw error
+      } else {
+        userId = created.id
+      }
+    }
+
+    if (bridgePayload) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8')
+      return res.send(renderBridgeSuccessHtml({
+        login: ghUser?.login || '',
+        token: tokenData.access_token,
+        projectId: bridgePayload.projectId || ''
+      }))
     }
 
     if (linkUserId) {
@@ -201,10 +294,36 @@ authRouter.get('/github/callback', async (req, res) => {
     const session = signSession(userId)
     res.redirect(`${config.frontendUrl}/auth/callback?token=${session}`)
   } catch (err) {
-    console.error(err)
+    console.error('[github-callback] Error:', err)
+    if (bridgePayload) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8')
+      return res.status(500).send(renderBridgeErrorHtml('Error de Servidor', err.message || 'Error inesperado'))
+    }
     res.redirect(`${config.frontendUrl}/auth?error=server_error`)
   }
+}
+
+// --- GitHub OAuth (login normal) ---
+
+authRouter.get('/github/login', (req, res) => {
+  if (!isGithubConfigured) {
+    return res.status(503).send('GitHub OAuth no está configurado en el backend (.env)')
+  }
+  let state
+  if (req.query.linkToken) {
+    const userId = verifySession(req.query.linkToken)
+    if (userId) state = createLinkState(pendingGithubLinks, userId)
+  }
+  const params = new URLSearchParams({
+    client_id: config.githubClientId,
+    redirect_uri: `${req.protocol}://${req.get('host')}/api/auth/github/callback`,
+    scope: 'repo delete_repo read:user user:email',
+    ...(state ? { state } : {}),
+  })
+  res.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`)
 })
+
+authRouter.get('/github/callback', (req, res) => handleGithubOAuthCallback(req, res, false))
 
 // --- GitHub OAuth para Extensión FlowPro Bridge (Popup en Lovable.dev) ---
 
@@ -214,214 +333,34 @@ authRouter.get('/github/lovable-connect', (req, res) => {
       ok: false,
       error: 'GITHUB_OAUTH_NOT_CONFIGURED',
       message: 'GitHub OAuth no está configurado en el backend (.env)'
-    });
+    })
   }
 
-  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-  const host = req.get('host');
-  const callbackUrl = `${protocol}://${host}/api/auth/github/lovable-callback`;
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https'
+  const host = req.get('host')
+  // Usar el callback oficial registrado en GitHub OAuth App (/api/auth/github/callback) para que GitHub no arroje
+  // el error "The redirect_uri is not associated with this application", o permitir uno explícito si se envía.
+  const callbackUrl = req.query.redirect_uri || `${protocol}://${host}/api/auth/github/callback`
 
   const statePayload = {
     projectId: req.query.projectId || '',
     origin: req.query.origin || '',
     isBridge: true,
     ts: Date.now()
-  };
-  const state = Buffer.from(JSON.stringify(statePayload)).toString('base64url');
+  }
+  const state = Buffer.from(JSON.stringify(statePayload)).toString('base64url')
 
   const params = new URLSearchParams({
     client_id: config.githubClientId,
     redirect_uri: callbackUrl,
     scope: 'repo delete_repo read:user user:email',
     state,
-  });
+  })
 
-  res.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`);
-});
+  res.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`)
+})
 
-authRouter.get('/github/lovable-callback', async (req, res) => {
-  const { code, state } = req.query;
-
-  if (!code) {
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.status(400).send(`<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>FlowPro - Error de Autorización</title>
-  <style>
-    body { background: #090d16; color: #f87171; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-    .card { background: #0f172a; border: 1px solid rgba(239,68,68,0.3); border-radius: 12px; padding: 24px 30px; text-align: center; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h3>Error: No se recibió código de autorización de GitHub.</h3>
-    <p>Cerrando ventana automáticamente...</p>
-  </div>
-  <script>setTimeout(() => window.close(), 2500);</script>
-</body>
-</html>`);
-  }
-
-  try {
-    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({
-        client_id: config.githubClientId,
-        client_secret: config.githubClientSecret,
-        code,
-      }),
-    });
-
-    const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) {
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      return res.status(400).send(`<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>FlowPro - Error de Token</title>
-  <style>
-    body { background: #090d16; color: #f87171; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-    .card { background: #0f172a; border: 1px solid rgba(239,68,68,0.3); border-radius: 12px; padding: 24px 30px; text-align: center; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h3>Error: No se pudo obtener el token de acceso de GitHub.</h3>
-    <p>${tokenData.error_description || tokenData.error || 'Código expirado o inválido'}</p>
-  </div>
-  <script>setTimeout(() => window.close(), 3000);</script>
-</body>
-</html>`);
-    }
-
-    const githubTokenFields = {
-      github_refresh_token: tokenData.refresh_token || null,
-      github_token_expires_at: tokenData.expires_in ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString() : null,
-    };
-
-    const ghUserRes = await fetch('https://api.github.com/user', {
-      headers: { Authorization: `Bearer ${tokenData.access_token}`, 'User-Agent': 'FlowPro-Lovable-Bridge' },
-    });
-    const ghUser = await ghUserRes.json();
-
-    if (supabase && ghUser?.id) {
-      try {
-        const { data: existingUser } = await supabase
-          .from('users')
-          .select('id')
-          .eq('github_id', String(ghUser.id))
-          .maybeSingle();
-
-        if (existingUser) {
-          await supabase
-            .from('users')
-            .update({
-              github_login: ghUser.login,
-              avatar_url: ghUser.avatar_url,
-              github_access_token: tokenData.access_token,
-              ...githubTokenFields,
-              updated_at: new Date().toISOString()
-            })
-            .eq('id', existingUser.id);
-        } else {
-          await supabase
-            .from('users')
-            .insert({
-              github_id: String(ghUser.id),
-              github_login: ghUser.login,
-              avatar_url: ghUser.avatar_url,
-              email: ghUser.email || null,
-              github_access_token: tokenData.access_token,
-              ...githubTokenFields,
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString()
-            });
-        }
-      } catch (dbErr) {
-        console.warn('[lovable-callback] No se pudo guardar token en Supabase (no bloqueante):', dbErr.message);
-      }
-    }
-
-    let projectId = '';
-    if (state) {
-      try {
-        const decoded = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
-        projectId = decoded.projectId || '';
-      } catch (_) {
-        try {
-          const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
-          projectId = decoded.projectId || '';
-        } catch (_) {}
-      }
-    }
-
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(`<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>FlowPro - GitHub Conectado</title>
-  <style>
-    body { background: #090d16; color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-    .card { background: #0f172a; border: 1px solid rgba(59,130,246,0.3); border-radius: 12px; padding: 28px 32px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); max-width: 380px; }
-    .spinner { width: 30px; height: 30px; border: 3px solid rgba(56,189,248,0.2); border-top-color: #38bdf8; border-radius: 50%; animation: spin 0.7s linear infinite; margin: 0 auto 16px; }
-    h3 { margin: 0 0 8px; color: #38bdf8; font-size: 17px; }
-    p { margin: 0; color: #94a3b8; font-size: 13px; line-height: 1.5; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="spinner"></div>
-    <h3>¡GitHub Conectado con Éxito!</h3>
-    <p>Conectado como <b>@${ghUser.login || 'usuario'}</b>.<br>Cerrando ventana...</p>
-  </div>
-  <script>
-    try {
-      if (window.opener) {
-        window.opener.postMessage({
-          type: 'FLOWPRO_GITHUB_AUTH_SUCCESS',
-          token: ${JSON.stringify(tokenData.access_token)},
-          login: ${JSON.stringify(ghUser.login || '')},
-          projectId: ${JSON.stringify(projectId || '')}
-        }, '*');
-      }
-    } catch (e) {
-      console.error('Error enviando mensaje a la extensión:', e);
-    }
-    setTimeout(() => {
-      window.close();
-    }, 800);
-  </script>
-</body>
-</html>`);
-  } catch (err) {
-    console.error('[lovable-callback] Error en intercambio OAuth:', err);
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.status(500).send(`<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>FlowPro - Error de Servidor</title>
-  <style>
-    body { background: #090d16; color: #f87171; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-    .card { background: #0f172a; border: 1px solid rgba(239,68,68,0.3); border-radius: 12px; padding: 24px 30px; text-align: center; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h3>Error del servidor durante la autenticación.</h3>
-    <p>${err.message || 'Error inesperado'}</p>
-  </div>
-  <script>setTimeout(() => window.close(), 3000);</script>
-</body>
-</html>`);
-  }
-});
+authRouter.get('/github/lovable-callback', (req, res) => handleGithubOAuthCallback(req, res, true))
 
 // --- Google OAuth (solo login/registro, no da acceso a repos) ---
 
@@ -545,7 +484,6 @@ authRouter.get('/me', requireAuth, async (req, res) => {
     resellerLicense && resellerLicense.status === 'active' && (!resellerLicense.expires_at || new Date(resellerLicense.expires_at) > new Date()),
   )
 
-  
   let resellerPaymentUrl = null
   if (user.reseller_id) {
     const { data: rl } = await supabase.from('reseller_licenses').select('payment_url').eq('user_id', user.reseller_id).maybeSingle()
