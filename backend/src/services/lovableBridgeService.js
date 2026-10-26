@@ -149,7 +149,7 @@ async function clearGitLocks(workspaceDir) {
  * @param {Function} [params.onActivity] Callback para telemetría efímera en vivo
  * @returns {Promise<{ ok: boolean, summary: string, message?: string, filesModified: string[], commitSha: string }>}
  */
-export async function processLovableDispatch({ projectId, prompt, github, activeRoute, onActivity }) {
+export async function processLovableDispatch({ projectId, prompt, github, activeRoute, selectedElement, onActivity }) {
   const notifyActivity = (desc) => {
     if (typeof onActivity === 'function') {
       try {
@@ -258,12 +258,23 @@ export async function processLovableDispatch({ projectId, prompt, github, active
   let agentSummary = '';
   let agentMessage = '';
 
+  const selectedElementBlock = selectedElement ? `
+ELEMENTO VISUAL SELECCIONADO POR EL USUARIO EN PANTALLA (CLICK-TO-EDIT):
+- Archivo objetivo: ${selectedElement.file || selectedElement.path || 'Desconocido'}
+- Línea aproximada: ${selectedElement.line || 'N/A'}
+- Componente JSX: <${selectedElement.component || 'Component'}>
+- Etiqueta HTML: <${selectedElement.tag || 'div'}>
+- Texto o etiqueta visible: "${selectedElement.textSnippet || ''}"
+- Ruta activa en pantalla: "${activeRoute || selectedElement.route || '/'}"
+REGLA PRIORITARIA: El usuario ha inspeccionado/seleccionado visualmente este elemento en pantalla. Centra y enfoca tus cambios directamente en este archivo y componente.` : '';
+
   const systemPrompt = `Eres FlowPro Lovable Bridge Agent, el orquestador autónomo de ingeniería de software.
 Estás modificando el proyecto web alojado en el repositorio GitHub "${owner}/${repo}" vinculado a Lovable.dev.
 
 INFORMACIÓN DEL ENTORNO DE LOVABLE:
 - Tecnologías: Vite + React + TypeScript + Tailwind CSS v3 + shadcn/ui + Lucide React.
 - Ruta activa en pantalla de Lovable: "${activeRoute || '/'}"
+${selectedElementBlock}
 ${supabaseTypes ? `- Esquema de Base de Datos Supabase (types.ts):\n\`\`\`typescript\n${supabaseTypes}\n\`\`\`\n` : ''}
 ${packageJsonContent ? `- package.json del proyecto:\n\`\`\`json\n${packageJsonContent}\n\`\`\`\n` : ''}
 

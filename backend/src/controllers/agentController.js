@@ -29,7 +29,7 @@ export async function handleLovableDispatch(req, res) {
   }
 
   try {
-    const { projectId, prompt, github, activeRoute, async: isAsync } = req.body || {};
+    const { projectId, prompt, github, activeRoute, selectedElement, async: isAsync } = req.body || {};
 
     // 1. Validación de enlace de GitHub
     if (!github || !github.owner || !github.repo) {
@@ -75,7 +75,7 @@ export async function handleLovableDispatch(req, res) {
       }
 
       // Procesar en background sin bloquear
-      processLovableDispatch({ projectId: pid, prompt, github, activeRoute })
+      processLovableDispatch({ projectId: pid, prompt, github, activeRoute, selectedElement })
         .then(result => {
           console.log(`[LovableDispatch:Async] Completado con éxito para ${pid}:`, result.commitSha);
         })
@@ -95,6 +95,7 @@ export async function handleLovableDispatch(req, res) {
       prompt,
       github,
       activeRoute,
+      selectedElement,
       onActivity
     });
 
