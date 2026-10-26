@@ -18,6 +18,7 @@ import { previewRouter } from './routes/preview.js'
 import { projectsRouter } from './routes/projects.js'
 import { appAiRouter } from './routes/appAi.js'
 import { agentsRouter } from './routes/agents.js'
+import { agentRouter } from './routes/agentRoutes.js'
 import { analyticsRouter } from './routes/analytics.js'
 import { stripeWebhookRouter } from './routes/stripeWebhook.js'
 import { dbProxyRouter } from './routes/dbProxy.js'
@@ -52,6 +53,16 @@ app.use('/api/db-proxy', cors())
 app.use('/api/storage-proxy', cors())
 // Pública también: la llama el runtime reporter del preview desde *.flow-pro.online
 app.use('/api/preview/runtime-report', cors())
+// CORS para lovable bridge
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/agent')) {
+    return cors({
+      origin: (origin, callback) => callback(null, origin || true),
+      credentials: true
+    })(req, res, next);
+  }
+  next();
+})
 app.use((req, res, next) => {
   if (
     req.path.startsWith('/api/app-ai') ||
@@ -59,6 +70,7 @@ app.use((req, res, next) => {
     req.path.startsWith('/api/db-proxy') ||
     req.path.startsWith('/api/storage-proxy') ||
     req.path.startsWith('/api/preview/runtime-report') ||
+    req.path.startsWith('/api/agent') ||
     req.path.includes('/telemetry/errors')
   ) {
     return cors()(req, res, next)
@@ -116,6 +128,7 @@ app.use('/api/turn', turnActionsRouter)
 app.use('/api/reseller', resellerRouter)
 app.use('/api/app-ai', appAiRouter)
 app.use('/api/agents', agentsRouter)
+app.use('/api/agent', agentRouter)
 app.use('/api', analyticsRouter)
 
 app.use((err, req, res, next) => {
@@ -124,6 +137,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message ? `Error interno: ${err.message}` : 'Error interno del servidor' })
 })
 
+if (!process.env.VERCEL) {
 app.listen(config.port, () => {
   console.log(`FlowPro backend escuchando en http://localhost:${config.port}`)
   if (!isSupabaseConfigured) console.warn('⚠ Supabase no configurado (.env) — la API fallará en la mayoría de rutas.')
@@ -133,3 +147,6 @@ app.listen(config.port, () => {
   if (!isStripeConfigured)
     console.warn('⚠ Stripe no configurado (.env) — los pagos usan el flujo simulado hasta que cargues STRIPE_SECRET_KEY y STRIPE_WEBHOOK_SECRET.')
 })
+}
+
+export default app;
