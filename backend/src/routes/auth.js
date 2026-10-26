@@ -206,6 +206,223 @@ authRouter.get('/github/callback', async (req, res) => {
   }
 })
 
+// --- GitHub OAuth para Extensión FlowPro Bridge (Popup en Lovable.dev) ---
+
+authRouter.get('/github/lovable-connect', (req, res) => {
+  if (!isGithubConfigured && !config.githubClientId) {
+    return res.status(503).json({
+      ok: false,
+      error: 'GITHUB_OAUTH_NOT_CONFIGURED',
+      message: 'GitHub OAuth no está configurado en el backend (.env)'
+    });
+  }
+
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const host = req.get('host');
+  const callbackUrl = `${protocol}://${host}/api/auth/github/lovable-callback`;
+
+  const statePayload = {
+    projectId: req.query.projectId || '',
+    origin: req.query.origin || '',
+    isBridge: true,
+    ts: Date.now()
+  };
+  const state = Buffer.from(JSON.stringify(statePayload)).toString('base64url');
+
+  const params = new URLSearchParams({
+    client_id: config.githubClientId,
+    redirect_uri: callbackUrl,
+    scope: 'repo delete_repo read:user user:email',
+    state,
+  });
+
+  res.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`);
+});
+
+authRouter.get('/github/lovable-callback', async (req, res) => {
+  const { code, state } = req.query;
+
+  if (!code) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(400).send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>FlowPro - Error de Autorización</title>
+  <style>
+    body { background: #090d16; color: #f87171; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #0f172a; border: 1px solid rgba(239,68,68,0.3); border-radius: 12px; padding: 24px 30px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h3>Error: No se recibió código de autorización de GitHub.</h3>
+    <p>Cerrando ventana automáticamente...</p>
+  </div>
+  <script>setTimeout(() => window.close(), 2500);</script>
+</body>
+</html>`);
+  }
+
+  try {
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        client_id: config.githubClientId,
+        client_secret: config.githubClientSecret,
+        code,
+      }),
+    });
+
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(400).send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>FlowPro - Error de Token</title>
+  <style>
+    body { background: #090d16; color: #f87171; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #0f172a; border: 1px solid rgba(239,68,68,0.3); border-radius: 12px; padding: 24px 30px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h3>Error: No se pudo obtener el token de acceso de GitHub.</h3>
+    <p>${tokenData.error_description || tokenData.error || 'Código expirado o inválido'}</p>
+  </div>
+  <script>setTimeout(() => window.close(), 3000);</script>
+</body>
+</html>`);
+    }
+
+    const githubTokenFields = {
+      github_refresh_token: tokenData.refresh_token || null,
+      github_token_expires_at: tokenData.expires_in ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString() : null,
+    };
+
+    const ghUserRes = await fetch('https://api.github.com/user', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}`, 'User-Agent': 'FlowPro-Lovable-Bridge' },
+    });
+    const ghUser = await ghUserRes.json();
+
+    if (supabase && ghUser?.id) {
+      try {
+        const { data: existingUser } = await supabase
+          .from('users')
+          .select('id')
+          .eq('github_id', String(ghUser.id))
+          .maybeSingle();
+
+        if (existingUser) {
+          await supabase
+            .from('users')
+            .update({
+              github_login: ghUser.login,
+              avatar_url: ghUser.avatar_url,
+              github_access_token: tokenData.access_token,
+              ...githubTokenFields,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', existingUser.id);
+        } else {
+          await supabase
+            .from('users')
+            .insert({
+              github_id: String(ghUser.id),
+              github_login: ghUser.login,
+              avatar_url: ghUser.avatar_url,
+              email: ghUser.email || null,
+              github_access_token: tokenData.access_token,
+              ...githubTokenFields,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString()
+            });
+        }
+      } catch (dbErr) {
+        console.warn('[lovable-callback] No se pudo guardar token en Supabase (no bloqueante):', dbErr.message);
+      }
+    }
+
+    let projectId = '';
+    if (state) {
+      try {
+        const decoded = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
+        projectId = decoded.projectId || '';
+      } catch (_) {
+        try {
+          const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
+          projectId = decoded.projectId || '';
+        } catch (_) {}
+      }
+    }
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>FlowPro - GitHub Conectado</title>
+  <style>
+    body { background: #090d16; color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #0f172a; border: 1px solid rgba(59,130,246,0.3); border-radius: 12px; padding: 28px 32px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); max-width: 380px; }
+    .spinner { width: 30px; height: 30px; border: 3px solid rgba(56,189,248,0.2); border-top-color: #38bdf8; border-radius: 50%; animation: spin 0.7s linear infinite; margin: 0 auto 16px; }
+    h3 { margin: 0 0 8px; color: #38bdf8; font-size: 17px; }
+    p { margin: 0; color: #94a3b8; font-size: 13px; line-height: 1.5; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <h3>¡GitHub Conectado con Éxito!</h3>
+    <p>Conectado como <b>@${ghUser.login || 'usuario'}</b>.<br>Cerrando ventana...</p>
+  </div>
+  <script>
+    try {
+      if (window.opener) {
+        window.opener.postMessage({
+          type: 'FLOWPRO_GITHUB_AUTH_SUCCESS',
+          token: ${JSON.stringify(tokenData.access_token)},
+          login: ${JSON.stringify(ghUser.login || '')},
+          projectId: ${JSON.stringify(projectId || '')}
+        }, '*');
+      }
+    } catch (e) {
+      console.error('Error enviando mensaje a la extensión:', e);
+    }
+    setTimeout(() => {
+      window.close();
+    }, 800);
+  </script>
+</body>
+</html>`);
+  } catch (err) {
+    console.error('[lovable-callback] Error en intercambio OAuth:', err);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.status(500).send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>FlowPro - Error de Servidor</title>
+  <style>
+    body { background: #090d16; color: #f87171; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #0f172a; border: 1px solid rgba(239,68,68,0.3); border-radius: 12px; padding: 24px 30px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h3>Error del servidor durante la autenticación.</h3>
+    <p>${err.message || 'Error inesperado'}</p>
+  </div>
+  <script>setTimeout(() => window.close(), 3000);</script>
+</body>
+</html>`);
+  }
+});
+
 // --- Google OAuth (solo login/registro, no da acceso a repos) ---
 
 authRouter.get('/google/login', (req, res) => {
