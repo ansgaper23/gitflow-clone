@@ -5,7 +5,7 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createClient } from '@supabase/supabase-js';
 import { runAgentWithRotation } from './aiAccounts.js';
-import { commitTree } from './github.js';
+import { commitTree, getValidGithubToken } from './github.js';
 import { supabase } from '../db/supabaseClient.js';
 import { config } from '../config.js';
 
@@ -82,30 +82,46 @@ function buildHumanActivityDescription(toolName, toolArgs) {
  * Obtiene el token de GitHub configurado para clonar y pushear repositorios
  */
 async function resolveGithubToken(explicitToken = null) {
+  // 1. Si hay un token explícito, probarlo y verificar si está activo contra GitHub
   if (explicitToken && typeof explicitToken === 'string' && explicitToken.trim().length > 0) {
-    return explicitToken.trim();
+    const cleanToken = explicitToken.trim();
+    try {
+      const checkRes = await fetch('https://api.github.com/user', {
+        headers: { Authorization: `Bearer ${cleanToken}`, 'User-Agent': 'FlowPro-Lovable-Bridge' }
+      });
+      if (checkRes.ok) {
+        return cleanToken;
+      }
+      console.warn('[LovableBridge] El token explícito proporcionado está vencido o es inválido. Buscando token renovado en Supabase...');
+    } catch (_) {
+      return cleanToken;
+    }
   }
+
   if (process.env.GITHUB_TOKEN) return process.env.GITHUB_TOKEN.trim();
   if (process.env.GITHUB_ACCESS_TOKEN) return process.env.GITHUB_ACCESS_TOKEN.trim();
 
-  // Buscar token de usuario autenticado en Supabase si existe
+  // 2. Buscar token en Supabase y auto-renovarlo si tiene expiración registrada
   try {
     if (supabase) {
       const { data } = await supabase
         .from('users')
-        .select('github_access_token')
+        .select('*')
         .not('github_access_token', 'is', null)
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
 
       if (data?.github_access_token) {
-        return data.github_access_token.trim();
+        const validToken = await getValidGithubToken(data);
+        return (validToken || data.github_access_token).trim();
       }
     }
-  } catch (_) {}
+  } catch (err) {
+    console.warn('[LovableBridge] Error al resolver token de Supabase:', err.message);
+  }
 
-  return null;
+  return explicitToken ? explicitToken.trim() : null;
 }
 
 /**
@@ -132,6 +148,99 @@ async function getWorkspaceFileTree(dir, baseDir = dir) {
   } catch (_) {
     return [];
   }
+}
+
+/**
+ * Pre-búsqueda semántica ultrarrápida de archivos relevantes (Arquitectura Lovable Engine).
+ * Precarga en memoria los componentes y utilidades más afines al prompt del usuario
+ * para que el modelo aplique cambios en Turno 1 sin perder tiempo leyendo en bucle.
+ */
+async function findRelevantProjectContext(workspaceDir, fileTree, prompt, activeRoute, selectedElement) {
+  const contextSnippets = [];
+  const candidateFiles = new Set();
+
+  // 1. Elemento seleccionado con Click-to-Edit (prioridad máxima)
+  if (selectedElement?.file) {
+    const target = selectedElement.file.replace(/^\.?\//, '');
+    if (fileTree.includes(target)) candidateFiles.add(target);
+  }
+
+  // 2. Ruta activa en pantalla de Lovable (ej: /match/123 -> MatchStream.tsx)
+  if (activeRoute && activeRoute !== '/') {
+    const cleanRoute = activeRoute.toLowerCase().replace(/[^a-z0-9]/g, '');
+    for (const rel of fileTree) {
+      if (!rel.startsWith('src/pages/') && !rel.startsWith('src/views/')) continue;
+      const baseName = path.basename(rel, path.extname(rel)).toLowerCase();
+      if (cleanRoute.includes(baseName) || baseName.includes(cleanRoute)) {
+        candidateFiles.add(rel);
+        break;
+      }
+    }
+  }
+
+  // 3. Palabras clave del prompt
+  const stopwords = new Set([
+    'para', 'como', 'pero', 'este', 'esta', 'estos', 'estas', 'cuando', 'donde',
+    'porque', 'tengo', 'hacer', 'cambiar', 'poner', 'quitar', 'quiero', 'necesito',
+    'problema', 'error', 'favor', 'puede', 'puedes', 'todos', 'todas', 'sobre',
+    'desde', 'hasta', 'entre', 'hacia', 'tiempo', 'ahora', 'luego', 'antes', 'despues'
+  ]);
+  const words = (prompt || '')
+    .toLowerCase()
+    .replace(/[^\w\sáéíóúüñ]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length >= 4 && !stopwords.has(w));
+
+  for (const rel of fileTree) {
+    if (!rel.startsWith('src/') || rel.endsWith('.d.ts') || rel.includes('.test.') || rel.includes('ui/')) continue;
+    const lowerRel = rel.toLowerCase();
+    for (const w of words) {
+      if (lowerRel.includes(w)) {
+        candidateFiles.add(rel);
+        break;
+      }
+    }
+    if (candidateFiles.size >= 6) break;
+  }
+
+  // 4. Mapeo semántico por intenciones comunes
+  const lowerPrompt = (prompt || '').toLowerCase();
+  const semanticRules = [
+    { regex: /embed|servidor|reproductor|stream|video|player|iframe/i, pattern: /player|stream|video|embed/i },
+    { regex: /header|menu|navbar|navegacion|barra/i, pattern: /header|navbar|nav/i },
+    { regex: /footer|pie\s+de\s+pagina/i, pattern: /footer/i },
+    { regex: /agenda|partido|partidos|evento|match/i, pattern: /match|agenda|schedule/i },
+    { regex: /canal|canales|channel|lista/i, pattern: /channel|canal/i },
+    { regex: /login|auth|sesion|usuario|perfil|registro/i, pattern: /auth|login|profile|user/i },
+    { regex: /database|supabase|tabla|datos|guardar/i, pattern: /supabase|db|api/i }
+  ];
+
+  for (const rule of semanticRules) {
+    if (rule.regex.test(lowerPrompt)) {
+      const matches = fileTree.filter(f => rule.pattern.test(f) && !f.includes('ui/'));
+      matches.slice(0, 3).forEach(f => candidateFiles.add(f));
+    }
+  }
+
+  // 5. Leer contenido de los archivos candidatos más relevantes (máximo 4 archivos, tope 35KB)
+  let totalChars = 0;
+  const maxChars = 35000;
+
+  for (const rel of candidateFiles) {
+    if (totalChars >= maxChars || contextSnippets.length >= 4) break;
+    const fullPath = path.join(workspaceDir, rel);
+    try {
+      if (fs.existsSync(fullPath)) {
+        const content = await fs.promises.readFile(fullPath, 'utf8');
+        if (content && content.length < 18000) {
+          contextSnippets.push(`--- ARCHIVO CLAVE RELEVANTE: ${rel} ---\n\`\`\`typescript\n${content}\n\`\`\``);
+          totalChars += content.length;
+        }
+      }
+    } catch (_) {}
+  }
+
+  return contextSnippets;
 }
 
 /**
@@ -307,6 +416,11 @@ export async function processLovableDispatch({ projectId, prompt, github, active
   // Leer árbol de archivos
   const fileTree = await getWorkspaceFileTree(workspaceDir);
 
+  // ── PRE-INDEXACIÓN SEMÁNTICA RÁPIDA (Estilo Lovable Engine) ──
+  // Identifica y precarga en memoria los archivos directamente relacionados con la solicitud
+  // para que el modelo aplique cambios en Ronda 1 sin perder tiempo leyendo en bucle.
+  const preloadedContext = await findRelevantProjectContext(workspaceDir, fileTree, prompt, activeRoute, selectedElement);
+
   // ── PASO B: Bucle Cognitivo del Agente de FlowPro ──
   notifyActivity('Analizando solicitud y planificando cambios...');
   console.log(`[LovableBridge] Ejecutando bucle de inferencia para: "${prompt}"...`);
@@ -314,6 +428,7 @@ export async function processLovableDispatch({ projectId, prompt, github, active
   const filesModified = new Set();
   let agentSummary = '';
   let agentMessage = '';
+  let readToolCount = 0;
 
   const selectedElementBlock = selectedElement ? `
 ELEMENTO VISUAL SELECCIONADO POR EL USUARIO EN PANTALLA (CLICK-TO-EDIT):
@@ -336,13 +451,22 @@ ${projectSupabase ? `- Base de datos Supabase conectada y activa: "${supabaseUrl
 ${supabaseTypes ? `- Esquema de Base de Datos Supabase (types.ts):\n\`\`\`typescript\n${supabaseTypes}\n\`\`\`\n` : ''}
 ${existingMigrations.length > 0 ? `- Migraciones SQL registradas (${existingMigrations.length}):\n${existingMigrations.slice(-5).map(m => `  • supabase/migrations/${m}`).join('\n')}\n` : ''}
 ${packageJsonContent ? `- package.json del proyecto:\n\`\`\`json\n${packageJsonContent}\n\`\`\`\n` : ''}
+${preloadedContext.length > 0 ? `
+ARCHIVOS DEL PROYECTO DIRECTAMENTE RELACIONADOS (PRE-CARGADOS EN MEMORIA PARA EDICIÓN INMEDIATA):
+${preloadedContext.join('\n\n')}
+` : ''}
 
 ÁRBOL DE ARCHIVOS ACTUAL DEL REPOSITORIO:
 ${fileTree.slice(0, 100).map(f => `- ${f}`).join('\n')}
 
 REGLAS DE ORO:
-1. OBJETIVO PRINCIPAL:
-   - Si la solicitud requiere cambios de código o diseño, modifica los archivos en disco usando search_files, read_file y propose_change o replace_file_content.
+1. OBJETIVO PRINCIPAL Y DIRECTIVA DE ACCIÓN INMEDIATA:
+   - Si la solicitud requiere cambios de código, corrección de bugs o diseño, NO pases más de 2 o 3 rondas leyendo archivos. Procede DIRECTAMENTE a modificar los archivos afectados con "replace_file_content" o "propose_change".
+   - Si el usuario reporta un defecto de interfaz, un reproductor que no carga o que los embeds de los servidores no reproducen, localiza de inmediato el reproductor (ej: VideoPlayer.tsx, streamHelper.ts o MatchStream.tsx) y aplica la corrección en el código.
+   - Para reproductores de video e iframes de streaming:
+     * Usa siempre referrerPolicy="no-referrer" en etiquetas <iframe> para evitar bloqueos por Anti-Hotlinking de servidores de streaming.
+     * Añade todos los permisos necesarios en allow="autoplay; encrypted-media; fullscreen; picture-in-picture; screen-wake-lock; clipboard-write; web-share".
+     * Soporta URLs de embed limpias sin destruir parámetros esenciales como ?r= o ?url=.
    - Si la solicitud es una consulta o auditoría (ej: qué tablas hay, qué datos existen, cómo funciona el backend), usa read_table_rows y read_file para investigar y responde detalladamente con message_user.
 2. Aplica los cambios usando "propose_change", "replace_file_content" o "create_file". Devuelve código COMPLETO sin placeholders ni omitir líneas existentes.
 3. Respeta el diseño existente: Tailwind CSS v3 (usa tokens semánticos o clases nativas), componentes shadcn/ui en @/components/ui, y lucide-react.
@@ -504,6 +628,7 @@ REGLAS DE ORO:
 
     // B. search_files: búsqueda en archivos de código
     if (toolName === 'search_files') {
+      readToolCount++;
       const q = (toolArgs.query || '').toLowerCase();
       if (!q) return 'Debes especificar un término de búsqueda.';
       const matches = [];
@@ -515,13 +640,18 @@ REGLAS DE ORO:
           if (txt.toLowerCase().includes(q)) matches.push(rel);
         } catch (_) {}
       }
-      return matches.length > 0
+      const res = matches.length > 0
         ? `Coincidencias encontradas en:\n${matches.join('\n')}`
         : `No se encontró ninguna coincidencia para "${toolArgs.query}".`;
+
+      return (readToolCount >= 3 && filesModified.size === 0)
+        ? `${res}\n\n[DIRECTIVA DE ACCIÓN INMEDIATA - LOVABLE ENGINE]: Ya has realizado ${readToolCount} lecturas/búsquedas. En tu siguiente respuesta DEBES aplicar los cambios en el código usando "replace_file_content" o "propose_change". NO sigas buscando.`
+        : res;
     }
 
     // C. read_file: lectura de archivo
     if (toolName === 'read_file') {
+      readToolCount++;
       const targetPath = toolArgs.path || toolArgs.filePath || '';
       const cleanPath = targetPath.replace(/^\.?\//, '');
       if (!cleanPath) return 'Error: Falta especificar la ruta del archivo.';
@@ -530,7 +660,11 @@ REGLAS DE ORO:
         return `Error: El archivo "${cleanPath}" no existe en el repositorio.`;
       }
       const content = await fs.promises.readFile(fullTarget, 'utf8');
-      return content.slice(0, 100000);
+      const snippet = content.slice(0, 100000);
+
+      return (readToolCount >= 3 && filesModified.size === 0)
+        ? `${snippet}\n\n[DIRECTIVA DE ACCIÓN INMEDIATA - LOVABLE ENGINE]: Ya has revisado ${readToolCount} archivos. Tienes el contexto completo. Procede AHORA a emitir "replace_file_content" o "propose_change" sobre el archivo objetivo para aplicar la solución.`
+        : snippet;
     }
 
     // D. propose_change / replace_file_content / create_file: escritura en disco
@@ -605,7 +739,7 @@ REGLAS DE ORO:
 
   try {
     // ── 3. INVOCACIÓN CON `projectId` PARA AISLAMIENTO DEL WORKSPACE ──
-    await runAgentWithRotation({
+    const agentResult = await runAgentWithRotation({
       system: systemPrompt,
       tools: tools,
       history: [],
@@ -615,6 +749,10 @@ REGLAS DE ORO:
       projectId: safeProjectId,
       toolChoice: 'auto'
     });
+
+    if (!agentMessage && agentResult?.text) {
+      agentMessage = agentResult.text.trim();
+    }
   } catch (agentErr) {
     console.error(`[LovableBridge] Error durante el bucle de IA:`, agentErr.message);
     throw new Error(`Fallo en la inferencia del agente: ${agentErr.message}`);
@@ -628,7 +766,7 @@ REGLAS DE ORO:
       console.log(`[LovableBridge] Turno informativo/consulta completado sin modificaciones de archivos para: "${prompt}"`);
       return {
         ok: true,
-        summary: agentSummary || 'Consulta completada',
+        summary: agentSummary || 'Diagnóstico completado',
         message: agentMessage,
         filesModified: [],
         commitSha: null
@@ -638,8 +776,8 @@ REGLAS DE ORO:
     return {
       ok: false,
       error: 'NO_FILES_MODIFIED',
-      summary: agentSummary || 'No se modificaron archivos',
-      message: 'El modelo analizó la solicitud pero no aplicó cambios con "propose_change" o "replace_file_content".',
+      summary: agentSummary || 'Sin cambios en archivos',
+      message: 'El modelo analizó la solicitud pero completó su turno sin aplicar modificaciones en el código. Prueba indicando específicamente el componente a modificar.',
       filesModified: [],
       commitSha: null
     };
