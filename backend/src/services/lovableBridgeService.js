@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { createClient } from '@supabase/supabase-js';
 import { runAgentWithRotation } from './aiAccounts.js';
 import { commitTree, getValidGithubToken } from './github.js';
+import { AttachmentProcessor } from './attachmentProcessor.js';
 import { supabase } from '../db/supabaseClient.js';
 import { config } from '../config.js';
 
@@ -81,8 +82,129 @@ function buildHumanActivityDescription(toolName, toolArgs) {
 /**
  * Obtiene el token de GitHub configurado para clonar y pushear repositorios
  */
-async function resolveGithubToken(explicitToken = null) {
-  // 1. Si hay un token explícito, probarlo y verificar si está activo contra GitHub
+/**
+ * Validador estático de integridad de módulos (Imports/Exports)
+ * Detecta si un archivo modificado importa símbolos locales que no están exportados en el destino,
+ * previniendo errores de compilación Vite / TanStack Router / Lovable antes de hacer git push.
+ */
+async function validateModuleIntegrity(workspaceDir, modifiedFiles) {
+  const errors = [];
+  const codeExts = ['.ts', '.tsx', '.js', '.jsx'];
+  const candidates = (modifiedFiles || []).filter(f => codeExts.includes(path.extname(f)));
+
+  for (const relFile of candidates) {
+    const fullSourcePath = path.join(workspaceDir, relFile);
+    if (!fs.existsSync(fullSourcePath)) continue;
+
+    let sourceCode = '';
+    try {
+      sourceCode = await fs.promises.readFile(fullSourcePath, 'utf8');
+    } catch (_) {
+      continue;
+    }
+
+    const importRegex = /import\s+(?:type\s+)?(?:\{([^}]+)\}|([A-Za-z0-9_$]+)\s*,\s*\{([^}]+)\})\s+from\s+['"]([^'"]+)['"]/g;
+    let match;
+
+    while ((match = importRegex.exec(sourceCode)) !== null) {
+      const namedBlock = match[1] || match[3] || '';
+      const modSpecifier = match[4] || '';
+
+      if (!modSpecifier.startsWith('.') && !modSpecifier.startsWith('@/')) {
+        continue;
+      }
+
+      const importedNames = namedBlock
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(s => {
+          const parts = s.split(/\s+as\s+/);
+          return parts[0].replace(/^type\s+/, '').trim();
+        })
+        .filter(n => n && !n.startsWith('//') && !n.startsWith('/*'));
+
+      if (importedNames.length === 0) continue;
+
+      let resolvedBase = '';
+      if (modSpecifier.startsWith('@/')) {
+        resolvedBase = path.join(workspaceDir, 'src', modSpecifier.slice(2));
+      } else {
+        resolvedBase = path.resolve(path.dirname(fullSourcePath), modSpecifier);
+      }
+
+      let targetFile = null;
+      const testPaths = [
+        resolvedBase,
+        resolvedBase + '.ts',
+        resolvedBase + '.tsx',
+        resolvedBase + '.js',
+        resolvedBase + '.jsx',
+        path.join(resolvedBase, 'index.ts'),
+        path.join(resolvedBase, 'index.tsx'),
+        path.join(resolvedBase, 'index.js')
+      ];
+
+      for (const p of testPaths) {
+        if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+          targetFile = p;
+          break;
+        }
+      }
+
+      if (!targetFile) {
+        errors.push(`[MODULO NO ENCONTRADO] "${relFile}" importa desde "${modSpecifier}", pero el archivo no existe en el proyecto.`);
+        continue;
+      }
+
+      let targetCode = '';
+      try {
+        targetCode = await fs.promises.readFile(targetFile, 'utf8');
+      } catch (_) {
+        continue;
+      }
+
+      if (/export\s+\*\s+from/i.test(targetCode)) {
+        continue;
+      }
+
+      const exportedNames = new Set();
+      const declRegex = /export\s+(?:async\s+)?(?:default\s+)?(?:const|function\*?|class|type|interface|enum|let|var)\s+([A-Za-z0-9_$]+)/g;
+      let dMatch;
+      while ((dMatch = declRegex.exec(targetCode)) !== null) {
+        exportedNames.add(dMatch[1]);
+      }
+
+      const exportBlockRegex = /export\s+(?:type\s+)?\{([^}]+)\}/g;
+      let ebMatch;
+      while ((ebMatch = exportBlockRegex.exec(targetCode)) !== null) {
+        const items = ebMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+        for (const it of items) {
+          const parts = it.split(/\s+as\s+/);
+          const exportAlias = (parts[1] || parts[0]).replace(/^type\s+/, '').trim();
+          if (exportAlias) exportedNames.add(exportAlias);
+        }
+      }
+
+      if (/export\s+default\s+/i.test(targetCode)) {
+        exportedNames.add('default');
+      }
+
+      const targetRel = path.relative(workspaceDir, targetFile).replace(/\\/g, '/');
+
+      for (const imp of importedNames) {
+        if (!exportedNames.has(imp)) {
+          errors.push(`[EXPORT FALTANTE] "${relFile}" intenta importar "${imp}" desde "${modSpecifier}", pero "${targetRel}" no exporta ningún símbolo con el nombre "${imp}".`);
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+async function resolveGithubToken(explicitToken = null, repoOwner = null) {
+  // 1. Si hay un token explícito, probarlo contra la API de GitHub
   if (explicitToken && typeof explicitToken === 'string' && explicitToken.trim().length > 0) {
     const cleanToken = explicitToken.trim();
     try {
@@ -92,36 +214,71 @@ async function resolveGithubToken(explicitToken = null) {
       if (checkRes.ok) {
         return cleanToken;
       }
-      console.warn('[LovableBridge] El token explícito proporcionado está vencido o es inválido. Buscando token renovado en Supabase...');
+      console.warn(`[LovableBridge] El token explícito proporcionado está vencido o es inválido (HTTP ${checkRes.status}). Buscando token para @${repoOwner || 'usuario'}...`);
     } catch (_) {
       return cleanToken;
+    }
+  }
+
+  // 2. Si se especificó el dueño del repositorio (ej. 'ansgaper23'), buscar a ESE usuario en Supabase
+  if (repoOwner && supabase) {
+    try {
+      const { data: userByOwner } = await supabase
+        .from('users')
+        .select('*')
+        .ilike('github_login', repoOwner)
+        .not('github_access_token', 'is', null)
+        .maybeSingle();
+
+      if (userByOwner) {
+        const validToken = await getValidGithubToken(userByOwner).catch(() => null);
+        if (validToken) {
+          const testRes = await fetch('https://api.github.com/user', {
+            headers: { Authorization: `Bearer ${validToken.trim()}`, 'User-Agent': 'FlowPro-Lovable-Bridge' }
+          }).catch(() => null);
+          if (testRes && testRes.ok) {
+            console.log(`[LovableBridge] ✅ Token válido resuelto para el dueño del repositorio: @${repoOwner}`);
+            return validToken.trim();
+          }
+        }
+      }
+    } catch (ownerErr) {
+      console.warn(`[LovableBridge] Error buscando token para @${repoOwner}:`, ownerErr.message);
     }
   }
 
   if (process.env.GITHUB_TOKEN) return process.env.GITHUB_TOKEN.trim();
   if (process.env.GITHUB_ACCESS_TOKEN) return process.env.GITHUB_ACCESS_TOKEN.trim();
 
-  // 2. Buscar token en Supabase y auto-renovarlo si tiene expiración registrada
+  // 3. Buscar cualquier token activo en Supabase como fallback
   try {
     if (supabase) {
       const { data } = await supabase
         .from('users')
         .select('*')
         .not('github_access_token', 'is', null)
-        .order('updated_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+        .order('created_at', { ascending: false })
+        .limit(5);
 
-      if (data?.github_access_token) {
-        const validToken = await getValidGithubToken(data);
-        return (validToken || data.github_access_token).trim();
+      if (data && data.length > 0) {
+        for (const u of data) {
+          const validToken = await getValidGithubToken(u).catch(() => null);
+          if (validToken) {
+            const testRes = await fetch('https://api.github.com/user', {
+              headers: { Authorization: `Bearer ${validToken.trim()}`, 'User-Agent': 'FlowPro-Lovable-Bridge' }
+            }).catch(() => null);
+            if (testRes && testRes.ok) {
+              return validToken.trim();
+            }
+          }
+        }
       }
     }
   } catch (err) {
     console.warn('[LovableBridge] Error al resolver token de Supabase:', err.message);
   }
 
-  return explicitToken ? explicitToken.trim() : null;
+  return null;
 }
 
 /**
@@ -265,7 +422,7 @@ async function clearGitLocks(workspaceDir) {
  * @param {Function} [params.onActivity] Callback para telemetría efímera en vivo
  * @returns {Promise<{ ok: boolean, summary: string, message?: string, filesModified: string[], commitSha: string }>}
  */
-export async function processLovableDispatch({ projectId, prompt, github, activeRoute, selectedElement, onActivity }) {
+export async function processLovableDispatch({ projectId, prompt, github, activeRoute, selectedElement, attachments, onActivity }) {
   const notifyActivity = (desc) => {
     if (typeof onActivity === 'function') {
       try {
@@ -293,10 +450,19 @@ export async function processLovableDispatch({ projectId, prompt, github, active
   const owner = github.owner.trim();
   const repo = github.repo.trim();
   const branch = (github.branch || 'main').trim();
-  const token = await resolveGithubToken(github.token);
+  const token = await resolveGithubToken(github.token, owner);
 
   // Asegurar directorio base de workspaces
   await fs.promises.mkdir(WORKSPACES_BASE_DIR, { recursive: true });
+
+  if (!token) {
+    console.error(`[LovableBridge] No se pudo resolver un token de GitHub válido para ${owner}/${repo}`);
+    return {
+      ok: false,
+      error: 'GITHUB_AUTH_FAILED',
+      message: `No se pudo autenticar con GitHub para "${owner}/${repo}". Tu token de GitHub ha expirado o no tiene permisos de escritura.\n\n👉 Por favor haz clic arriba en el botón [🔑 Conectar GitHub] en FlowPro para autorizar vía OAuth o introduce un Personal Access Token (classic) con permiso 'repo'.`
+    };
+  }
 
   const safeProjectId = String(projectId || `${owner}-${repo}`).replace(/[^a-zA-Z0-9_-]/g, '');
   const workspaceDir = path.join(WORKSPACES_BASE_DIR, `lovable-${safeProjectId}`);
@@ -313,7 +479,7 @@ export async function processLovableDispatch({ projectId, prompt, github, active
     if (fs.existsSync(path.join(workspaceDir, '.git'))) {
       notifyActivity('Sincronizando cambios locales con GitHub (git pull)...');
       console.log(`[LovableBridge] Repositorio existente detectado en caché. Actualizando con git pull...`);
-      await clearGitLocks(workspaceDir);
+    await clearGitLocks(workspaceDir);
       await execAsync(`git remote set-url origin "${gitAuthUrl}"`, { cwd: workspaceDir });
       try {
         await execAsync(`git fetch origin "${branch}"`, { cwd: workspaceDir });
@@ -341,6 +507,10 @@ export async function processLovableDispatch({ projectId, prompt, github, active
     await execAsync('git config user.email "bridge@flow-pro.online"', { cwd: workspaceDir });
   } catch (gitPrepErr) {
     console.error(`[LovableBridge] Error en preparación de Git:`, gitPrepErr.message);
+    const isAuthErr = /authentication failed|invalid username or token|bad credentials/i.test(gitPrepErr.message);
+    if (isAuthErr) {
+      throw new Error(`GITHUB_AUTH_FAILED: El token de GitHub ha expirado o no tiene permisos para acceder al repositorio "${owner}/${repo}". Por favor actualiza tu token en el botón [🔑 Conectar GitHub] de FlowPro.`);
+    }
     throw new Error(`No se pudo sincronizar el repositorio de GitHub (${owner}/${repo}): ${gitPrepErr.message}`);
   }
 
@@ -422,6 +592,18 @@ export async function processLovableDispatch({ projectId, prompt, github, active
   const preloadedContext = await findRelevantProjectContext(workspaceDir, fileTree, prompt, activeRoute, selectedElement);
 
   // ── PASO B: Bucle Cognitivo del Agente de FlowPro ──
+  // ── CLASIFICADOR DE INTENCIÓN DE USUARIO (Estilo Lovable Engine) ──
+  const cleanPrompt = (prompt || '').toLowerCase().trim();
+  const hasQuestionIntent = /\?|¿|por\s*qu[eé]|c[oó]mo\s+(?:funciona|est[aá]|hace|se)|cu[aá]l|qu[eé]\s+(?:es|hace|significa|tablas|columnas|archivos|roles)|explica|analiza|audita|diagnostica|dime|muestra|donde|d[oó]nde|por\s+que/i.test(cleanPrompt);
+  const hasActionIntent = /\b(?:cambi[aáeé]|cre[aáeé]|agr[eé]g[aáeé]|a[ñn][aá]d[aáeé]|el[ií]min[aáeé]|b[oó]rr[aáeé]|mod[ií]fic[aáeé]|corr[ií]g[aáeé]|arr[eé]gl[aáeé]|soluci[oó]n[aáeé]|resuelv[aáeé]|resolv[eé]r?|implement[aáeé]|actualiz[aáeé]|ren[oó]mbr[aáeé]|h[aá]z|hacer|hag[aá]|p[oó]n|qu[ií]t[aáeé]|reempl[aá]z[aáeé]|aj[uú]st[aáeé]|rep[aá]r[aáeé]|fix|update|delete|insert)(?:[rn]|lo|la|los|las|me|nos)?\b/i.test(cleanPrompt);
+
+  let detectedIntent = 'ACTION';
+  if (hasQuestionIntent && hasActionIntent) {
+    detectedIntent = 'HYBRID';
+  } else if (hasQuestionIntent && !hasActionIntent) {
+    detectedIntent = 'QUERY';
+  }
+
   notifyActivity('Analizando solicitud y planificando cambios...');
   console.log(`[LovableBridge] Ejecutando bucle de inferencia para: "${prompt}"...`);
 
@@ -443,6 +625,31 @@ REGLA PRIORITARIA: El usuario ha inspeccionado/seleccionado visualmente este ele
   const systemPrompt = `Eres FlowPro Lovable Bridge Agent, el orquestador autónomo de ingeniería de software.
 Estás modificando el proyecto web alojado en el repositorio GitHub "${owner}/${repo}" vinculado a Lovable.dev.
 
+TONO Y ESTILO DE COMUNICACIÓN (LOVABLE NATIVE PERSONA):
+- Eres el asistente y compañero de desarrollo senior de Lovable (FlowPro). Tu tono es cálido, empático, directo, profesional y muy amigable.
+- NUNCA uses encabezados artificiales ni burocráticos como "### Diagnóstico", "### Análisis Técnico", "---", ni "### Recomendaciones".
+- NUNCA vomites bloques de código fuente, llamadas a useEffect, dependencias de hooks o rutas internas de archivos a menos que el usuario lo solicite expresamente.
+- Responde siempre en Markdown limpio y bien estructurado:
+  - Escribe una frase breve de saludo o introducción en su propio párrafo.
+  - Deja una línea en blanco entre cada párrafo.
+  - Cuando enumeres puntos, usa listas de Markdown reales, con cada viñeta en su propia línea comenzando con '- ' (nunca pongas varias viñetas dentro del mismo párrafo ni uses el símbolo '•' en línea).
+  - Resalta los términos clave en **negrita**.
+  - Sé conciso: máximo 4 a 6 viñetas, de una o dos líneas cada una.
+  - Si haces una pregunta al final, ponla en un párrafo aparte.
+- Cierra con una pregunta amable ofreciendo el siguiente paso de forma abierta y colaborativa.
+
+${detectedIntent === 'QUERY' ? `MODO CONSULTA / PREGUNTA:
+- Responde la duda del usuario de forma directa y amigable en el primer párrafo.
+- Si hay condiciones o datos clave, destácalos en 2 o 3 viñetas breves con negritas.
+- Concluye con una pregunta cordial ofreciendo ajustar o implementar mejoras.` 
+: detectedIntent === 'HYBRID' ? `MODO HÍBRIDO (PREGUNTA + ACCIÓN):
+- Responde amistosamente a la pregunta en 1 o 2 oraciones.
+- Aplica la corrección en el código con "edit_file".
+- Confirma en 1 frase lo que se solucionó y cómo verificarlo en la vista previa.` 
+: `MODO EJECUCIÓN PURA (ACCIÓN):
+- Procede de inmediato a aplicar los cambios en el código con "edit_file".
+- Confirma amistosamente el cambio en 1 o 2 oraciones claras invitando a verlo en la vista previa.`}
+
 INFORMACIÓN DEL ENTORNO DE LOVABLE:
 - Tecnologías: Vite + React + TypeScript + Tailwind CSS v3 + shadcn/ui + Lucide React.
 - Ruta activa en pantalla de Lovable: "${activeRoute || '/'}"
@@ -460,24 +667,29 @@ ${preloadedContext.join('\n\n')}
 ${fileTree.slice(0, 100).map(f => `- ${f}`).join('\n')}
 
 REGLAS DE ORO:
-1. OBJETIVO PRINCIPAL Y DIRECTIVA DE ACCIÓN INMEDIATA:
-   - Si la solicitud requiere cambios de código, corrección de bugs o diseño, NO pases más de 2 o 3 rondas leyendo archivos. Procede DIRECTAMENTE a modificar los archivos afectados con "replace_file_content" o "propose_change".
-   - Si el usuario reporta un defecto de interfaz, un reproductor que no carga o que los embeds de los servidores no reproducen, localiza de inmediato el reproductor (ej: VideoPlayer.tsx, streamHelper.ts o MatchStream.tsx) y aplica la corrección en el código.
+1. PRIORIDAD DE EDICIÓN QUIRÚRGICA Y PREVENCIÓN DE TRUNCAMIENTO:
+   - Para modificar archivos existentes, PRIORIZA SIEMPRE la herramienta "edit_file" especificando el bloque exacto ("target") y su sustituto ("replacement").
+   - Queda ESTRICTAMENTE PROHIBIDO enviar fragmentos parciales o snippets a "propose_change" o "replace_file_content". Esas herramientas son únicamente para archivos nuevos ("create_file") o reescrituras 100% completas conservando todos sus imports, tipos y componentes existentes.
+   - Si la solicitud requiere cambios de código, actúa de inmediato sin pasar más de 2 o 3 rondas leyendo archivos.
+2. INTEGRIDAD ABSOLUTA DE IMPORTS Y EXPORTS (PREVENCIÓN DE ERRORES DE COMPILACIÓN):
+   - NUNCA importes una función, tipo o componente desde un archivo local (@/... o ./...) sin haber comprobado con "read_file" o "search_files" que el archivo destino REALMENTE lo exporta con ese nombre exacto.
+   - ATOMICIDAD: Si creas o modificas una interfaz visual que necesita nuevas funciones de backend, helpers en src/lib/ o consultas, DEBES modificar o exportar dichas funciones en el archivo de helpers antes de finalizar.
+3. REGLAS DE STREAMING Y REPRODUCTORES:
    - Para reproductores de video e iframes de streaming:
      * Usa siempre referrerPolicy="no-referrer" en etiquetas <iframe> para evitar bloqueos por Anti-Hotlinking de servidores de streaming.
      * Añade todos los permisos necesarios en allow="autoplay; encrypted-media; fullscreen; picture-in-picture; screen-wake-lock; clipboard-write; web-share".
      * Soporta URLs de embed limpias sin destruir parámetros esenciales como ?r= o ?url=.
-   - Si la solicitud es una consulta o auditoría (ej: qué tablas hay, qué datos existen, cómo funciona el backend), usa read_table_rows y read_file para investigar y responde detalladamente con message_user.
-2. Aplica los cambios usando "propose_change", "replace_file_content" o "create_file". Devuelve código COMPLETO sin placeholders ni omitir líneas existentes.
-3. Respeta el diseño existente: Tailwind CSS v3 (usa tokens semánticos o clases nativas), componentes shadcn/ui en @/components/ui, y lucide-react.
-4. NO uses Tailwind v4 (@import "tailwindcss" o @theme).
+4. DISEÑO Y COMPONENTES:
+   - Respeta el diseño existente: Tailwind CSS v3 (usa tokens semánticos o clases nativas), componentes shadcn/ui en @/components/ui, y lucide-react.
+   - NO uses Tailwind v4 (@import "tailwindcss" o @theme).
 5. GESTIÓN DE BASE DE DATOS Y SUPABASE:
-   - Para consultar datos existentes o ver qué registros contiene una tabla, usa la herramienta "read_table_rows".
-   - Para crear nuevas tablas o añadir/modificar columnas, usa "propose_db_migration" generando un archivo SQL en supabase/migrations/ con DDL idempotente (CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD COLUMN IF NOT EXISTS), y actualiza los componentes que consumen la tabla.
+   - Para consultar datos existentes, usa la herramienta "read_table_rows".
+   - Para crear nuevas tablas o columnas, usa "propose_db_migration" con SQL idempotente (CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD COLUMN IF NOT EXISTS).
    - Respeta siempre el esquema de Supabase tipado en "src/integrations/supabase/types.ts".
-6. Al terminar, llama OBLIGATORIAMENTE a "message_user" con:
-   - summary: Un título semántico muy corto (3 a 6 palabras) del cambio o diagnóstico realizado (ej: "Auditoría de base de datos completada").
-   - message: Una explicación conversacional limpia, natural y concisa (1 o 2 párrafos) de las modificaciones o hallazgos.`;
+6. CIERRE OBLIGATORIO (ESTILO AMIGABLE Y RESUMIDO DE LOVABLE):
+   - Al terminar, llama OBLIGATORIAMENTE a "message_user" con:
+     * summary: Un título semántico muy corto (3 a 6 palabras, ej: "Licencia de prueba explicada" o "Pestaña renombrada a FLOW PRO").
+     * message: Un mensaje cálido, conciso, conversacional y natural (1 o 2 párrafos breves o 2-3 viñetas limpias). Cero encabezados formales, cero explicaciones redundantes de código.`;
 
   // ── 1. DEFINICIÓN DE HERRAMIENTAS UNIVERSAL (Antigravity, Anthropic, Gemini, OpenAI) ──
   const makeTool = (name, description, schema) => ({
@@ -488,6 +700,20 @@ REGLAS DE ORO:
   });
 
   const tools = [
+    makeTool(
+      'edit_file',
+      'Reemplaza una sección específica de código en un archivo existente buscando un bloque exacto (target) y sustituyéndolo por el nuevo bloque (replacement). Ideal para modificaciones puntuales sin reescribir todo el archivo.',
+      {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Ruta relativa del archivo a editar (ej: src/components/dashboard/SuperAdminDashboard.tsx)' },
+          target: { type: 'string', description: 'Texto o bloque de código EXACTO existente que se desea reemplazar' },
+          replacement: { type: 'string', description: 'Nuevo texto o bloque de código que sustituirá a target' },
+          summary: { type: 'string', description: 'Resumen descriptivo del cambio' }
+        },
+        required: ['path', 'target', 'replacement']
+      }
+    ),
     makeTool(
       'propose_change',
       'Propone o aplica una modificación completa sobre un archivo del repositorio.',
@@ -586,14 +812,14 @@ REGLAS DE ORO:
     ),
     makeTool(
       'message_user',
-      'Notifica el resumen final de lo implementado.',
+      'Entrega la respuesta al usuario con el estilo nativo de Lovable: amigable, cálido, conversacional y muy resumido (máximo 1-2 párrafos cortos o 2-3 viñetas breves). Queda terminantemente PROHIBIDO usar encabezados formales tipo "### Diagnóstico", "### Análisis Técnico", "---", ni pegar bloques de código o rutas internas a menos que el usuario lo haya pedido expresamente.',
       {
         type: 'object',
         properties: {
-          summary: { type: 'string', description: 'Título o resumen de los cambios (3 a 6 palabras)' },
-          message: { type: 'string', description: 'Detalle conversacional y limpio de los cambios' }
+          summary: { type: 'string', description: 'Título o resumen de una sola línea (3 a 6 palabras, ej: Asignación de licencia de prueba)' },
+          message: { type: 'string', description: 'Mensaje amigable, natural y resumido estilo Lovable (1-2 párrafos breves, sin jerga académica ni encabezados rígidos)' }
         },
-        required: ['summary']
+        required: ['summary', 'message']
       }
     )
   ];
@@ -644,9 +870,14 @@ REGLAS DE ORO:
         ? `Coincidencias encontradas en:\n${matches.join('\n')}`
         : `No se encontró ninguna coincidencia para "${toolArgs.query}".`;
 
-      return (readToolCount >= 3 && filesModified.size === 0)
-        ? `${res}\n\n[DIRECTIVA DE ACCIÓN INMEDIATA - LOVABLE ENGINE]: Ya has realizado ${readToolCount} lecturas/búsquedas. En tu siguiente respuesta DEBES aplicar los cambios en el código usando "replace_file_content" o "propose_change". NO sigas buscando.`
-        : res;
+      if (readToolCount >= 3 && filesModified.size === 0) {
+        if (detectedIntent === 'QUERY') {
+          return `${res}\n\n[DIRECTIVA INFORMATIVA]: Ya has recopilado suficiente contexto (${readToolCount} lecturas). Procede AHORA a redactar tu respuesta bien estructurada llamando a "message_user". No es necesario modificar archivos.`;
+        } else {
+          return `${res}\n\n[DIRECTIVA DE ACCIÓN INMEDIATA]: Ya has realizado ${readToolCount} lecturas. Procede AHORA a aplicar los cambios en el código usando "edit_file".`;
+        }
+      }
+      return res;
     }
 
     // C. read_file: lectura de archivo
@@ -662,9 +893,43 @@ REGLAS DE ORO:
       const content = await fs.promises.readFile(fullTarget, 'utf8');
       const snippet = content.slice(0, 100000);
 
-      return (readToolCount >= 3 && filesModified.size === 0)
-        ? `${snippet}\n\n[DIRECTIVA DE ACCIÓN INMEDIATA - LOVABLE ENGINE]: Ya has revisado ${readToolCount} archivos. Tienes el contexto completo. Procede AHORA a emitir "replace_file_content" o "propose_change" sobre el archivo objetivo para aplicar la solución.`
-        : snippet;
+      if (readToolCount >= 3 && filesModified.size === 0) {
+        if (detectedIntent === 'QUERY') {
+          return `${snippet}\n\n[DIRECTIVA INFORMATIVA]: Ya has revisado ${readToolCount} archivos y dispones del contexto necesario. Procede AHORA a redactar tu respuesta analítica y bien estructurada llamando a "message_user". No es necesario modificar archivos.`;
+        } else {
+          return `${snippet}\n\n[DIRECTIVA DE ACCIÓN INMEDIATA]: Ya has revisado ${readToolCount} archivos. Tienes el contexto completo. Procede AHORA a aplicar la solución sobre el archivo objetivo usando "edit_file".`;
+        }
+      }
+      return snippet;
+    }
+
+    // D0. edit_file: reemplazo puntual de texto
+    if (toolName === 'edit_file') {
+      const targetPath = toolArgs.path || toolArgs.filePath || '';
+      const cleanPath = targetPath.replace(/^\.?\//, '');
+      if (!cleanPath) return 'Error: Falta especificar la ruta del archivo.';
+      const fullTarget = path.join(workspaceDir, cleanPath);
+      if (!fs.existsSync(fullTarget)) {
+        return `Error: El archivo "${cleanPath}" no existe en el repositorio.`;
+      }
+      const existingContent = await fs.promises.readFile(fullTarget, 'utf8');
+      const targetStr = toolArgs.target;
+      const replacementStr = toolArgs.replacement ?? '';
+
+      if (typeof targetStr !== 'string' || !targetStr) {
+        return 'Error: Debes especificar el parámetro "target" con el bloque de texto exacto a reemplazar.';
+      }
+
+      if (!existingContent.includes(targetStr)) {
+        return `Error: El bloque target no fue encontrado exactamente en "${cleanPath}". Asegúrate de copiar el texto exacto incluyendo espacios, saltos de línea e indentación.`;
+      }
+
+      const updatedContent = existingContent.replace(targetStr, replacementStr);
+      await fs.promises.writeFile(fullTarget, updatedContent, 'utf8');
+      filesModified.add(cleanPath);
+      if (toolArgs.summary) agentSummary = toolArgs.summary;
+      console.log(`[LovableBridge] ✅ Archivo editado puntualmente con edit_file: ${cleanPath}`);
+      return `Archivo "${cleanPath}" editado exitosamente. Se reemplazó la sección indicada sin afectar el resto del archivo.`;
     }
 
     // D. propose_change / replace_file_content / create_file: escritura en disco
@@ -675,6 +940,20 @@ REGLAS DE ORO:
 
       const fileContent = toolArgs.new_content ?? toolArgs.content ?? toolArgs.code ?? toolArgs.new_str ?? '';
       const fullTarget = path.join(workspaceDir, cleanPath);
+
+      // Salvaguarda contra truncamiento catastrófico de archivos
+      if (fs.existsSync(fullTarget) && toolName !== 'create_file') {
+        try {
+          const existingContent = await fs.promises.readFile(fullTarget, 'utf8');
+          const existingLines = existingContent.split('\n').length;
+          const newLines = fileContent.split('\n').length;
+          if (existingLines > 80 && newLines < (existingLines * 0.35)) {
+            console.warn(`[LovableBridge] ⚠️ Salvaguarda activada: Intento de truncamiento destructivo en ${cleanPath} (De ${existingLines} a ${newLines} líneas).`);
+            return `ERROR DE INTEGRIDAD: El archivo "${cleanPath}" tiene ${existingLines} líneas y el contenido enviado solo tiene ${newLines} líneas. Se ha bloqueado la sobreescritura para evitar borrar el componente. Debes enviar el código COMPLETO conservando todos los imports, componentes y exports existentes.`;
+          }
+        } catch (_) {}
+      }
+
       await fs.promises.mkdir(path.dirname(fullTarget), { recursive: true });
       await fs.promises.writeFile(fullTarget, fileContent, 'utf8');
       filesModified.add(cleanPath);
@@ -727,8 +1006,13 @@ REGLAS DE ORO:
       return 'Memoria registrada.';
     }
 
-    // H. message_user: cierre de turno
+    // H. message_user: cierre de turno con validación previa de integridad
     if (toolName === 'message_user') {
+      const integrityErrors = await validateModuleIntegrity(workspaceDir, Array.from(filesModified));
+      if (integrityErrors.length > 0) {
+        console.warn(`[LovableBridge] ⚠️ Error de integridad de módulos detectado antes de message_user:`, integrityErrors);
+        return `ERROR DE INTEGRIDAD DE COMPILACIÓN DETECTADO:\n${integrityErrors.join('\n')}\n\nDEBES corregir las importaciones o exportar las funciones/tipos faltantes en sus respectivos archivos usando "edit_file" antes de poder concluir con message_user.`;
+      }
       agentSummary = toolArgs.summary || agentSummary;
       agentMessage = toolArgs.message || '';
       return 'Resumen enviado.';
@@ -738,12 +1022,107 @@ REGLAS DE ORO:
   };
 
   try {
+    // ── PROCESAMIENTO DE DOCUMENTOS Y ADJUNTOS MULTIMODAL ──
+    const documentContextBlocks = [];
+    if (attachments && Array.isArray(attachments) && attachments.length > 0) {
+      for (const att of attachments) {
+        if (!att || !att.data) continue;
+        const name = att.name || 'documento';
+        const mime = att.type || '';
+
+        let buffer = null;
+        try {
+          const base64Data = att.data.includes('base64,') ? att.data.split('base64,')[1] : att.data;
+          buffer = Buffer.from(base64Data, 'base64');
+        } catch (bErr) {
+          console.warn(`[LovableBridge] No se pudo decodificar adjunto ${name}:`, bErr.message);
+          continue;
+        }
+
+        notifyActivity(`Extrayendo contenido de "${name}"...`);
+        const lowerName = name.toLowerCase();
+        const isImage =
+          mime.startsWith('image/') ||
+          lowerName.endsWith('.png') ||
+          lowerName.endsWith('.jpg') ||
+          lowerName.endsWith('.jpeg') ||
+          lowerName.endsWith('.webp') ||
+          lowerName.endsWith('.svg') ||
+          lowerName.endsWith('.gif');
+
+        // Imágenes: guardar en public/images/ y documentar
+        if (isImage) {
+          try {
+            let safeName = name.replace(/[^a-zA-Z0-9_.-]/g, '_');
+            if (!path.extname(safeName)) {
+              const ext = mime.split('/')[1] || 'png';
+              safeName += `.${ext.replace('+xml', '')}`;
+            }
+            const assetsDir = path.join(workspaceDir, 'public', 'images');
+            await fs.promises.mkdir(assetsDir, { recursive: true });
+            const targetPath = path.join(assetsDir, safeName);
+            await fs.promises.writeFile(targetPath, buffer);
+            filesModified.add(`public/images/${safeName}`);
+
+            documentContextBlocks.push(
+              `[IMAGEN ADJUNTA: "${name}"]\n- Guardada en el repositorio en: "public/images/${safeName}"\n- Acceso en componentes React: src="/images/${safeName}"\n- Nota: El usuario adjuntó esta imagen. Incorpórala o úsala en los componentes según su petición.`
+            );
+          } catch (imgErr) {
+            documentContextBlocks.push(`[IMAGEN ADJUNTA: "${name}" (${imgErr.message})]`);
+          }
+          continue;
+        }
+
+        // Documentos: Word (.docx), Excel (.xlsx, .csv), PDF (.pdf), Texto (.md, .txt, .json, .sql)
+        try {
+          const extracted = await AttachmentProcessor.extractTextFull(buffer, name, mime);
+          let textContent = extracted.text || '';
+
+          // Fallback a lectura de texto plano si no se extrajo texto pero es un archivo de texto/código
+          if (!textContent.trim() && (mime.startsWith('text/') || /\.(txt|md|json|js|jsx|ts|tsx|html|css|sql|csv|env|yml|yaml|xml)$/i.test(name))) {
+            try {
+              textContent = buffer.toString('utf8');
+            } catch (_) {}
+          }
+
+          // Si el .docx contenía imágenes incrustadas, extraerlas también a public/assets/
+          if (extracted.extractedAssets && extracted.extractedAssets.length > 0) {
+            for (const asset of extracted.extractedAssets) {
+              if (asset.buffer) {
+                try {
+                  const safeImg = path.basename(asset.publicPath || asset.name || 'asset.png');
+                  const targetImg = path.join(workspaceDir, 'public', 'assets', safeImg);
+                  await fs.promises.mkdir(path.dirname(targetImg), { recursive: true });
+                  await fs.promises.writeFile(targetImg, asset.buffer);
+                  filesModified.add(`public/assets/${safeImg}`);
+                } catch (_) {}
+              }
+            }
+          }
+
+          if (textContent.trim().length > 0) {
+            documentContextBlocks.push(
+              `================================================================================\nCONTENIDO EXTRAÍDO DEL DOCUMENTO ADJUNTO: "${name}"\n================================================================================\n${textContent.slice(0, 45000)}\n================================================================================`
+            );
+            console.log(`[LovableBridge] ✅ Documento "${name}" extraído exitosamente (${textContent.length} caracteres)`);
+          }
+        } catch (docErr) {
+          console.warn(`[LovableBridge] Error extrayendo documento ${name}:`, docErr.message);
+          documentContextBlocks.push(`[DOCUMENTO ADJUNTO: "${name}" - Error de lectura: ${docErr.message}]`);
+        }
+      }
+    }
+
+    const finalUserPrompt = documentContextBlocks.length > 0
+      ? `${prompt}\n\n[ARCHIVOS Y DOCUMENTOS ADJUNTOS POR EL USUARIO EN EL CHAT]:\n${documentContextBlocks.join('\n\n')}`
+      : prompt;
+
     // ── 3. INVOCACIÓN CON `projectId` PARA AISLAMIENTO DEL WORKSPACE ──
     const agentResult = await runAgentWithRotation({
       system: systemPrompt,
       tools: tools,
       history: [],
-      userMessage: prompt,
+      userMessage: finalUserPrompt,
       executeTool: executeTool,
       signal: null,
       projectId: safeProjectId,
@@ -786,6 +1165,12 @@ REGLAS DE ORO:
   const finalSummary = agentSummary || 'Actualización de componentes e interfaz';
 
   // ── PASO C: Commit y Push Atómico a GitHub ──
+  // Validación de integridad pre-commit
+  const finalIntegrityCheck = await validateModuleIntegrity(workspaceDir, modifiedList);
+  if (finalIntegrityCheck.length > 0) {
+    console.error(`[LovableBridge] ❌ Bloqueo Pre-Commit: errores de integridad detectados:`, finalIntegrityCheck);
+    throw new Error(`El código introdujo errores de exportación faltantes:\n${finalIntegrityCheck.join('\n')}`);
+  }
   notifyActivity(`Preparando commit y sincronizando ${modifiedList.length} archivo(s) con GitHub...`);
   console.log(`[LovableBridge] Guardando cambios y preparando git push (${modifiedList.length} archivos modificados)...`);
 
@@ -802,6 +1187,7 @@ REGLAS DE ORO:
       
       notifyActivity('Haciendo push a GitHub (rama ' + branch + ')...');
       console.log(`[LovableBridge] Haciendo push a origin/${branch}...`);
+      await execAsync(`git remote set-url origin "${gitAuthUrl}"`, { cwd: workspaceDir });
       await execAsync(`git push origin "${branch}"`, { cwd: workspaceDir });
       
       const revRes = await execAsync('git rev-parse HEAD', { cwd: workspaceDir });

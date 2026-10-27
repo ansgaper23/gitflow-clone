@@ -1941,6 +1941,13 @@ Reglas importantes:
 - Cuando propongas un cambio de base de datos, el SQL debe ser válido para PostgreSQL y usar sentencias seguras (ej. "create table if not exists", "alter table ... add column if not exists").
 
 - Responde siempre en español, de forma clara y concisa.
+- Responde siempre en Markdown limpio y bien estructurado:
+  - Escribe una frase breve de saludo o introducción en su propio párrafo.
+  - Deja una línea en blanco entre cada párrafo.
+  - Cuando enumeres puntos, usa listas de Markdown reales, con cada viñeta en su propia línea comenzando con '- ' (nunca pongas varias viñetas dentro del mismo párrafo ni uses el símbolo '•' en línea).
+  - Resalta los términos clave en **negrita**.
+  - Sé conciso: máximo 4 a 6 viñetas, de una o dos líneas cada una.
+  - Si haces una pregunta al final, ponla en un párrafo aparte.
 
 - Si el usuario solo hace una pregunta y no requiere cambios, responde normalmente sin proponer nada.
 

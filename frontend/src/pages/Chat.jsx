@@ -3149,14 +3149,15 @@ export default function Chat() {
 
             msg.role === 'user' ? (
 
-              <div key={msg.id} className="flex justify-end w-full py-2 group">
+              <div key={msg.id} className="flex justify-end w-full my-2 group">
 
                 <div className="flex flex-col items-end gap-1 w-full">
 
-                  <div className="max-w-[85%] sm:max-w-[70%] w-fit min-w-[3rem] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-zinc-800 text-zinc-100 text-[14px] leading-relaxed break-words whitespace-pre-wrap select-text shadow-sm prose prose-invert prose-p:my-0 prose-img:rounded-xl prose-img:max-h-64 prose-img:object-cover">
+                  <div className="w-fit max-w-[85%] ml-auto px-3 py-2 rounded-2xl bg-zinc-800 text-zinc-100 text-sm leading-snug whitespace-pre-wrap break-words select-text shadow-sm prose prose-invert prose-p:my-0 prose-p:leading-snug prose-img:rounded-xl prose-img:max-h-64 prose-img:object-cover">
 
                     <ReactMarkdown
                       components={{
+                        p: ({ node, ...props }) => <p className="m-0 leading-snug" {...props} />,
                         pre: ({ children }) => <>{children}</>,
                         code: ({ node, inline, className, children, ...props }) => {
                           const match = /language-(\w+)/.exec(className || '');
