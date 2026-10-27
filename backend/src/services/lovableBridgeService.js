@@ -45,6 +45,37 @@ function getFriendlyFileName(relPath) {
   return `"${relPath}"`;
 }
 
+
+function normalizeLovableMarkdown(text) {
+  if (!text || typeof text !== 'string') return '';
+  let clean = text.trim();
+
+  // a) Saludo inicial en su propio parrafo
+  clean = clean.replace(/^(\u00A1?Hola!?[,.]?|Buenas(?: [a-z]+)?[,.]?|Saludos[,.]?)\s+/i, '$1\n\n');
+
+  // b) Oracion introductoria que termina en dos puntos (ej: "contempla lo siguiente:")
+  clean = clean.replace(/([.!?])\s+([A-Za-z\u00C0-\u017F][^.\n!?]{4,85}:)/g, '$1\n\n$2');
+
+  // c) Separar vinetas inline despues de puntuacion (: . ! ? ) )
+  clean = clean.replace(/([.:;!?\)])\s*[-–—•●\u2013\u2014\u2022\u25CF]\s+/g, '$1\n\n- ');
+
+  // d) Separar listas numeradas
+  clean = clean.replace(/([.:;!?\)])\s*(\d+)\.\s+/g, '$1\n\n$2. ');
+
+  // e) Vinetas con guion en medio de frase
+  clean = clean.replace(/(\s+)[-–—•●\u2013\u2014\u2022\u25CF]\s+([A-Za-z0-9_*\u00C0-\u017F])/g, '\n\n- $2');
+
+  // f) Pregunta final que empieza con interrogacion
+  clean = clean.replace(/([.:;!])\s+([\u00BF\?][A-Za-z\u00C0-\u017F])/g, '$1\n\n$2');
+
+  // g) Destacar en negrita titulos de items (- Titulo: Texto -> - **Titulo:** Texto)
+  clean = clean.replace(/(^|\n)([ \t]*)([-*•–—●\u2013\u2014\u2022\u25CF]|\d+\.)[ \t]+([A-Za-z0-9\u00C0-\u017F][^:\n\*]{2,45}):[ \t]+/g, function(_m, p1, p2, p3, p4) {
+    return p1 + p2 + p3 + ' **' + p4 + ':** ';
+  });
+
+  return clean;
+}
+
 function buildHumanActivityDescription(toolName, toolArgs) {
   const targetPath = toolArgs.path || toolArgs.filePath || '';
   const cleanPath = targetPath.replace(/^\.?\//, '');
@@ -1014,7 +1045,7 @@ REGLAS DE ORO:
         return `ERROR DE INTEGRIDAD DE COMPILACIÓN DETECTADO:\n${integrityErrors.join('\n')}\n\nDEBES corregir las importaciones o exportar las funciones/tipos faltantes en sus respectivos archivos usando "edit_file" antes de poder concluir con message_user.`;
       }
       agentSummary = toolArgs.summary || agentSummary;
-      agentMessage = toolArgs.message || '';
+      agentMessage = normalizeLovableMarkdown(toolArgs.message || '');
       return 'Resumen enviado.';
     }
 
@@ -1130,7 +1161,7 @@ REGLAS DE ORO:
     });
 
     if (!agentMessage && agentResult?.text) {
-      agentMessage = agentResult.text.trim();
+      agentMessage = normalizeLovableMarkdown(agentResult.text.trim());
     }
   } catch (agentErr) {
     console.error(`[LovableBridge] Error durante el bucle de IA:`, agentErr.message);
